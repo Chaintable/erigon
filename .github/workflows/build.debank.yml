@@ -38,6 +38,15 @@ jobs:
         run: |
           echo "REVISION=$(git rev-parse --short=8 HEAD)" >> $GITHUB_ENV
 
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ap-northeast-1
+          
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
       - name: Build image and push to ECR
         uses:  docker/build-push-action@v5
         with:
