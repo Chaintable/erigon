@@ -191,7 +191,8 @@ func (u *Uploader) PushDebankOutPut(ctx context.Context, out *dtypes.DebankOutPu
 					},
 				},
 			}
-			err := u.WriteBlockNotice(u.LastBlockNotice)
+			err := u.WriteBlockNotice(lastBlockNotice)
+			log.Info("write block notice", "block", out.Header.Number.Uint64())
 			if err != nil {
 				return err
 			}
