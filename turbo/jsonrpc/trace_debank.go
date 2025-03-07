@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math/big"
 	"time"
 
 	"github.com/erigontech/erigon-lib/common"
@@ -121,7 +122,12 @@ func (api *TraceAPIImpl) DebankBlockRaw(ctx context.Context, blockNrOrHash rpc.B
 		}
 		includedTxs = append(includedTxs, txn)
 		receipts = append(receipts, receipt)
-		from := tracer.Evm.Origin
+		var from common.Address
+		if tracer.Evm != nil {
+			from = tracer.Evm.Origin
+		} else {
+			from = getFrom(txn)
+		}
 		tx := dtracer.BuildPipelineTransaction(txn, receipt, from, chainConfig, header)
 		blockFile.Txs = append(blockFile.Txs, tx)
 	}
@@ -274,4 +280,21 @@ func CreateHistoryStateReader2(tx kv.TemporalTx, txNumsReader rawdbv3.TxNumsRead
 	}
 	r.SetTxNum(txNum)
 	return r, nil
+}
+
+func getFrom(txn types.Transaction) common.Address {
+	var chainId *big.Int
+	switch t := txn.(type) {
+	case *types.LegacyTx:
+		if t.Protected() {
+			chainId = types.DeriveChainId(&t.V).ToBig()
+		}
+	default:
+		chainId = txn.GetChainID().ToBig()
+	}
+
+	var from common.Address
+	signer := types.LatestSignerForChainID(chainId)
+	from, _ = txn.Sender(*signer)
+	return from
 }
