@@ -14,8 +14,8 @@ ADD go.sum go.sum
 RUN go mod download
 ADD . .
 
-RUN make all
-RUN make db-tools
+RUN make erigon
+# RUN make db-tools
 
 
 FROM ubuntu:24.04

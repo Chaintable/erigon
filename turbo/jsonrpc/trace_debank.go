@@ -4,8 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math/big"
+	"time"
 
 	"github.com/erigontech/erigon-lib/common"
+	"github.com/erigontech/erigon-lib/kv"
+	"github.com/erigontech/erigon-lib/kv/rawdbv3"
 	"github.com/erigontech/erigon-lib/log/v3"
 	"github.com/erigontech/erigon-lib/rlp"
 	"github.com/erigontech/erigon/consensus"
@@ -19,17 +23,10 @@ import (
 	"github.com/erigontech/erigon/eth/consensuschain"
 	"github.com/erigontech/erigon/rpc"
 	"github.com/erigontech/erigon/turbo/rpchelper"
-	"github.com/erigontech/erigon/turbo/shards"
+	"github.com/erigontech/erigon/turbo/snapshotsync/freezeblocks"
 )
 
-type DebankOutPut struct {
-	BlockFile      *dtypes.BlockFile `json:"block_file"`
-	Header         *dtypes.Header    `json:"header"`
-	StateDiff      []byte            `json:"state_diff"`
-	ValidationHash int64             `json:"validation_hash"`
-}
-
-func (api *TraceAPIImpl) DebankBlock(ctx context.Context, blockNrOrHash rpc.BlockNumberOrHash) (*DebankOutPut, error) {
+func (api *TraceAPIImpl) DebankBlockRaw(ctx context.Context, blockNrOrHash rpc.BlockNumberOrHash) (*dtypes.DebankOutPut, error) {
 	dbtx, err := api.kv.BeginTemporalRo(ctx)
 	if err != nil {
 		return nil, err
@@ -59,31 +56,23 @@ func (api *TraceAPIImpl) DebankBlock(ctx context.Context, blockNrOrHash rpc.Bloc
 	header := block.Header()
 
 	if block.NumberU64() == 0 {
-		return nil, fmt.Errorf("cannot trace genesis block")
+		genesis := core.GenesisBlockByChainName(chainConfig.ChainName)
+		return dtracer.OnGenesisBlock(block, genesis.Alloc)
 	}
 
-	parentNo := rpc.BlockNumber(block.NumberU64() - 1)
 	parentHash := block.ParentHash()
-	parentNrOrHash := rpc.BlockNumberOrHash{
-		BlockNumber:      &parentNo,
-		BlockHash:        &parentHash,
-		RequireCanonical: true,
-	}
-
 	parentHeader, err := api._blockReader.Header(ctx, dbtx, parentHash, block.NumberU64()-1)
 	if err != nil {
 		return nil, err
 	}
 
-	stateReader, err := rpchelper.CreateStateReader(ctx, dbtx, api._blockReader, parentNrOrHash, 0, api.filters, api.stateCache, chainConfig.ChainName)
+	stateReader, err := CreateHistoryStateReader2(dbtx, rawdbv3.TxNums.WithCustomReadTxNumFunc(freezeblocks.ReadTxNumFuncFromBlockReader(ctx, api._blockReader)), header.Number.Uint64(), 0, chainConfig.ChainName)
 	if err != nil {
 		return nil, err
 	}
-	stateCache := shards.NewStateCache(32, 0)
-	cachedReader := state.NewCachedReader(stateReader, stateCache)
+
 	writer := dtracer.NewBlockStorageDiff()
-	cachedWriter := state.NewCachedWriter(writer, stateCache)
-	ibs := state.New(cachedReader)
+	ibs := state.New(stateReader)
 	usedGas := new(uint64)
 	usedBlobGas := new(uint64)
 	gp := new(core.GasPool).AddGas(header.GasLimit).AddBlobGas(chainConfig.GetMaxBlobGasPerBlock(header.Time))
@@ -96,7 +85,7 @@ func (api *TraceAPIImpl) DebankBlock(ctx context.Context, blockNrOrHash rpc.Bloc
 	consensusHeaderReader := consensuschain.NewReader(chainConfig, dbtx, api._blockReader, nil)
 	logger := log.New("trace_debankBlock")
 
-	err = core.InitializeBlockExecution(engine, consensusHeaderReader, block.HeaderNoCopy(), chainConfig, ibs, cachedWriter, logger, nil)
+	err = core.InitializeBlockExecution(engine, consensusHeaderReader, block.HeaderNoCopy(), chainConfig, ibs, writer, logger, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -113,41 +102,39 @@ func (api *TraceAPIImpl) DebankBlock(ctx context.Context, blockNrOrHash rpc.Bloc
 		return h
 	}
 	blockFile := &dtypes.BlockFile{
-		Block:            dtracer.BuildPipelineBlock(block),
-		SpecialTransfers: dtracer.BuildPipelineWithdrawals(block),
-		Events:           make([]dtypes.Event, 0),
-		Txs:              make([]dtypes.Transaction, 0),
-		Traces:           make([]dtypes.Trace, 0),
+		Block:  dtracer.BuildPipelineBlock(block),
+		Events: make([]dtypes.Event, 0),
+		Txs:    make([]dtypes.Transaction, 0),
+		Traces: make([]dtypes.Trace, 0),
 	}
 	stateHeader := dtracer.BuildPilelineBlockHeader(block)
-	balanceTracer := &dtracer.BalanceTracer{BlockFile: blockFile}
-	// 为empty block 设置 balanceTracer
-	ibs.SetHooks(&tracing.Hooks{
-		OnBalanceChange: balanceTracer.OnBalanceChange,
-	})
 	for i, txn := range block.Transactions() {
 		ibs.SetTxContext(i)
 		tracer := dtracer.NewCallTracer(blockFile, txn.Hash().Hex())
 		vmConfig.Debug = true
 		vmConfig.Tracer = tracer
 		ibs.SetHooks(&tracing.Hooks{
-			OnLog:           tracer.OnLog,
-			OnBalanceChange: balanceTracer.OnBalanceChange,
+			OnLog: tracer.OnLog,
 		})
-		receipt, _, err := core.ApplyTransaction(chainConfig, core.GetHashFn(header, getHeader), engine, nil, gp, ibs, cachedWriter, header, txn, usedGas, usedBlobGas, vmConfig)
+		receipt, _, err := core.ApplyTransaction(chainConfig, core.GetHashFn(header, getHeader), engine, nil, gp, ibs, writer, header, txn, usedGas, usedBlobGas, vmConfig)
 		if err != nil {
 			return nil, fmt.Errorf("trace_debankBlock: bn=%d, txnIdx=%d, %w", header.Number.Uint64(), i, err)
 		}
 		includedTxs = append(includedTxs, txn)
 		receipts = append(receipts, receipt)
-		from := tracer.Evm.Origin
+		var from common.Address
+		if tracer.Evm != nil {
+			from = tracer.Evm.Origin
+		} else {
+			from = getFrom(txn)
+		}
 		tx := dtracer.BuildPipelineTransaction(txn, receipt, from, chainConfig, header)
 		blockFile.Txs = append(blockFile.Txs, tx)
 	}
 
 	chainReader := consensuschain.NewReader(chainConfig, dbtx, api._blockReader, logger)
 
-	newBlock, _, _, _, err := core.FinalizeBlockExecution(engine, stateReader, block.Header(), block.Transactions(), block.Uncles(), cachedWriter, chainConfig, ibs, receipts, block.Withdrawals(), chainReader, true, logger)
+	newBlock, _, _, _, err := core.FinalizeBlockExecution(engine, stateReader, block.Header(), block.Transactions(), block.Uncles(), writer, chainConfig, ibs, receipts, block.Withdrawals(), chainReader, true, logger)
 	if err != nil {
 		return nil, err
 	}
@@ -191,17 +178,123 @@ func (api *TraceAPIImpl) DebankBlock(ctx context.Context, blockNrOrHash rpc.Bloc
 
 	stateDiff := writer.ToStateDiff(parentHeader.Root, newBlock.Root())
 
-	data, err := rlp.EncodeToBytes(stateDiff)
-	if err != nil {
-		return nil, err
-	}
-
-	out := &DebankOutPut{
+	out := &dtypes.DebankOutPut{
 		BlockFile:      blockFile,
 		Header:         stateHeader,
-		StateDiff:      data,
+		StateDiff:      stateDiff,
 		ValidationHash: blockFile.Validation().ValidationHash,
 	}
 
 	return out, nil
+}
+
+type DebankOutPutJs struct {
+	BlockFile      *dtypes.BlockFile `json:"block_file"`
+	Header         *dtypes.Header    `json:"header"`
+	StateDiff      []byte            `json:"state_diff"`
+	ValidationHash int64             `json:"validation_hash"`
+}
+
+func (api *TraceAPIImpl) DebankBlock(ctx context.Context, blockNrOrHash rpc.BlockNumberOrHash) (*DebankOutPutJs, error) {
+	output, err := api.DebankBlockRaw(ctx, blockNrOrHash)
+	if err != nil {
+		return nil, err
+	}
+	data, err := rlp.EncodeToBytes(output.StateDiff)
+	if err != nil {
+		return nil, err
+	}
+
+	return &DebankOutPutJs{
+		BlockFile:      output.BlockFile,
+		Header:         output.Header,
+		StateDiff:      data,
+		ValidationHash: output.ValidationHash,
+	}, nil
+}
+
+func (api *TraceAPIImpl) DebankBGTraceStart(ctx context.Context, region string, nodeXBucket string, chainTableBucket string, broker string, topic string, chainID string, startBlock, endBlock, maxTask uint64) (*BGTraceStatus, error) {
+	if region == "" || nodeXBucket == "" || chainTableBucket == "" || broker == "" || topic == "" || chainID == "" || endBlock == 0 || startBlock > endBlock || maxTask == 0 {
+		return nil, errors.New("missing required parameters")
+	}
+
+	err := dtracer.DebankTraceBackGroundMangeInstance.Start(api, region, nodeXBucket, chainTableBucket, broker, topic, chainID, startBlock, endBlock, maxTask)
+	if err != nil {
+		return nil, err
+	}
+	stat, err := api.DebankBGTraceStatus(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	return stat, nil
+}
+
+func (api *TraceAPIImpl) DebankBGTraceStop(ctx context.Context) (*BGTraceStatus, error) {
+	stat, err := api.DebankBGTraceStatus(ctx)
+	if err != nil {
+		return nil, err
+	}
+	dtracer.DebankTraceBackGroundMangeInstance.Stop()
+	return stat, nil
+}
+
+type BGTraceStatus struct {
+	Start     uint64  `json:"start"`
+	End       uint64  `json:"end"`
+	Latest    uint64  `json:"latest"`
+	Blocks    uint64  `json:"blocks"`
+	StartTime uint64  `json:"start_time"`
+	Duration  uint64  `json:"duration"`
+	Rate      float64 `json:"rate"`
+}
+
+func (api *TraceAPIImpl) DebankBGTraceStatus(ctx context.Context) (*BGTraceStatus, error) {
+	start, end, latest, startTime := dtracer.DebankTraceBackGroundMangeInstance.Status()
+	return &BGTraceStatus{
+		Start:     start,
+		End:       end,
+		Latest:    latest,
+		Blocks:    latest - start + 1,
+		StartTime: uint64(startTime.Unix()),
+		Duration:  uint64(time.Now().Unix() - startTime.Unix()),
+		Rate:      float64(latest-start+1) / float64(time.Now().Unix()-startTime.Unix()),
+	}, nil
+
+}
+
+func CreateHistoryStateReader2(tx kv.TemporalTx, txNumsReader rawdbv3.TxNumsReader, blockNumber uint64, txnIndex int, chainName string) (state.StateReader, error) {
+	r := state.NewHistoryReaderV3()
+	r.SetTx(tx)
+	//r.SetTrace(true)
+	minTxNum, err := txNumsReader.Min(tx, blockNumber)
+	if err != nil {
+		return nil, err
+	}
+	txNum := uint64(int(minTxNum) + txnIndex)
+	earliestTxNum := r.StateHistoryStartFrom()
+	if txNum < earliestTxNum {
+		// data available only starting from earliestTxNum, throw error to avoid unintended
+		// consequences of using this StateReader
+		return r, state.PrunedError
+	}
+	r.SetTxNum(txNum)
+	return r, nil
+}
+
+func getFrom(txn types.Transaction) common.Address {
+	var chainId *big.Int
+	switch t := txn.(type) {
+	case *types.LegacyTx:
+		if t.Protected() {
+			chainId = types.DeriveChainId(&t.V).ToBig()
+		}
+	default:
+		chainId = txn.GetChainID().ToBig()
+	}
+
+	var from common.Address
+	signer := types.LatestSignerForChainID(chainId)
+	from, _ = txn.Sender(*signer)
+	return from
 }
