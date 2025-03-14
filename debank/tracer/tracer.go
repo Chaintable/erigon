@@ -1,4 +1,4 @@
-package debank
+package tracer
 
 import (
 	"errors"
@@ -12,7 +12,6 @@ import (
 	"github.com/erigontech/erigon-lib/crypto"
 	"github.com/erigontech/erigon-lib/types/accounts"
 	"github.com/erigontech/erigon/accounts/abi"
-	"github.com/erigontech/erigon/core/tracing"
 	"github.com/erigontech/erigon/core/types"
 	"github.com/erigontech/erigon/core/vm"
 	dtypes "github.com/erigontech/erigon/debank/types"
@@ -69,6 +68,7 @@ func (bs *BlockStorageDiffMap) ToStateDiff(parrentRoot, root common.Hash) *dtype
 
 func (bs *BlockStorageDiffMap) UpdateAccountData(address common.Address, original, account *accounts.Account) error {
 	addrhash := crypto.Keccak256Hash(address.Bytes())
+	delete(bs.DeletedAccounts, addrhash)
 	bs.NewAccounts[addrhash] = dtypes.NewAccount{
 		Address:  addrhash,
 		Balance:  account.Balance.Clone(),
@@ -222,7 +222,6 @@ func (t *callTracer) ToTrace(f *callFrame) dtypes.Trace {
 type callTracer struct {
 	callstack []callFrame
 	gasLimit  uint64
-	reason    error
 	txID      string
 	Evm       *vm.EVM
 	BlockFile *dtypes.BlockFile
@@ -394,47 +393,60 @@ func (t *callTracer) OnLog(log *types.Log) {
 	t.callstack[len(t.callstack)-1].Logs = append(t.callstack[len(t.callstack)-1].Logs, l)
 }
 
-type BalanceTracer struct {
-	BlockFile *dtypes.BlockFile
+func OnGenesisBlock(block *types.Block, alloc types.GenesisAlloc) (*dtypes.DebankOutPut, error) {
+	// do something
+
+	header := BuildPilelineBlockHeader(block)
+	blockDiff := GenesisAllocToStateDiff(alloc)
+	blockDiff.Hash = block.Root()
+	blockDiff.ParentHash = types.EmptyRootHash
+
+	blockFile := &dtypes.BlockFile{
+		Block: BuildPipelineBlock(block),
+	}
+
+	return &dtypes.DebankOutPut{
+		BlockFile:      blockFile,
+		Header:         header,
+		StateDiff:      blockDiff,
+		ValidationHash: blockFile.Validation().ValidationHash,
+	}, nil
 }
 
-func (t *BalanceTracer) OnBalanceChange(a common.Address, prevBalance, newBalance *uint256.Int, reason tracing.BalanceChangeReason) {
-	diff := new(big.Int).Sub(newBalance.ToBig(), prevBalance.ToBig())
-
-	if reason == tracing.BalanceIncreaseRewardMineUncle || reason == tracing.BalanceIncreaseRewardMineBlock {
-		for i := range t.BlockFile.SpecialTransfers {
-			sp := &t.BlockFile.SpecialTransfers[i]
-			if sp.ToAddress == strings.ToLower(a.Hex()) && sp.Memo == "block_reward" {
-				sp.Value = (*hexutil.Big)(new(big.Int).Add(sp.Value.ToInt(), diff))
-				return
+func GenesisAllocToStateDiff(genesisAlloc types.GenesisAlloc) *dtypes.BlockStorageDiff {
+	diff := &dtypes.BlockStorageDiff{}
+	diff.NewAccounts = make([]dtypes.NewAccount, 0)
+	diff.NewCodes = make([]dtypes.NewCode, 0)
+	diff.StorageDiff = make([]dtypes.AccountStorageDiff, 0)
+	diff.DeletedAccounts = make([]common.Hash, 0)
+	for addr, acc := range genesisAlloc {
+		diff.NewAccounts = append(diff.NewAccounts, dtypes.NewAccount{
+			Address:  crypto.Keccak256Hash(addr[:]),
+			Balance:  uint256.MustFromBig(acc.Balance),
+			Nonce:    acc.Nonce,
+			CodeHash: common.BytesToHash(acc.Code),
+		})
+		if len(acc.Code) > 0 {
+			diff.NewCodes = append(diff.NewCodes, dtypes.NewCode{
+				CodeHash: common.BytesToHash(acc.Code),
+				Code:     acc.Code,
+			})
+		}
+		values := make([]dtypes.IndexValuePair, 0)
+		for index, v := range acc.Storage {
+			value := uint256.NewInt(0)
+			if len(v) > 0 {
+				value = uint256.NewInt(0).SetBytes(v.Bytes())
 			}
+			values = append(values, dtypes.IndexValuePair{
+				Index: index,
+				Value: value,
+			})
 		}
-		specialTransfer := dtypes.SpecialTransfer{
-			FromAddress: common.Address{}.Hex(),
-			ToAddress:   strings.ToLower(a.Hex()),
-			Value:       (*hexutil.Big)(diff),
-			Memo:        "block_reward",
-			Idx:         big.NewInt(int64(reason)),
-		}
-		specialTransfer.ID = util.ToHash([]string{t.BlockFile.Block.ID, specialTransfer.ToAddress, fmt.Sprintf("%d", tracing.BalanceIncreaseRewardMineBlock)})
-		t.BlockFile.SpecialTransfers = append(t.BlockFile.SpecialTransfers, specialTransfer)
+		diff.StorageDiff = append(diff.StorageDiff, dtypes.AccountStorageDiff{
+			Address: crypto.Keccak256Hash(addr[:]),
+			Values:  values,
+		})
 	}
-	if reason == tracing.BalanceIncreaseRewardTransactionFee {
-		for i := range t.BlockFile.SpecialTransfers {
-			sp := &t.BlockFile.SpecialTransfers[i]
-			if sp.ToAddress == strings.ToLower(a.Hex()) && sp.Memo == "gasfee_reward" {
-				sp.Value = (*hexutil.Big)(new(big.Int).Add(sp.Value.ToInt(), diff))
-				return
-			}
-		}
-		specialTransfer := dtypes.SpecialTransfer{
-			FromAddress: common.Address{}.Hex(),
-			ToAddress:   strings.ToLower(a.Hex()),
-			Value:       (*hexutil.Big)(diff),
-			Memo:        "gasfee_reward",
-			Idx:         big.NewInt(int64(reason)),
-		}
-		specialTransfer.ID = util.ToHash([]string{t.BlockFile.Block.ID, specialTransfer.ToAddress, fmt.Sprintf("%d", tracing.BalanceIncreaseRewardTransactionFee)})
-		t.BlockFile.SpecialTransfers = append(t.BlockFile.SpecialTransfers, specialTransfer)
-	}
+	return diff
 }
