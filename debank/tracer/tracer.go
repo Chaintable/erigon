@@ -220,11 +220,12 @@ func (t *callTracer) ToTrace(f *callFrame) dtypes.Trace {
 }
 
 type callTracer struct {
-	callstack []callFrame
-	gasLimit  uint64
-	txID      string
-	Evm       *vm.EVM
-	BlockFile *dtypes.BlockFile
+	callstack    []callFrame
+	gasLimit     uint64
+	txID         string
+	Evm          *vm.EVM
+	BlockFile    *dtypes.BlockFile
+	PendiingLogs []*types.Log // only for polygon TransferLogs
 }
 
 func NewCallTracer(BlockFile *dtypes.BlockFile, txID string) *callTracer {
@@ -254,7 +255,12 @@ func (t *callTracer) CaptureStart(env *vm.EVM, from common.Address, to common.Ad
 	}
 	t.Evm = env
 	t.callstack = append(t.callstack, call)
-
+	if len(t.PendiingLogs) > 0 {
+		for _, logg := range t.PendiingLogs {
+			t.OnLog(logg)
+		}
+		t.PendiingLogs = nil
+	}
 }
 func (t *callTracer) CaptureEnter(typ vm.OpCode, from common.Address, to common.Address, precompile bool, create bool, input []byte, gas uint64, value *uint256.Int, code []byte) {
 	toCopy := to
@@ -371,9 +377,13 @@ func (t *callTracer) addTraceAndLog(cf *callFrame) {
 	}
 }
 
-func (t *callTracer) OnLog(log *types.Log) {
-	topics := make([]string, len(log.Topics))
-	for i, topic := range log.Topics {
+func (t *callTracer) OnLog(logg *types.Log) {
+	if len(t.callstack) == 0 {
+		t.PendiingLogs = append(t.PendiingLogs, logg)
+		return
+	}
+	topics := make([]string, len(logg.Topics))
+	for i, topic := range logg.Topics {
 		topics[i] = topic.Hex()
 	}
 	var selector string
@@ -384,10 +394,10 @@ func (t *callTracer) OnLog(log *types.Log) {
 		remainingTopics = topics[1:]
 	}
 	l := dtypes.Event{
-		Address:  strings.ToLower(log.Address.Hex()),
+		Address:  strings.ToLower(logg.Address.Hex()),
 		Selector: selector,
 		Topics:   remainingTopics,
-		Data:     log.Data,
+		Data:     logg.Data,
 		Position: int64(len(t.callstack[len(t.callstack)-1].Calls) + len(t.callstack[len(t.callstack)-1].Logs)),
 	}
 	t.callstack[len(t.callstack)-1].Logs = append(t.callstack[len(t.callstack)-1].Logs, l)
