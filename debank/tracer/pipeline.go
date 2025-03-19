@@ -131,3 +131,27 @@ func BuildPipelineTransaction(tx types.Transaction, receipt *types.Receipt, from
 	}
 	return transaction
 }
+
+func BuildBorPipelineTransaction(tx types.Transaction, receipt *types.Receipt, txHash common.Hash) dtypes.Transaction {
+	txn := tx.(*types.LegacyTx)
+	to := receipt.ContractAddress
+	if tx.GetTo() != nil {
+		to = *tx.GetTo()
+	}
+	transaction := dtypes.Transaction{
+		ID:               txHash.Hex(),
+		From:             strings.ToLower(common.Address{}.Hex()),
+		To:               strings.ToLower(to.Hex()),
+		Gas:              big.NewInt(int64(tx.GetGas())),
+		GasPrice:         txn.GasPrice.ToBig(),
+		GasUsed:          big.NewInt(int64(receipt.GasUsed)),
+		Status:           receipt.Status == types.ReceiptStatusSuccessful,
+		GasFeeCap:        common.Big0,
+		GasTipCap:        common.Big0,
+		Input:            tx.GetData(),
+		Nonce:            big.NewInt(int64(tx.GetNonce())),
+		TransactionIndex: int64(receipt.TransactionIndex),
+		Value:            (*hexutil.Big)(tx.GetValue().ToBig()),
+	}
+	return transaction
+}
