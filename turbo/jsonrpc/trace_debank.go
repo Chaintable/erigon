@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/erigontech/erigon-lib/common"
-	libcommon "github.com/erigontech/erigon-lib/common"
 	"github.com/erigontech/erigon-lib/kv"
 	"github.com/erigontech/erigon-lib/kv/rawdbv3"
 	"github.com/erigontech/erigon-lib/log/v3"
@@ -168,7 +167,7 @@ func (api *TraceAPIImpl) DebankBlockRaw(ctx context.Context, blockNrOrHash rpc.B
 			stateReceiverContract := chainConfig.Bor.(*borcfg.BorConfig).StateReceiverContractAddress()
 			txCtx := evmtypes.TxContext{
 				TxHash:   bortypes.ComputeBorTxHash(blockNumber, blockHash),
-				Origin:   libcommon.Address{},
+				Origin:   common.Address{},
 				GasPrice: uint256.NewInt(0),
 			}
 			vmConfig.Debug = true
