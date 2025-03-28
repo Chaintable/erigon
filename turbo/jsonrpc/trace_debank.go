@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math/big"
 	"runtime"
+	"runtime/debug"
 	"time"
 
 	"github.com/erigontech/erigon-lib/common"
@@ -204,11 +205,12 @@ func (api *TraceAPIImpl) DebankBlockRaw(ctx context.Context, blockNrOrHash rpc.B
 					return nil, err
 				}
 
-				evm.Reset(txCtx, ibs)
+				// evm.Reset(txCtx, ibs)
 				a++
 
-				if a%100 == 0 {
+				if a%200 == 0 {
 					runtime.GC()
+					debug.FreeOSMemory()
 				}
 			}
 
