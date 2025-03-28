@@ -49,7 +49,6 @@ func (api *TraceAPIImpl) DebankBlockRaw(ctx context.Context, blockNrOrHash rpc.B
 	if err != nil {
 		return nil, err
 	}
-	log.Info("trace_debankBlock: blockNumber and blockHash", "blockNumber", blockNumber, "blockHash", blockHash.Hex())
 
 	// Extract transactions from block
 	block, bErr := api.blockWithSenders(ctx, dbtx, blockHash, blockNumber)
@@ -117,10 +116,7 @@ func (api *TraceAPIImpl) DebankBlockRaw(ctx context.Context, blockNrOrHash rpc.B
 	}
 	stateHeader := dtracer.BuildPilelineBlockHeader(block)
 
-	log.Info("trace_debankBlock: processing block", "blockNumber", block.NumberU64(), "blockHash", block.Hash().Hex(), "txsCount", len(block.Transactions()))
-
 	for i, txn := range block.Transactions() {
-		log.Info("trace_debankBlock: processing transaction", "blockNumber", block.NumberU64(), "blockHash", block.Hash().Hex(), "txnIndex", i, "txnHash", txn.Hash().Hex())
 		ibs.SetTxContext(i)
 		tracer := dtracer.NewCallTracer(blockFile, txn.Hash().Hex())
 		vmConfig.Debug = true
@@ -188,11 +184,9 @@ func (api *TraceAPIImpl) DebankBlockRaw(ctx context.Context, blockNrOrHash rpc.B
 			blockCtx := transactions.NewEVMBlockContext(engine, header, true, dbtx, api._blockReader, chainConfig)
 			evm := vm.NewEVM(blockCtx, txCtx, ibs, chainConfig, vmConfig)
 			rules := chainConfig.Rules(blockNumber, block.Time())
-			log.Info("trace_debankBlock: processing Bor transaction", "blockNumber", block.NumberU64(), "blockHash", block.Hash().Hex(), "borTxHash", borTxHash.Hex())
 			a := 0
 			for _, msg := range stateSyncEvents {
 				gp := new(core.GasPool).AddGas(msg.Gas()).AddBlobGas(msg.BlobGas())
-				log.Info("trace_debankBlock: processing state sync message", "blockNumber", block.NumberU64(), "blockHash", block.Hash().Hex(), "index", a, "total", len(stateSyncEvents))
 				_, err := core.ApplyMessage(evm, msg, gp, true, false /* gasBailout */)
 				if err != nil {
 					return nil, err
