@@ -184,7 +184,6 @@ func (api *TraceAPIImpl) DebankBlockRaw(ctx context.Context, blockNrOrHash rpc.B
 			blockCtx := transactions.NewEVMBlockContext(engine, header, true, dbtx, api._blockReader, chainConfig)
 			evm := vm.NewEVM(blockCtx, txCtx, ibs, chainConfig, vmConfig)
 			rules := chainConfig.Rules(blockNumber, block.Time())
-			a := 0
 			for _, msg := range stateSyncEvents {
 				gp := new(core.GasPool).AddGas(msg.Gas()).AddBlobGas(msg.BlobGas())
 				_, err := core.ApplyMessage(evm, msg, gp, true, false /* gasBailout */)
@@ -198,7 +197,6 @@ func (api *TraceAPIImpl) DebankBlockRaw(ctx context.Context, blockNrOrHash rpc.B
 				}
 
 				evm.Reset(txCtx, ibs)
-				a++
 			}
 
 			receipt := types.Receipt{
