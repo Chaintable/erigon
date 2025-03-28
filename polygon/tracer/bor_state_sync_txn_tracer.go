@@ -36,6 +36,7 @@ func NewBorStateSyncTxnTracer(
 	return &borStateSyncTxnTracer{
 		EVMLogger:                    tracer,
 		stateSyncEventsCount:         stateSyncEventsCount,
+		stateSyncEventsTotal:         stateSyncEventsCount,
 		stateReceiverContractAddress: stateReceiverContractAddress,
 	}
 }
@@ -53,11 +54,12 @@ type borStateSyncTxnTracer struct {
 	vm.EVMLogger
 	captureStartCalledOnce       bool
 	stateSyncEventsCount         int
+	stateSyncEventsTotal         int
 	stateReceiverContractAddress libcommon.Address
 }
 
 func (bsstt *borStateSyncTxnTracer) CaptureTxStart(_ uint64) {
-	if bsstt.stateSyncEventsCount == 0 {
+	if bsstt.stateSyncEventsCount == bsstt.stateSyncEventsTotal {
 		log.Info("borStateSyncTxnTracer: CaptureTxStart called")
 		bsstt.EVMLogger.CaptureTxStart(0)
 	}
