@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"runtime"
 	"time"
 
 	"github.com/erigontech/erigon-lib/common"
@@ -205,6 +206,10 @@ func (api *TraceAPIImpl) DebankBlockRaw(ctx context.Context, blockNrOrHash rpc.B
 
 				evm.Reset(txCtx, ibs)
 				a++
+
+				if a%10 == 0 {
+					runtime.GC()
+				}
 			}
 
 			receipt := types.Receipt{
