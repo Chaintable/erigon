@@ -49,6 +49,7 @@ func (api *TraceAPIImpl) DebankBlockRaw(ctx context.Context, blockNrOrHash rpc.B
 	if err != nil {
 		return nil, err
 	}
+	log.Info("trace_debankBlock: blockNumber and blockHash", "blockNumber", blockNumber, "blockHash", blockHash.Hex())
 
 	// Extract transactions from block
 	block, bErr := api.blockWithSenders(ctx, dbtx, blockHash, blockNumber)
@@ -115,7 +116,11 @@ func (api *TraceAPIImpl) DebankBlockRaw(ctx context.Context, blockNrOrHash rpc.B
 		Traces: make([]dtypes.Trace, 0),
 	}
 	stateHeader := dtracer.BuildPilelineBlockHeader(block)
+
+	log.Info("trace_debankBlock: processing block", "blockNumber", block.NumberU64(), "blockHash", block.Hash().Hex(), "txsCount", len(block.Transactions()))
+
 	for i, txn := range block.Transactions() {
+		log.Info("trace_debankBlock: processing transaction", "blockNumber", block.NumberU64(), "blockHash", block.Hash().Hex(), "txnIndex", i, "txnHash", txn.Hash().Hex())
 		ibs.SetTxContext(i)
 		tracer := dtracer.NewCallTracer(blockFile, txn.Hash().Hex())
 		vmConfig.Debug = true
