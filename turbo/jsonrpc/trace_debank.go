@@ -192,11 +192,11 @@ func (api *TraceAPIImpl) DebankBlockRaw(ctx context.Context, blockNrOrHash rpc.B
 			a := 0
 			for _, msg := range stateSyncEvents {
 				gp := new(core.GasPool).AddGas(msg.Gas()).AddBlobGas(msg.BlobGas())
+				log.Info("trace_debankBlock: processing state sync message", "blockNumber", block.NumberU64(), "blockHash", block.Hash().Hex(), "index", a, "total", len(stateSyncEvents))
 				_, err := core.ApplyMessage(evm, msg, gp, true, false /* gasBailout */)
 				if err != nil {
 					return nil, err
 				}
-				log.Info("trace_debankBlock: processing state sync message", "blockNumber", block.NumberU64(), "blockHash", block.Hash().Hex(), "index", a, "total", len(stateSyncEvents))
 
 				err = ibs.FinalizeTx(rules, writer)
 				if err != nil {
