@@ -115,6 +115,7 @@ func (api *TraceAPIImpl) DebankBlockRaw(ctx context.Context, blockNrOrHash rpc.B
 		Traces: make([]dtypes.Trace, 0),
 	}
 	stateHeader := dtracer.BuildPilelineBlockHeader(block)
+
 	for i, txn := range block.Transactions() {
 		ibs.SetTxContext(i)
 		tracer := dtracer.NewCallTracer(blockFile, txn.Hash().Hex())
