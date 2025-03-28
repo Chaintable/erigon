@@ -189,13 +189,14 @@ func (api *TraceAPIImpl) DebankBlockRaw(ctx context.Context, blockNrOrHash rpc.B
 			evm := vm.NewEVM(blockCtx, txCtx, ibs, chainConfig, vmConfig)
 			rules := chainConfig.Rules(blockNumber, block.Time())
 			log.Info("trace_debankBlock: processing Bor transaction", "blockNumber", block.NumberU64(), "blockHash", block.Hash().Hex(), "borTxHash", borTxHash.Hex())
+			a := 0
 			for _, msg := range stateSyncEvents {
 				gp := new(core.GasPool).AddGas(msg.Gas()).AddBlobGas(msg.BlobGas())
 				_, err := core.ApplyMessage(evm, msg, gp, true, false /* gasBailout */)
 				if err != nil {
 					return nil, err
 				}
-				log.Info("trace_debankBlock: processing state sync message", "blockNumber", block.NumberU64(), "blockHash", block.Hash().Hex())
+				log.Info("trace_debankBlock: processing state sync message", "blockNumber", block.NumberU64(), "blockHash", block.Hash().Hex(), "index", a, "total", len(stateSyncEvents))
 
 				err = ibs.FinalizeTx(rules, writer)
 				if err != nil {
@@ -203,6 +204,7 @@ func (api *TraceAPIImpl) DebankBlockRaw(ctx context.Context, blockNrOrHash rpc.B
 				}
 
 				evm.Reset(txCtx, ibs)
+				a++
 			}
 
 			receipt := types.Receipt{
