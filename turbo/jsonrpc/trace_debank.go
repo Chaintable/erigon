@@ -177,7 +177,7 @@ func (api *TraceAPIImpl) DebankBlockRaw(ctx context.Context, blockNrOrHash rpc.B
 				Origin:   common.Address{},
 				GasPrice: uint256.NewInt(0),
 			}
-			vmConfig.Debug = true
+			vmConfig.Debug = false
 			atracer := dtracer.NewCallTracer(blockFile, txCtx.TxHash.Hex())
 			vmConfig.Tracer = atracer
 			if vmConfig.Tracer != nil {
