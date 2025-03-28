@@ -22,6 +22,7 @@ import (
 	"github.com/holiman/uint256"
 
 	libcommon "github.com/erigontech/erigon-lib/common"
+	"github.com/erigontech/erigon-lib/log/v3"
 	"github.com/erigontech/erigon/core/state"
 	"github.com/erigontech/erigon/core/vm"
 	"github.com/erigontech/erigon/eth/tracers"
@@ -56,11 +57,17 @@ type borStateSyncTxnTracer struct {
 }
 
 func (bsstt *borStateSyncTxnTracer) CaptureTxStart(_ uint64) {
-	bsstt.EVMLogger.CaptureTxStart(0)
+	if bsstt.stateSyncEventsCount == 0 {
+		log.Info("borStateSyncTxnTracer: CaptureTxStart called")
+		bsstt.EVMLogger.CaptureTxStart(0)
+	}
 }
 
 func (bsstt *borStateSyncTxnTracer) CaptureTxEnd(_ uint64) {
-	bsstt.EVMLogger.CaptureTxEnd(0)
+	if bsstt.stateSyncEventsCount == 0 {
+		log.Info("borStateSyncTxnTracer: CaptureTxEnd called")
+		bsstt.EVMLogger.CaptureTxEnd(0)
+	}
 }
 
 func (bsstt *borStateSyncTxnTracer) CaptureStart(

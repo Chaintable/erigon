@@ -5,8 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
-	"runtime"
-	"runtime/debug"
 	"time"
 
 	"github.com/erigontech/erigon-lib/common"
@@ -177,7 +175,7 @@ func (api *TraceAPIImpl) DebankBlockRaw(ctx context.Context, blockNrOrHash rpc.B
 				Origin:   common.Address{},
 				GasPrice: uint256.NewInt(0),
 			}
-			vmConfig.Debug = false
+			vmConfig.Debug = true
 			atracer := dtracer.NewCallTracer(blockFile, txCtx.TxHash.Hex())
 			vmConfig.Tracer = atracer
 			if vmConfig.Tracer != nil {
@@ -192,7 +190,6 @@ func (api *TraceAPIImpl) DebankBlockRaw(ctx context.Context, blockNrOrHash rpc.B
 			rules := chainConfig.Rules(blockNumber, block.Time())
 			log.Info("trace_debankBlock: processing Bor transaction", "blockNumber", block.NumberU64(), "blockHash", block.Hash().Hex(), "borTxHash", borTxHash.Hex())
 			a := 0
-			debug.SetGCPercent(50)
 			for _, msg := range stateSyncEvents {
 				gp := new(core.GasPool).AddGas(msg.Gas()).AddBlobGas(msg.BlobGas())
 				_, err := core.ApplyMessage(evm, msg, gp, true, false /* gasBailout */)
@@ -206,13 +203,8 @@ func (api *TraceAPIImpl) DebankBlockRaw(ctx context.Context, blockNrOrHash rpc.B
 					return nil, err
 				}
 
-				// evm.Reset(txCtx, ibs)
+				evm.Reset(txCtx, ibs)
 				a++
-
-				if a%200 == 0 {
-					runtime.GC()
-					debug.FreeOSMemory()
-				}
 			}
 
 			receipt := types.Receipt{
