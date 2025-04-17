@@ -178,7 +178,7 @@ func (f *callFrame) processOutput(output []byte, err error, reverted bool) {
 
 var _ vm.EVMLogger = (*callTracer)(nil)
 
-func (t *callTracer) ToTrace(f *callFrame) dtypes.Trace {
+func (t *callTracer) ToTrace(f *callFrame, traceAddress []int64) dtypes.Trace {
 	CallCreateType := ""
 	CallType := ""
 	switch f.Type {
@@ -216,6 +216,8 @@ func (t *callTracer) ToTrace(f *callFrame) dtypes.Trace {
 		PosInParentTrace:  int64(f.PosInParentTrace),
 		SelfStorageChange: f.SelfStorageChange,
 		StorageChange:     f.StorageChange,
+		Subtraces:         int64(len(f.Calls)),
+		TraceAddress:      traceAddress,
 	}
 }
 
@@ -356,16 +358,16 @@ func (t *callTracer) CaptureTxEnd(restGas uint64) {
 	if len(t.callstack) == 1 && !t.callstack[0].failed() {
 		topCall := &t.callstack[0]
 		topCall.TraceID = util.ToHash([]string{t.txID, "", "0"})
-		t.BlockFile.Traces = append(t.BlockFile.Traces, t.ToTrace(topCall))
-		t.addTraceAndLog(topCall)
+		t.BlockFile.Traces = append(t.BlockFile.Traces, t.ToTrace(topCall, []int64{}))
+		t.addTraceAndLog(topCall, []int64{})
 	}
 }
 
-func (t *callTracer) addTraceAndLog(cf *callFrame) {
+func (t *callTracer) addTraceAndLog(cf *callFrame, traceAddress []int64) {
 	for i := range cf.Calls {
 		cf.Calls[i].ParentTraceID = cf.TraceID
 		cf.Calls[i].TraceID = util.ToHash([]string{t.txID, cf.TraceID, fmt.Sprintf("%d", cf.Calls[i].PosInParentTrace)})
-		t.addTraceAndLog(&cf.Calls[i])
+		t.addTraceAndLog(&cf.Calls[i], childTraceAddress(traceAddress, int64(i)))
 	}
 	for i := range cf.Logs {
 		cf.Logs[i].ParentTraceID = cf.TraceID
@@ -373,7 +375,7 @@ func (t *callTracer) addTraceAndLog(cf *callFrame) {
 		t.BlockFile.Events = append(t.BlockFile.Events, cf.Logs[i])
 	}
 	for i := range cf.Calls {
-		t.BlockFile.Traces = append(t.BlockFile.Traces, t.ToTrace(&cf.Calls[i]))
+		t.BlockFile.Traces = append(t.BlockFile.Traces, t.ToTrace(&cf.Calls[i], childTraceAddress(traceAddress, int64(i))))
 	}
 }
 
@@ -399,6 +401,7 @@ func (t *callTracer) OnLog(logg *types.Log) {
 		Topics:   remainingTopics,
 		Data:     logg.Data,
 		Position: int64(len(t.callstack[len(t.callstack)-1].Calls) + len(t.callstack[len(t.callstack)-1].Logs)),
+		LogIndex: int64(logg.Index),
 	}
 	t.callstack[len(t.callstack)-1].Logs = append(t.callstack[len(t.callstack)-1].Logs, l)
 }
@@ -459,4 +462,11 @@ func GenesisAllocToStateDiff(genesisAlloc types.GenesisAlloc) *dtypes.BlockStora
 		})
 	}
 	return diff
+}
+
+func childTraceAddress(a []int64, i int64) []int64 {
+	child := make([]int64, 0, len(a)+1)
+	child = append(child, a...)
+	child = append(child, i)
+	return child
 }
