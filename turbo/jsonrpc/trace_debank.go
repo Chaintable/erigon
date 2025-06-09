@@ -109,10 +109,13 @@ func (api *TraceAPIImpl) DebankBlockRaw(ctx context.Context, blockNrOrHash rpc.B
 		return h
 	}
 	blockFile := &dtypes.BlockFile{
-		Block:  dtracer.BuildPipelineBlock(block),
-		Events: make([]dtypes.Event, 0),
-		Txs:    make([]dtypes.Transaction, 0),
-		Traces: make([]dtypes.Trace, 0),
+		Block:            dtracer.BuildPipelineBlock(block),
+		Events:           make([]dtypes.Event, 0),
+		Txs:              make([]dtypes.Transaction, 0),
+		Traces:           make([]dtypes.Trace, 0),
+		ErrorEvents:      make([]dtypes.Event, 0),
+		ErrorTraces:      make([]dtypes.Trace, 0),
+		StorageContracts: make([]string, 0),
 	}
 	stateHeader := dtracer.BuildPilelineBlockHeader(block)
 
