@@ -189,7 +189,7 @@ func (api *TraceAPIImpl) DebankBlockRaw(ctx context.Context, blockNrOrHash rpc.B
 			rules := chainConfig.Rules(blockNumber, block.Time())
 			for _, msg := range stateSyncEvents {
 				gp := new(core.GasPool).AddGas(msg.Gas()).AddBlobGas(msg.BlobGas())
-				_, err := core.ApplyMessage(evm, msg, gp, true, false /* gasBailout */)
+				_, err := core.ApplyMessage(evm, msg, gp, true, false /* gasBailout */, api.engine())
 				if err != nil {
 					return nil, err
 				}
