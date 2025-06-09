@@ -1,5 +1,5 @@
 # syntax = docker/dockerfile:1.2
-FROM docker.io/library/golang:1.22-bullseye as builder
+FROM docker.io/library/golang:1.23-bullseye as builder
 
 ARG ACCESS_TOKEN
 
