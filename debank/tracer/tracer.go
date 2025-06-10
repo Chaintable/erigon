@@ -437,7 +437,19 @@ func OnGenesisBlock(block *types.Block, alloc types.GenesisAlloc) (*dtypes.Deban
 	blockDiff.ParentHash = types.EmptyRootHash
 
 	blockFile := &dtypes.BlockFile{
-		Block: BuildPipelineBlock(block),
+		Block:            BuildPipelineBlock(block),
+		Txs:              make([]dtypes.Transaction, 0),
+		Events:           make([]dtypes.Event, 0),
+		Traces:           make([]dtypes.Trace, 0),
+		ErrorEvents:      make([]dtypes.Event, 0),
+		ErrorTraces:      make([]dtypes.Trace, 0),
+		StorageContracts: make([]string, 0),
+	}
+
+	for _, acc := range blockDiff.StorageDiff {
+		if len(acc.Values) > 0 {
+			blockFile.StorageContracts = append(blockFile.StorageContracts, strings.ToLower(acc.Address.String()))
+		}
 	}
 
 	return &dtypes.DebankOutPut{
