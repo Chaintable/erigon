@@ -265,10 +265,8 @@ func (api *TraceAPIImpl) DebankBlockRaw(ctx context.Context, blockNrOrHash rpc.B
 
 	stateDiff := writer.ToStateDiff(parentHeader.Root, newBlock.Root())
 
-	for _, acc := range stateDiff.StorageDiff {
-		if len(acc.Values) > 0 {
-			blockFile.StorageContracts = append(blockFile.StorageContracts, strings.ToLower(acc.Address.String()))
-		}
+	for addr := range writer.StorageChanges {
+		blockFile.StorageContracts = append(blockFile.StorageContracts, strings.ToLower(addr.Hex()))
 	}
 
 	out := &dtypes.DebankOutPut{

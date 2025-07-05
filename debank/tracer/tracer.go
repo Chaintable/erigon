@@ -24,6 +24,7 @@ type BlockStorageDiffMap struct {
 	DeletedAccounts map[common.Hash]struct{}
 	StorageDiff     map[common.Hash]map[common.Hash]*uint256.Int
 	NewCodes        map[common.Hash]dtypes.NewCode
+	StorageChanges  map[common.Address]struct{} // Used to track storage changes for contracts
 }
 
 func NewBlockStorageDiff() *BlockStorageDiffMap {
@@ -32,6 +33,7 @@ func NewBlockStorageDiff() *BlockStorageDiffMap {
 		DeletedAccounts: make(map[common.Hash]struct{}),
 		StorageDiff:     make(map[common.Hash]map[common.Hash]*uint256.Int),
 		NewCodes:        make(map[common.Hash]dtypes.NewCode),
+		StorageChanges:  make(map[common.Address]struct{}),
 	}
 }
 
@@ -100,6 +102,7 @@ func (bs *BlockStorageDiffMap) WriteAccountStorage(address common.Address, incar
 	}
 	storageDiff := bs.StorageDiff[addrhash]
 	storageDiff[crypto.Keccak256Hash(key.Bytes())] = value
+	bs.DeletedAccounts[addrhash] = struct{}{}
 	return nil
 }
 
@@ -446,12 +449,11 @@ func OnGenesisBlock(block *types.Block, alloc types.GenesisAlloc) (*dtypes.Deban
 		StorageContracts: make([]string, 0),
 	}
 
-	for _, acc := range blockDiff.StorageDiff {
-		if len(acc.Values) > 0 {
-			blockFile.StorageContracts = append(blockFile.StorageContracts, strings.ToLower(acc.Address.String()))
+	for addr, acc := range alloc {
+		if len(acc.Storage) > 0 {
+			blockFile.StorageContracts = append(blockFile.StorageContracts, strings.ToLower(addr.Hex()))
 		}
 	}
-
 	return &dtypes.DebankOutPut{
 		BlockFile:      blockFile,
 		Header:         header,
