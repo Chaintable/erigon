@@ -723,6 +723,9 @@ func (c *AuRa) Finalize(config *chain.Config, header *types.Header, state *state
 		return nil, nil, nil, err
 	}
 
+	c.signerMutex.Lock()
+	defer c.signerMutex.Unlock()
+
 	// check_and_lock_block -> check_epoch_end_signal (after enact)
 	if header.Number.Uint64() >= DEBUG_LOG_FROM {
 		fmt.Printf("finalize1: %d,%d\n", header.Number.Uint64(), len(receipts))

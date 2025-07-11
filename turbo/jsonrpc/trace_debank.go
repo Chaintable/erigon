@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/erigontech/erigon-lib/common"
+	"github.com/erigontech/erigon-lib/common/hexutility"
 	"github.com/erigontech/erigon-lib/kv"
 	"github.com/erigontech/erigon-lib/kv/rawdbv3"
 	"github.com/erigontech/erigon-lib/log/v3"
@@ -282,7 +283,7 @@ func (api *TraceAPIImpl) DebankBlockRaw(ctx context.Context, blockNrOrHash rpc.B
 type DebankOutPutJs struct {
 	BlockFile      *dtypes.BlockFile `json:"block_file"`
 	Header         *dtypes.Header    `json:"header"`
-	StateDiff      []byte            `json:"state_diff"`
+	StateDiff      hexutility.Bytes  `json:"state_diff"`
 	ValidationHash int64             `json:"validation_hash"`
 }
 
