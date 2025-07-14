@@ -102,7 +102,7 @@ func (bs *BlockStorageDiffMap) WriteAccountStorage(address common.Address, incar
 	}
 	storageDiff := bs.StorageDiff[addrhash]
 	storageDiff[crypto.Keccak256Hash(key.Bytes())] = value
-	bs.DeletedAccounts[addrhash] = struct{}{}
+	bs.StorageChanges[address] = struct{}{}
 	return nil
 }
 
