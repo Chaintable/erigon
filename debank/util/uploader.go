@@ -159,6 +159,10 @@ func (u *Uploader) UploadDebankOutPut(ctx context.Context, out *dtypes.DebankOut
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
+		// 如果StateDiff的Hash和ParentHash相同，说明是empty block，不用上传
+		if out.StateDiff.Hash == out.StateDiff.ParentHash {
+			return
+		}
 		err := u.uploadStateDiff(u.chainID, out.StateDiff)
 		if err != nil {
 			lock.Lock()
