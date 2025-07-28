@@ -13,6 +13,7 @@ import (
 	"github.com/erigontech/erigon-lib/kv"
 	"github.com/erigontech/erigon-lib/kv/rawdbv3"
 	"github.com/erigontech/erigon-lib/log/v3"
+	"github.com/erigontech/erigon-lib/metrics"
 	"github.com/erigontech/erigon-lib/rlp"
 	"github.com/erigontech/erigon/consensus"
 	"github.com/erigontech/erigon/core"
@@ -33,6 +34,18 @@ import (
 	"github.com/erigontech/erigon/turbo/snapshotsync/freezeblocks"
 	"github.com/erigontech/erigon/turbo/transactions"
 	"github.com/holiman/uint256"
+)
+
+var (
+	LatestBlockNumber = metrics.GetOrCreateGauge("pipeline_block_num")
+
+	ChainHeadNumber = metrics.GetOrCreateGauge("chain_head_block")
+
+	LatestBlockTime = metrics.GetOrCreateGauge("pipeline_block_time")
+
+	NodeInfo = metrics.GetOrCreateGauge(`pipeline_node_info{role="writer"}`)
+
+	BlockProcessTimer = metrics.GetOrCreateSummary("pipeline/block_process")
 )
 
 func (api *TraceAPIImpl) DebankBlockRaw(ctx context.Context, blockNrOrHash rpc.BlockNumberOrHash) (*dtypes.DebankOutPut, error) {
@@ -68,6 +81,10 @@ func (api *TraceAPIImpl) DebankBlockRaw(ctx context.Context, blockNrOrHash rpc.B
 		genesis := core.GenesisBlockByChainName(chainConfig.ChainName)
 		return dtracer.OnGenesisBlock(block, genesis.Alloc)
 	}
+
+	LatestBlockNumber.SetUint64(block.NumberU64())
+	ChainHeadNumber.SetUint64(block.NumberU64())
+	LatestBlockTime.SetUint64(block.Time())
 
 	parentHash := block.ParentHash()
 	parentHeader, err := api._blockReader.Header(ctx, dbtx, parentHash, block.NumberU64()-1)
@@ -288,6 +305,8 @@ type DebankOutPutJs struct {
 }
 
 func (api *TraceAPIImpl) DebankBlock(ctx context.Context, blockNrOrHash rpc.BlockNumberOrHash) (*DebankOutPutJs, error) {
+	start := time.Now()
+	defer BlockProcessTimer.Observe(float64(time.Since(start)))
 	output, err := api.DebankBlockRaw(ctx, blockNrOrHash)
 	if err != nil {
 		return nil, err
