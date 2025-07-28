@@ -45,7 +45,7 @@ var (
 
 	NodeInfo = metrics.GetOrCreateGauge(`pipeline_node_info{role="writer"}`)
 
-	BlockProcessTimer = metrics.GetOrCreateSummary("pipeline_block_process")
+	BlockProcessTimer = metrics.GetOrCreateSummary("chain_inserts")
 )
 
 func (api *TraceAPIImpl) DebankBlockRaw(ctx context.Context, blockNrOrHash rpc.BlockNumberOrHash) (*dtypes.DebankOutPut, error) {
@@ -306,7 +306,6 @@ type DebankOutPutJs struct {
 
 func (api *TraceAPIImpl) DebankBlock(ctx context.Context, blockNrOrHash rpc.BlockNumberOrHash) (*DebankOutPutJs, error) {
 	start := time.Now()
-	defer BlockProcessTimer.Observe(float64(time.Since(start)))
 	output, err := api.DebankBlockRaw(ctx, blockNrOrHash)
 	if err != nil {
 		return nil, err
@@ -316,6 +315,7 @@ func (api *TraceAPIImpl) DebankBlock(ctx context.Context, blockNrOrHash rpc.Bloc
 		return nil, err
 	}
 
+	BlockProcessTimer.Observe(float64(time.Since(start)))
 	return &DebankOutPutJs{
 		BlockFile:      output.BlockFile,
 		Header:         output.Header,
