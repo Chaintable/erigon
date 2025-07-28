@@ -422,7 +422,7 @@ func newGaugeVec(name string, labels []string, help ...string) (*prometheus.Gaug
 
 const defaultSummaryWindow = 5 * time.Minute
 
-var defaultSummaryQuantiles = map[float64]float64{0.5: 0.05, 0.9: 0.01, 0.97: 0.003, 0.99: 0.001}
+var defaultSummaryQuantiles = map[float64]float64{0.5: 0.05, 0.75: 0.025, 0.9: 0.01, 0.95: 0.005, 0.99: 0.001}
 
 // NewSummary creates and returns new summary with the given name in s.
 //
