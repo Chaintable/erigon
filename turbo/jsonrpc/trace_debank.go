@@ -45,7 +45,7 @@ var (
 
 	NodeInfo = metrics.GetOrCreateGauge(`pipeline_node_info{role="writer"}`)
 
-	BlockProcessTimer = metrics.GetOrCreateSummary("pipeline/block_process")
+	BlockProcessTimer = metrics.GetOrCreateSummary("pipeline_block_process")
 )
 
 func (api *TraceAPIImpl) DebankBlockRaw(ctx context.Context, blockNrOrHash rpc.BlockNumberOrHash) (*dtypes.DebankOutPut, error) {
