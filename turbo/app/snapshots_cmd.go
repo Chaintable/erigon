@@ -52,7 +52,6 @@ import (
 	"github.com/erigontech/erigon-lib/etl"
 	"github.com/erigontech/erigon-lib/kv"
 	"github.com/erigontech/erigon-lib/kv/mdbx"
-	"github.com/erigontech/erigon-lib/kv/rawdbv3"
 	"github.com/erigontech/erigon-lib/kv/temporal"
 	"github.com/erigontech/erigon-lib/log/v3"
 	"github.com/erigontech/erigon-lib/metrics"
@@ -220,6 +219,15 @@ var snapshotCommand = cli.Command{
 			Action: func(cliCtx *cli.Context) error {
 				dirs := datadir.New(cliCtx.String(utils.DataDirFlag.Name))
 				return dir.DeleteFiles(dirs.SnapIdx, dirs.SnapHistory, dirs.SnapDomain, dirs.SnapAccessors)
+			},
+			Flags: joinFlags([]cli.Flag{&utils.DataDirFlag}),
+		},
+		{
+			Name:  "reset-to-old-ver-format",
+			Usage: "change all the snapshots to 3.0 file format",
+			Action: func(cliCtx *cli.Context) error {
+				dirs := datadir.New(cliCtx.String(utils.DataDirFlag.Name))
+				return dirs.RenameNewVersions()
 			},
 			Flags: joinFlags([]cli.Flag{&utils.DataDirFlag}),
 		},
@@ -679,6 +687,10 @@ func doIntegrity(cliCtx *cli.Context) error {
 			if err := blockReader.(*freezeblocks.BlockReader).IntegrityTxnID(failFast); err != nil {
 				return err
 			}
+		case integrity.HeaderNoGaps:
+			if err := integrity.NoGapsInCanonicalHeaders(ctx, db, blockReader, failFast); err != nil {
+				return err
+			}
 		case integrity.Blocks:
 			if err := integrity.SnapBlocksRead(ctx, db, blockReader, 0, 0, failFast); err != nil {
 				return err
@@ -708,7 +720,7 @@ func doIntegrity(cliCtx *cli.Context) error {
 				return err
 			}
 		case integrity.ReceiptsNoDups:
-			if err := integrity.ReceiptsNoDuplicates(ctx, db, blockReader, failFast); err != nil {
+			if err := integrity.CheckReceiptsNoDups(ctx, db, blockReader, failFast); err != nil {
 				return err
 			}
 		default:
@@ -1320,7 +1332,7 @@ func openSnaps(ctx context.Context, cfg ethconfig.BlocksFreezing, dirs datadir.D
 	}
 	defer tx.Rollback()
 	stats.LogStats(tx, logger, func(endTxNumMinimax uint64) (uint64, error) {
-		_, histBlockNumProgress, err := rawdbv3.TxNums.WithCustomReadTxNumFunc(freezeblocks.ReadTxNumFuncFromBlockReader(ctx, blockReader)).FindBlockNum(tx, endTxNumMinimax)
+		histBlockNumProgress, _, err := blockReader.TxnumReader(ctx).FindBlockNum(tx, endTxNumMinimax)
 		return histBlockNumProgress, err
 	})
 
@@ -1477,8 +1489,8 @@ func doCompress(cliCtx *cli.Context) error {
 			concatBuf = concatBuf[:0]
 		}
 
-		compressionPageBuf, word = compress.EncodeZstdIfNeed(compressionPageBuf, word, doSnappyEachWord)
-		decompressionPageBuf, word, err = compress.DecodeZstdIfNeed(decompressionPageBuf, word, doUnSnappyEachWord)
+		compressionPageBuf, word = compress.EncodeZstdIfNeed(compressionPageBuf[:0], word, doSnappyEachWord)
+		decompressionPageBuf, word, err = compress.DecodeZstdIfNeed(decompressionPageBuf[:0], word, doUnSnappyEachWord)
 		if err != nil {
 			return err
 		}
@@ -1687,7 +1699,7 @@ func doRetireCommand(cliCtx *cli.Context, dirs datadir.Dirs) error {
 	blocksInSnapshots := blockReader.FrozenBlocks()
 
 	if chainConfig.Bor != nil {
-		blocksInSnapshots = min(blocksInSnapshots, blockReader.FrozenBorBlocks())
+		blocksInSnapshots = min(blocksInSnapshots, blockReader.FrozenBorBlocks(false))
 	}
 
 	from2, to2, ok := freezeblocks.CanRetire(to, blocksInSnapshots, coresnaptype.Enums.Headers, nil)
@@ -1706,7 +1718,7 @@ func doRetireCommand(cliCtx *cli.Context, dirs datadir.Dirs) error {
 	allDeletedBlocks := 0
 	for deletedBlocks > 0 { // prune happens by small steps, so need many runs
 		err = db.UpdateNosync(ctx, func(tx kv.RwTx) error {
-			if deletedBlocks, err = br.PruneAncientBlocks(tx, 100); err != nil {
+			if deletedBlocks, err = br.PruneAncientBlocks(tx, 100, time.Hour); err != nil {
 				return err
 			}
 			return nil
@@ -1745,7 +1757,7 @@ func doRetireCommand(cliCtx *cli.Context, dirs datadir.Dirs) error {
 		return err
 	}
 
-	txNumsReader := rawdbv3.TxNums.WithCustomReadTxNumFunc(freezeblocks.ReadTxNumFuncFromBlockReader(ctx, blockReader))
+	txNumsReader := blockReader.TxnumReader(ctx)
 	var lastTxNum uint64
 	if err := db.Update(ctx, func(tx kv.RwTx) error {
 		execProgress, _ := stages.GetStageProgress(tx, stages.Execution)

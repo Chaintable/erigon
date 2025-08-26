@@ -340,7 +340,7 @@ var ErrNothingToPrune = errors.New("nothing to prune")
 
 var mxPruneTookBor = metrics.GetOrCreateSummary(`prune_seconds{type="bor"}`)
 
-func (br *BlockRetire) PruneAncientBlocks(tx kv.RwTx, limit int) (deleted int, err error) {
+func (br *BlockRetire) PruneAncientBlocks(tx kv.RwTx, limit int, timeout time.Duration) (deleted int, err error) {
 	if br.blockReader.FreezingCfg().KeepBlocks {
 		return deleted, nil
 	}
@@ -348,17 +348,31 @@ func (br *BlockRetire) PruneAncientBlocks(tx kv.RwTx, limit int) (deleted int, e
 	if err != nil {
 		return deleted, err
 	}
-	if canDeleteTo := CanDeleteTo(currentProgress, br.blockReader.FrozenBlocks()); canDeleteTo > 0 {
-		br.logger.Debug("[snapshots] Prune Blocks", "to", canDeleteTo, "limit", limit)
-		deletedBlocks, err := br.blockWriter.PruneBlocks(context.Background(), tx, canDeleteTo, limit)
-		if err != nil {
-			return deleted, err
-		}
-		deleted += deletedBlocks
-	}
 
-	if br.chainConfig.Bor != nil {
-		if canDeleteTo := CanDeleteTo(currentProgress, br.blockReader.FrozenBorBlocks()); canDeleteTo > 0 {
+	t := time.Now()
+	frozenBlocks := br.blockReader.FrozenBlocks()
+	isBor := br.chainConfig.Bor != nil
+
+	for i := 0; i < limit; i++ {
+		if time.Since(t) > timeout {
+			break
+		}
+		if canDeleteTo := CanDeleteTo(currentProgress, frozenBlocks); canDeleteTo > 0 {
+			br.logger.Debug("[snapshots] Prune Blocks", "to", canDeleteTo, "limit", limit)
+			deletedBlocks, err := br.blockWriter.PruneBlocks(context.Background(), tx, canDeleteTo, 1)
+			if err != nil {
+				return deleted, err
+			}
+			deleted += deletedBlocks
+		}
+
+		if !isBor {
+			continue
+		}
+
+		frozenBlocks := br.blockReader.FrozenBorBlocks(true)
+
+		if canDeleteTo := CanDeleteTo(currentProgress, frozenBlocks); canDeleteTo > 0 {
 			// PruneBorBlocks - [1, to) old blocks after moving it to snapshots.
 
 			deletedBorBlocks, err := func() (deleted int, err error) {
@@ -370,7 +384,7 @@ func (br *BlockRetire) PruneAncientBlocks(tx kv.RwTx, limit int) (deleted int, e
 				}
 
 				return bordb.PruneHeimdall(context.Background(),
-					br.heimdallStore, br.bridgeStore, pruneTx, canDeleteTo, limit)
+					br.heimdallStore, br.bridgeStore, pruneTx, canDeleteTo, 1)
 			}()
 			br.logger.Debug("[snapshots] Prune Bor Blocks", "to", canDeleteTo, "limit", limit, "deleted", deleted, "err", err)
 			if err != nil {
@@ -378,7 +392,6 @@ func (br *BlockRetire) PruneAncientBlocks(tx kv.RwTx, limit int) (deleted int, e
 			}
 			deleted += deletedBorBlocks
 		}
-
 	}
 
 	return deleted, nil
@@ -406,6 +419,9 @@ func (br *BlockRetire) RetireBlocksInBackground(ctx context.Context, minBlockNum
 		}
 
 		err := br.RetireBlocks(ctx, minBlockNum, maxBlockNum, lvl, seedNewSnapshots, onDeleteSnapshots, onFinishRetire)
+		if errors.Is(err, heimdall.ErrHeimdallDataIsNotReady) {
+			return
+		}
 		if err != nil {
 			br.logger.Warn("[snapshots] retire blocks", "err", err)
 			return
@@ -452,7 +468,7 @@ func (br *BlockRetire) RetireBlocks(ctx context.Context, requestedMinBlockNum ui
 		}
 
 		if includeBor {
-			minBorBlockNum := max(br.blockReader.FrozenBorBlocks(), requestedMinBlockNum)
+			minBorBlockNum := max(br.blockReader.FrozenBorBlocks(false), requestedMinBlockNum)
 			okBor, err = br.retireBorBlocks(ctx, minBorBlockNum, maxBlockNum, lvl, seedNewSnapshots, onDeleteSnapshots)
 			if err != nil {
 				return err

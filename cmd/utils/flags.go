@@ -1132,7 +1132,7 @@ var (
 		Usage: "Enabling Polygon PoS Single Slot Finality since block",
 	}
 	KeepExecutionProofsFlag = cli.BoolFlag{
-		Name:  "experimental.commitment-history",
+		Name:  "prune.experimental.include-commitment-history",
 		Usage: "Enables blazing fast eth_getProof for executed block",
 	}
 )
@@ -1746,7 +1746,7 @@ func setBorConfig(ctx *cli.Context, cfg *ethconfig.Config, nodeConfig *nodecfg.C
 }
 
 func setMiner(ctx *cli.Context, cfg *params.MiningConfig) {
-	cfg.Enabled = ctx.IsSet(MiningEnabledFlag.Name)
+	cfg.Enabled = ctx.Bool(MiningEnabledFlag.Name)
 	cfg.EnabledPOS = !ctx.IsSet(ProposingDisableFlag.Name)
 
 	if cfg.Enabled && len(cfg.Etherbase.Bytes()) == 0 {

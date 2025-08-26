@@ -31,7 +31,6 @@ import (
 	"github.com/erigontech/erigon/polygon/tracer"
 	"github.com/erigontech/erigon/rpc"
 	"github.com/erigontech/erigon/turbo/rpchelper"
-	"github.com/erigontech/erigon/turbo/snapshotsync/freezeblocks"
 	"github.com/erigontech/erigon/turbo/transactions"
 	"github.com/holiman/uint256"
 )
@@ -92,7 +91,7 @@ func (api *TraceAPIImpl) DebankBlockRaw(ctx context.Context, blockNrOrHash rpc.B
 		return nil, err
 	}
 
-	stateReader, err := CreateHistoryStateReader2(dbtx, rawdbv3.TxNums.WithCustomReadTxNumFunc(freezeblocks.ReadTxNumFuncFromBlockReader(ctx, api._blockReader)), header.Number.Uint64(), 0, chainConfig.ChainName)
+	stateReader, err := CreateHistoryStateReader2(dbtx, api._txNumReader, header.Number.Uint64(), 0, chainConfig.ChainName)
 	if err != nil {
 		return nil, err
 	}
