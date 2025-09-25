@@ -196,17 +196,17 @@ jobs:
 
   build-debian-pkg:
     name: Debian packages
-    needs: [ build-release, ]
-    if: always() && contains(needs.build-release.result, 'success') && !contains(needs.test-release.result, 'failure')
-    uses: erigontech/erigon/.github/workflows/reusable-release-build-debian-pkg.yml@release/3.1
+    needs: [ build-release ]
+    if: always() && contains(needs.build-release.result, 'success')
+    uses: 0xpolygon/erigon/.github/workflows/reusable-release-build-debian-pkg.yml@release/3.1
     with:
       application: ${{ needs.build-release.outputs.application }}
       version: ${{ needs.build-release.outputs.parsed-version }}
 
 
   publish-docker-image:
-    needs: [ build-release, ]
-    if: always() && contains(needs.build-release.result, 'success') && !contains(needs.test-release.result, 'failure')
+    needs: [ build-release ]
+    if: always() && contains(needs.build-release.result, 'success')
     runs-on: ubuntu24.04-16core-64GB-600SSD-bor
     timeout-minutes: 30
     name: Docker image
@@ -316,7 +316,7 @@ jobs:
   In-case-of-failure:
     name: "In case of failure: remove remote git tag pointing to the new version."
     needs: [ publish-release, build-release, build-debian-pkg, publish-docker-image ]
-    if: always() && !contains(needs.build-release.result, 'success') && contains(needs.test-release.result, 'failure') && !contains(needs.publish-release.result, 'success') && !contains(needs.build-debian-pkg.result, 'success') && !contains(needs.publish-docker-image.result, 'success')
+    if: always() && !contains(needs.build-release.result, 'success') && !contains(needs.publish-release.result, 'success') && !contains(needs.build-debian-pkg.result, 'success') && !contains(needs.publish-docker-image.result, 'success')
     runs-on: ubuntu24.04-16core-64GB-600SSD-bor
 
     steps:
