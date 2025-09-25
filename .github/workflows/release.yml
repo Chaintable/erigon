@@ -9,11 +9,10 @@ env:
   TEST_CHAIN: "mainnet"
   BUILDER_IMAGE: "golang:1.24-bookworm"
   DOCKER_BASE_IMAGE: "debian:12-slim"
-  APP_REPO: "erigontech/erigon"
+  APP_REPO: "0xpolygon/erigon"
   PACKAGE: "github.com/erigontech/erigon"
   BINARIES: "erigon downloader devnet evm caplin diag integration rpcdaemon sentry txpool"
-  DOCKERHUB_REPOSITORY: "erigontech/erigon"
-  DOCKERHUB_REPOSITORY_DEV: "erigontech/dev-erigon"
+  DOCKERHUB_REPOSITORY: "0xpolygon/erigon"
   DOCKERFILE_PATH: "Dockerfile"
   LABEL_DESCRIPTION: "Erigon is an implementation of Ethereum (execution layer with embeddable consensus layer), on the efficiency frontier. Archive Node by default."
 
@@ -48,8 +47,7 @@ on:
 jobs:
 
   build-release:
-    #runs-on: ubuntu-latest
-    runs-on: [devops-01-self-hosted]
+    runs-on: ubuntu24.04-16core-64GB-600SSD-bor
     timeout-minutes: 60
     name: Create git tag, build and publish Release Artifacts
     outputs:
@@ -100,10 +98,10 @@ jobs:
           echo "parsed_version=$(echo ${{ inputs.release_version }} | sed -e 's/^v//g')" >> $GITHUB_OUTPUT
 
       - name: Login to Docker Hub
-        uses: docker/login-action@9780b0c442fbb1117ed29e0efdff1e18412f7567  ## v3.3.0
+        uses: docker/login-action@v3
         with:
-          username: ${{ secrets.ORG_DOCKERHUB_ERIGONTECH_USERNAME }}
-          password: ${{ secrets.ORG_DOCKERHUB_ERIGONTECH_TOKEN }}
+          username: ${{ secrets.DOCKERHUB }}
+          password: ${{ secrets.DOCKERHUB_KEY }}
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
@@ -114,7 +112,7 @@ jobs:
       - name: Build and push temporary multiplatform image, store outputs locally for further processing
         env:
           BUILD_VERSION: ${{ inputs.release_version }}
-          DOCKER_URL: ${{ env.DOCKERHUB_REPOSITORY_DEV }}
+          DOCKER_URL: ${{ env.DOCKERHUB_REPOSITORY }}
         run: |
           cd erigon;
           docker buildx build \
@@ -125,10 +123,10 @@ jobs:
             --sbom=true \
             --platform linux/amd64,linux/amd64/v2,linux/arm64 \
             --label org.opencontainers.image.created=$(date -u +'%Y-%m-%dT%H:%M:%SZ') \
-            --label org.opencontainers.image.authors="https://github.com/erigontech/erigon/graphs/contributors" \
-            --label org.opencontainers.image.url="https://github.com/erigontech/erigon/tree/${{ inputs.checkout_ref }}" \
+            --label org.opencontainers.image.authors="https://github.com/0xpolygon/erigon/graphs/contributors" \
+            --label org.opencontainers.image.url="https://github.com/0xpolygon/erigon/tree/${{ inputs.checkout_ref }}" \
             --label org.opencontainers.image.documentation="https://docs.erigon.tech/" \
-            --label org.opencontainers.image.source="https://github.com/erigontech/erigon" \
+            --label org.opencontainers.image.source="https://github.com/0xpolygon/erigon" \
             --label org.opencontainers.image.version=${{ inputs.release_version }} \
             --label org.opencontainers.image.revision=${{ steps.getCommitId.outputs.commit-id }} \
             --label org.opencontainers.image.vcs-ref-short=${{ steps.getCommitId.outputs.short-commit-id }} \
@@ -196,100 +194,9 @@ jobs:
           compression-level: 0
           if-no-files-found: error
 
-  test-release:
-    name: test on ${{ matrix.id }}
-    if: ${{ ! inputs.skip_tests }}
-    runs-on: [ self-hosted, qa, Release, "${{ matrix.runner-arch }}" ]
-    timeout-minutes: 2800  # 2 days
-    needs: [ build-release ]
-    strategy:
-      matrix:
-        include:
-          - id: linux/amd64
-            runner-arch: X64
-            artifact: linux_amd64
-          - id: linux/arm64
-            runner-arch: ARM64
-            artifact: linux_arm64
-
-    steps:
-
-      - name: Cleanup working directory
-        run: rm -drfv *
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-
-      - name: Download artifact ${{ env.APPLICATION }}_${{ inputs.release_version }}_${{ matrix.artifact }}.tar
-        uses: actions/download-artifact@v4
-        with:
-          name: ${{ env.APPLICATION }}_${{ inputs.release_version }}_${{ matrix.artifact }}.tar
-          path: .
-
-      - name: Extract artifact ${{ env.APPLICATION }}_${{ inputs.release_version }}_${{ matrix.artifact }}.tar
-        run: |
-          pwd
-          ls -l ${{ env.APPLICATION }}_${{ inputs.release_version }}_${{ matrix.artifact }}.tar
-          tar xvf ${{ env.APPLICATION }}_${{ inputs.release_version }}_${{ matrix.artifact }}.tar
-          ls -lR
-
-      - name: Fast checkout git repository erigontech/erigon-qa
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 ## 4.2.2
-        with:
-          token: ${{ secrets.ORG_GITHUB_ERIGONTECH_ERIGON_QA_READ }}
-          repository: erigontech/erigon-qa
-          fetch-depth: 1
-          ref: main
-          path: erigon-qa
-
-      - name: Run QA Tests
-        run: |
-          cd ./erigon-qa/test_system
-          pwd
-          ls -lao
-          pip3 install -r requirements.txt   
-          ln -s $(pwd)/base_library $(pwd)/qa-tests/tip-tracking/base_library
-          echo "DEBUG -- content of directory $(pwd) :"
-          ls -l
-          echo "DEBUG -- content of directory $(pwd)/qa-tests/tip-tracking/"
-          ls -l $(pwd)/qa-tests/tip-tracking/
-          echo "DEBUG -- content of directory GITHUB_WORKSPACE ${GITHUB_WORKSPACE} :"
-          ls -l ${GITHUB_WORKSPACE}
-          echo "DEBUG -- end."
-          rm -rf ${RUNNER_WORKSPACE}/erigon-data || true
-          mkdir ${RUNNER_WORKSPACE}/erigon-data
-          # Run Erigon, wait sync and check ability to maintain sync
-          python3 qa-tests/tip-tracking/run_and_check_tip_tracking.py \
-            ${GITHUB_WORKSPACE}/${{ env.APPLICATION }}_${{ inputs.release_version }}_${{ matrix.artifact }} \
-              ${RUNNER_WORKSPACE}/erigon-data ${{ env.TEST_TRACKING_TIME_SECONDS }} ${{ env.TEST_TOTAL_TIME_SECONDS }} ${{ env.APPLICATION_VERSION }} ${{ env.TEST_CHAIN }}
-          # Capture monitoring script exit status
-          test_exit_status=$?
-          # Save the subsection reached status
-          echo "test_executed=true" >> "$GITHUB_OUTPUT"
-          # Check test runner script exit status
-          if [ $test_exit_status -eq 0 ]; then
-            echo "Tests completed successfully"
-            echo "TEST_RESULT=success" >> "$GITHUB_OUTPUT"
-          else
-            echo "Error detected during tests"
-            echo "TEST_RESULT=failure" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Upload Downloader Torrent Client Status
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: torrent-client-status-${{ matrix.artifact }}
-          path: torrent-client-status.txt
-
-      - name: Cleanup working directory
-        run: rm -drfv *
-
   build-debian-pkg:
     name: Debian packages
-    needs: [ build-release, test-release ]
+    needs: [ build-release, ]
     if: always() && contains(needs.build-release.result, 'success') && !contains(needs.test-release.result, 'failure')
     uses: erigontech/erigon/.github/workflows/reusable-release-build-debian-pkg.yml@release/3.1
     with:
@@ -298,11 +205,11 @@ jobs:
 
 
   publish-docker-image:
-    needs: [ build-release, test-release ]
+    needs: [ build-release, ]
     if: always() && contains(needs.build-release.result, 'success') && !contains(needs.test-release.result, 'failure')
-    runs-on: ubuntu-latest
+    runs-on: ubuntu24.04-16core-64GB-600SSD-bor
     timeout-minutes: 30
-    name: Docker image        
+    name: Docker image
 
     steps:
 
@@ -332,29 +239,26 @@ jobs:
     - name: Login to Docker Hub
       uses: docker/login-action@9780b0c442fbb1117ed29e0efdff1e18412f7567  ## v3.3.0
       with:
-        username: ${{ secrets.ORG_DOCKERHUB_ERIGONTECH_USERNAME }}
-        password: ${{ secrets.ORG_DOCKERHUB_ERIGONTECH_TOKEN }}
+        username: ${{ secrets.DOCKERHUB }}
+        password: ${{ secrets.DOCKERHUB_KEY }}
 
     - name: Push multi-platform docker images (${{ env.BUILD_VERSION }}${{ inputs.publish_latest_tag == true && ' and latest tag'}}) in case perform_release is true
       if: ${{ inputs.perform_release }}
       env:
         BUILD_VERSION: ${{ inputs.release_version }}
         DOCKER_URL: ${{ env.DOCKERHUB_REPOSITORY }}
-        DOCKER_URL_TMP: ${{ env.DOCKERHUB_REPOSITORY_DEV }}
       run: |
         echo Publishing docker image: 
-        skopeo copy --multi-arch all docker://${{ env.DOCKER_URL_TMP }}:${{ env.BUILD_VERSION }} docker://${{ env.DOCKER_URL }}:${{ env.BUILD_VERSION }}
+        # images are already built+push in build-release
         if [ "x${{ inputs.publish_latest_tag }}" == "xtrue" ]; then
           echo Publishing latest tag:
-          skopeo copy --multi-arch all docker://${{ env.DOCKER_URL_TMP }}:${{ env.BUILD_VERSION }} docker://${{ env.DOCKER_URL }}:latest
+          skopeo copy --multi-arch all docker://${{ env.DOCKER_URL }}:${{ env.BUILD_VERSION }} docker://${{ env.DOCKER_URL }}:latest
         fi
-        echo -n Deleting temporary image:
-        skopeo delete docker://${{ env.DOCKER_URL_TMP }}:${{ env.BUILD_VERSION }} && echo " ...done"
 
   publish-release:
     needs: [ build-debian-pkg, publish-docker-image, build-release ]
     if: always() && contains(needs.build-release.result, 'success') && contains(needs.build-debian-pkg.result, 'success') && contains(needs.publish-docker-image.result, 'success')
-    runs-on: ubuntu-latest
+    runs-on: ubuntu24.04-16core-64GB-600SSD-bor
     timeout-minutes: 15
     name: Publish release notes
 
@@ -411,9 +315,9 @@ jobs:
 
   In-case-of-failure:
     name: "In case of failure: remove remote git tag pointing to the new version."
-    needs: [ publish-release, build-release, test-release, build-debian-pkg, publish-docker-image ]
+    needs: [ publish-release, build-release, build-debian-pkg, publish-docker-image ]
     if: always() && !contains(needs.build-release.result, 'success') && contains(needs.test-release.result, 'failure') && !contains(needs.publish-release.result, 'success') && !contains(needs.build-debian-pkg.result, 'success') && !contains(needs.publish-docker-image.result, 'success')
-    runs-on: ubuntu-latest
+    runs-on: ubuntu24.04-16core-64GB-600SSD-bor
 
     steps:
       - name: Checkout git repository ${{ env.APP_REPO }} reference ${{ inputs.checkout_ref }}
