@@ -1,0 +1,42 @@
+# syntax = docker/dockerfile:1.2
+FROM docker.io/library/golang:1.24-bullseye as builder
+
+ARG ACCESS_TOKEN
+
+RUN apt-get update && apt-get install -y build-essential git bash ca-certificates libstdc++6
+
+WORKDIR /go/src/github.com/ledgerwatch/erigon
+
+ADD erigon-lib erigon-lib
+ADD go.mod go.mod
+ADD go.sum go.sum
+
+RUN go mod download
+ADD . .
+
+RUN make erigon
+# RUN make db-tools
+
+
+FROM ubuntu:24.04
+
+# 编译报错，无用则去除
+RUN apt-get update && apt-get install -y ca-certificates libstdc++6 tzdata curl jq dnsutils
+
+WORKDIR /app
+
+COPY --from=builder /go/src/github.com/ledgerwatch/erigon/build/bin /app/
+
+
+EXPOSE 8545 \
+       8551 \
+       8546 \
+       30303 \
+       30303/udp \
+       42069 \
+       42069/udp \
+       8080 \
+       9090 \
+       6060
+
+ENTRYPOINT ["/app/erigon"]
