@@ -8,6 +8,7 @@ RUN apt-get update && apt-get install -y build-essential git bash ca-certificate
 WORKDIR /go/src/github.com/ledgerwatch/erigon
 
 ADD erigon-lib erigon-lib
+ADD erigon-db erigon-db
 ADD go.mod go.mod
 ADD go.sum go.sum
 
