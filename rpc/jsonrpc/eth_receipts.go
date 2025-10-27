@@ -553,18 +553,25 @@ func (api *APIImpl) GetBlockReceipts(ctx context.Context, numberOrHash rpc.Block
 	if err != nil {
 		return nil, fmt.Errorf("getReceipts error: %w", err)
 	}
-	result := make([]map[string]interface{}, 0, len(receipts))
-	for _, receipt := range receipts {
-		txn := block.Transactions()[receipt.TransactionIndex]
-		result = append(result, ethutils.MarshalReceipt(receipt, txn, chainConfig, block.HeaderNoCopy(), txn.Hash(), true, true))
-	}
 
-	if chainConfig.Bor == nil {
-		return result, nil
+	numReceipts := len(receipts)
+	numTxs := len(block.Transactions())
+	result := make([]map[string]interface{}, 0, numReceipts)
+
+	for _, receipt := range receipts {
+		// State-sync receipts' TransactionIndex is equal to numTxs.
+		if int(receipt.TransactionIndex) == numTxs {
+			// This is a state-sync transaction receipt.
+			result = append(result, ethutils.MarshalReceipt(receipt, bortypes.NewBorTransaction(), chainConfig, block.HeaderNoCopy(), receipt.TxHash, false, true))
+		} else {
+			// This is a normal transaction receipt.
+			txn := block.Transactions()[receipt.TransactionIndex]
+			result = append(result, ethutils.MarshalReceipt(receipt, txn, chainConfig, block.HeaderNoCopy(), txn.Hash(), true, true))
+		}
 	}
 
 	var borTx types.Transaction = bortypes.NewBorTransaction()
-	if chainConfig.Bor.IsMadhugiri(blockNum) && len(receipts)+1 == len(block.Transactions()) {
+	if chainConfig.Bor != nil && chainConfig.Bor.IsMadhugiri(blockNum) && len(receipts)+1 == len(block.Transactions()) {
 		borTx = block.Transactions()[len(block.Transactions())-1]
 		if borTx.Type() != types.StateSyncTxType {
 			return result, nil

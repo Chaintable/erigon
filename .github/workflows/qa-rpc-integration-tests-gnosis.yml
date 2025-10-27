@@ -19,7 +19,7 @@ on:
 
 jobs:
   gnosis-rpc-integ-tests:
-    if: false # Temporarily disabled
+    if: false  # Temporarily disabled
     concurrency:
       group: >-
         ${{

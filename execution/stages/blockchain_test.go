@@ -307,7 +307,9 @@ func testReorgLong(t *testing.T) {
 
 // Tests that reorganising a short difficult chain after a long easy one
 // overwrites the canonical numbers and links in the database.
-func TestReorgShortBlocks(t *testing.T) { testReorgShort(t) }
+func TestReorgShortBlocks(t *testing.T) {
+	testReorgShort(t)
+}
 
 func testReorgShort(t *testing.T) {
 	t.Parallel()

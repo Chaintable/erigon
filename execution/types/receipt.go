@@ -580,9 +580,30 @@ func (e receiptEncoder69) EncodeRLP(w io.Writer) error { return e.r.EncodeRLP69(
 
 func (rs Receipts) EncodeRLP69(w io.Writer) error {
 	encs := make([]receiptEncoder69, len(rs))
+	n := len(rs)
+
 	for i := range rs {
-		encs[i] = receiptEncoder69{r: rs[i]}
+		// Copy the receipt reference.
+		r := rs[i]
+
+		// Only the last receipt can be a state-sync tx.
+		if i == n-1 {
+			// Post-Madhugiri, the state-sync transaction is a typed tx (StateSyncTxType)
+			// and must keep its type for eth/69 encoding. Only apply the pre-HF heuristic
+			// when the receipt is not already the typed state-sync receipt.
+			if r.Type != StateSyncTxType {
+				// Match the ReadStateSyncReceiptByHash logic for pre-HF:
+				// It's a state-sync transaction if the cumulative gas is zero, or
+				// the cumulative gas is equal to the previous one (zero gas usage)
+				if r.CumulativeGasUsed == 0 || (n >= 2 && r.CumulativeGasUsed == rs[n-2].CumulativeGasUsed) {
+					r.Type = LegacyTxType
+				}
+			}
+		}
+
+		encs[i] = receiptEncoder69{r: r}
 	}
+
 	return rlp.Encode(w, encs)
 }
 
