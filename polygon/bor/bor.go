@@ -56,6 +56,7 @@ import (
 	"github.com/erigontech/erigon/execution/types/accounts"
 	"github.com/erigontech/erigon/polygon/bor/borcfg"
 	"github.com/erigontech/erigon/polygon/bor/statefull"
+	"github.com/erigontech/erigon/polygon/bridge"
 	"github.com/erigontech/erigon/polygon/heimdall"
 	"github.com/erigontech/erigon/rpc"
 	"github.com/erigontech/erigon/turbo/services"
@@ -1307,10 +1308,14 @@ func (c *Bor) CommitStates(
 		if _, err := syscall(*event.To(), event.Data()); err != nil {
 			return nil, err
 		}
+		// Can be empty in tests
+		if len(event.Data()) == 0 {
+			continue
+		}
 
-		var ev types.StateSyncData
-		if err := rlp.DecodeBytes(event.Data(), &ev); err != nil {
-			log.Error("error while decoding state sync data", "err", err)
+		var ev bridge.EventRecordWithTime
+		if err := ev.UnmarshallBytes(event.Data()); err != nil {
+			log.Error("error while unmarshaling state sync data", "err", err)
 			continue // Not a state-sync event, skip
 		}
 
