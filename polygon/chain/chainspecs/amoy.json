@@ -18,7 +18,8 @@
     },
     "bor": {
       "period": {
-        "0": 2
+        "0": 2,
+        "28899616": 1
       },
       "producerDelay": {
         "0": 4
@@ -45,6 +46,7 @@
       "ahmedabadBlock": 11865856,
       "bhilaiBlock": 22765056,
       "rioBlock": 26272256,
+      "madhugiriBlock": 28899616,
       "blockAlloc": {
         "11865856": {
           "0000000000000000000000000000000000001001": {
@@ -74,4 +76,3 @@
     },
   "defaultBlockGasLimit": 45000000
   }
-  
