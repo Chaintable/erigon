@@ -8,7 +8,7 @@ import (
 )
 
 func init() {
-	tracers.RegisterLookup(false, flatAliasLookup)
+	tracers.RegisterLookup(true, flatAliasLookup)
 }
 
 // flatAliasLookup maps "flatCallTracer" ("flat_call_tracer") to the native call tracer
