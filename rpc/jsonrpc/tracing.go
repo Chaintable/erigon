@@ -147,13 +147,10 @@ func (api *DebugAPIImpl) traceBlock(ctx context.Context, blockNrOrHash rpc.Block
 			return ctx.Err()
 		}
 		ibs.SetTxContext(blockCtx.BlockNumber, txnIndex)
-		msg, _ := txn.AsMessage(*signer, block.BaseFee(), rules)
-
-		txCtx := evmtypes.TxContext{
-			TxHash:     txnHash,
-			Origin:     msg.From(),
-			GasPrice:   msg.GasPrice(),
-			BlobHashes: msg.BlobHashes(),
+		// Build message + tx context exactly like trace_transaction does.
+		msg, txCtx, err := transactions.ComputeTxContext(ibs, engine, rules, signer, block, chainConfig, txnIndex)
+		if err != nil {
+			return err
 		}
 
 		if isBorStateSyncTxn {
