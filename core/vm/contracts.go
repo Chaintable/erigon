@@ -60,6 +60,8 @@ type PrecompiledContract interface {
 
 func Precompiles(chainRules *chain.Rules) map[common.Address]PrecompiledContract {
 	switch {
+	case chainRules.IsMadhugiriPro:
+		return PrecompiledContractsMadhugiriPro
 	case chainRules.IsMadhugiri:
 		return PrecompiledContractsMadhugiri
 	case chainRules.IsOsaka:
@@ -241,17 +243,39 @@ var PrecompiledContractsMadhugiri = map[common.Address]PrecompiledContract{
 	common.BytesToAddress([]byte{0x01, 0x00}): &p256Verify{},
 }
 
+var PrecompiledContractsMadhugiriPro = map[common.Address]PrecompiledContract{
+	common.BytesToAddress([]byte{0x01}):       &ecrecover{},
+	common.BytesToAddress([]byte{0x02}):       &sha256hash{},
+	common.BytesToAddress([]byte{0x03}):       &ripemd160hash{},
+	common.BytesToAddress([]byte{0x04}):       &dataCopy{},
+	common.BytesToAddress([]byte{0x05}):       &bigModExp{madhugiri: true},
+	common.BytesToAddress([]byte{0x06}):       &bn254AddIstanbul{},
+	common.BytesToAddress([]byte{0x07}):       &bn254ScalarMulIstanbul{},
+	common.BytesToAddress([]byte{0x08}):       &bn254PairingIstanbul{},
+	common.BytesToAddress([]byte{0x09}):       &blake2F{},
+	common.BytesToAddress([]byte{0x0a}):       &pointEvaluation{},
+	common.BytesToAddress([]byte{0x0b}):       &bls12381G1Add{},
+	common.BytesToAddress([]byte{0x0c}):       &bls12381G1MultiExp{},
+	common.BytesToAddress([]byte{0x0d}):       &bls12381G2Add{},
+	common.BytesToAddress([]byte{0x0e}):       &bls12381G2MultiExp{},
+	common.BytesToAddress([]byte{0x0f}):       &bls12381Pairing{},
+	common.BytesToAddress([]byte{0x10}):       &bls12381MapFpToG1{},
+	common.BytesToAddress([]byte{0x11}):       &bls12381MapFp2ToG2{},
+	common.BytesToAddress([]byte{0x01, 0x00}): &p256Verify{eip7951: true},
+}
+
 var (
-	PrecompiledAddressesMadhugiri []common.Address
-	PrecompiledAddressesOsaka     []common.Address
-	PrecompiledAddressesPrague    []common.Address
-	PrecompiledAddressesNapoli    []common.Address
-	PrecompiledAddressesBhilai    []common.Address
-	PrecompiledAddressesCancun    []common.Address
-	PrecompiledAddressesBerlin    []common.Address
-	PrecompiledAddressesIstanbul  []common.Address
-	PrecompiledAddressesByzantium []common.Address
-	PrecompiledAddressesHomestead []common.Address
+	PrecompiledAddressesMadhugiriPro []common.Address
+	PrecompiledAddressesMadhugiri    []common.Address
+	PrecompiledAddressesOsaka        []common.Address
+	PrecompiledAddressesPrague       []common.Address
+	PrecompiledAddressesNapoli       []common.Address
+	PrecompiledAddressesBhilai       []common.Address
+	PrecompiledAddressesCancun       []common.Address
+	PrecompiledAddressesBerlin       []common.Address
+	PrecompiledAddressesIstanbul     []common.Address
+	PrecompiledAddressesByzantium    []common.Address
+	PrecompiledAddressesHomestead    []common.Address
 )
 
 func init() {
@@ -285,11 +309,16 @@ func init() {
 	for k := range PrecompiledContractsMadhugiri {
 		PrecompiledAddressesMadhugiri = append(PrecompiledAddressesMadhugiri, k)
 	}
+	for k := range PrecompiledContractsMadhugiriPro {
+		PrecompiledAddressesMadhugiriPro = append(PrecompiledAddressesMadhugiriPro, k)
+	}
 }
 
 // ActivePrecompiles returns the precompiles enabled with the current configuration.
 func ActivePrecompiles(rules *chain.Rules) []common.Address {
 	switch {
+	case rules.IsMadhugiriPro:
+		return PrecompiledAddressesMadhugiriPro
 	case rules.IsMadhugiri:
 		return PrecompiledAddressesMadhugiri
 	case rules.IsOsaka:
