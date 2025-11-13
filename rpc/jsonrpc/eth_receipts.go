@@ -247,7 +247,122 @@ func (api *BaseAPI) getLogsV3(ctx context.Context, tx kv.TemporalTx, begin, end 
 		return nil, err
 	}
 
-	//var blockHash common.Hash
+	// if a single block by hash is requested and no filters applied, return all logs in canonical order
+	if crit.BlockHash != nil && len(crit.Addresses) == 0 && len(crit.Topics) == 0 {
+		header, err := api._blockReader.HeaderByHash(ctx, tx, *crit.BlockHash)
+		if err != nil {
+			return nil, err
+		}
+		if header == nil {
+			return nil, fmt.Errorf("header not found for block %x", *crit.BlockHash)
+		}
+		block, err := api._blockReader.BlockByHash(ctx, tx, header.Hash())
+		if err != nil {
+			return nil, err
+		}
+		if block == nil {
+			return nil, fmt.Errorf("block not found for hash %x", *crit.BlockHash)
+		}
+
+		// compute min and max tx num for the block
+		minTxNum, err := api._txNumReader.Min(tx, header.Number.Uint64())
+		if err != nil {
+			return nil, err
+		}
+		maxTxNum, err := api._txNumReader.Max(tx, header.Number.Uint64())
+		if err != nil {
+			return nil, err
+		}
+
+		// Iterate all transactions in the block in order and collect all logs.
+		for txIndex := 0; txIndex < block.Transactions().Len(); txIndex++ {
+			txn, err := api._txnReader.TxnByIdxInBlock(ctx, tx, header.Number.Uint64(), txIndex)
+			if err != nil {
+				return nil, err
+			}
+			if txn == nil {
+				continue
+			}
+
+			// derive canonical txNum from block and index
+			txNum := minTxNum + uint64(txIndex)
+
+			r, err := api.receiptsGenerator.GetReceipt(ctx, chainConfig, tx, header, txn, txIndex, txNum)
+			if err != nil {
+				return nil, err
+			}
+			if r == nil {
+				continue
+			}
+			// No filters are used, so we don't drop anything, we just emit in place.
+			for _, lg := range r.Logs {
+				logs = append(logs, &types.ErigonLog{
+					Address:     lg.Address,
+					Topics:      lg.Topics,
+					Data:        lg.Data,
+					BlockNumber: lg.BlockNumber,
+					TxHash:      lg.TxHash,
+					TxIndex:     lg.TxIndex,
+					BlockHash:   lg.BlockHash,
+					Index:       lg.Index,
+					Removed:     lg.Removed,
+					Timestamp:   header.Time,
+				})
+			}
+		}
+
+		// Append Bor state-sync/event logs after all normal tx logs.
+		if chainConfig.Bor != nil {
+			events, err := api.bridgeReader.Events(ctx, header.Hash(), header.Number.Uint64())
+			if err != nil {
+				return nil, err
+			}
+			if len(events) > 0 {
+				var txHash common.Hash
+				var borTxIndex int
+				var borTxNum uint64
+
+				if chainConfig.Bor.IsMadhugiri(block.NumberU64()) {
+					// state sync as real tx
+					lastIdx := block.Transactions().Len() - 1
+					borTx := block.Transactions()[lastIdx]
+					txHash = borTx.Hash()
+					borTxIndex = lastIdx
+					borTxNum = minTxNum + uint64(lastIdx)
+				} else {
+					// synthetic state sync tx
+					txHash = bortypes.ComputeBorTxHash(block.NumberU64(), block.Hash())
+					borTxIndex = block.Transactions().Len()
+					borTxNum = maxTxNum + 1
+				}
+
+				// txNum is not used for ordering here; pass 0
+				borLogs, err := api.borReceiptGenerator.GenerateBorLogs(
+					ctx, events, api._txNumReader, tx, header, chainConfig, txHash, borTxIndex, borTxNum,
+				)
+				if err != nil {
+					return nil, err
+				}
+				// No filters applied, emit all logs
+				for _, lg := range borLogs {
+					logs = append(logs, &types.ErigonLog{
+						Address:     lg.Address,
+						Topics:      lg.Topics,
+						Data:        lg.Data,
+						BlockNumber: lg.BlockNumber,
+						TxHash:      lg.TxHash,
+						TxIndex:     lg.TxIndex,
+						BlockHash:   lg.BlockHash,
+						Index:       lg.Index,
+						Removed:     lg.Removed,
+						Timestamp:   header.Time,
+					})
+				}
+			}
+		}
+		return logs, nil
+	}
+
 	var header *types.Header
 
 	txNumbers, err := applyFiltersV3(api._txNumReader, tx, begin, end, crit, order.Asc)
