@@ -166,6 +166,7 @@ func (api *DebugAPIImpl) traceBlock(ctx context.Context, blockNrOrHash rpc.Block
 			}
 
 			var _gasUsed uint64
+			//nolint:ineffassign // err is checked below
 			_gasUsed, err = polygontracer.TraceBorStateSyncTxnDebugAPI(
 				ctx,
 				chainConfig,
@@ -188,9 +189,9 @@ func (api *DebugAPIImpl) traceBlock(ctx context.Context, blockNrOrHash rpc.Block
 				return err
 			}
 			var _gasUsed uint64
-			_gasUsed, traceErr := transactions.TraceTx(ctx, engine, txn, msg, blockCtx, txCtx, block.Hash(), txnIndex, ibs, config, chainConfig, stream, api.evmCallTimeout)
+			//nolint:ineffassign // err is checked below
+			_gasUsed, err = transactions.TraceTx(ctx, engine, txn, msg, blockCtx, txCtx, block.Hash(), txnIndex, ibs, config, chainConfig, stream, api.evmCallTimeout)
 			gasUsed += _gasUsed
-			err = traceErr
 		}
 		if err == nil {
 			err = ibs.FinalizeTx(rules, state.NewNoopWriter())
