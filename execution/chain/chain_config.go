@@ -182,7 +182,9 @@ type BorConfig interface {
 	IsRio(num uint64) bool
 	GetRioBlock() *big.Int
 	IsMadhugiri(num uint64) bool
+	IsMadhugiriPro(num uint64) bool
 	GetMadhugiriBlock() *big.Int
+	GetMadhugiriProBlock() *big.Int
 	StateReceiverContractAddress() common.Address
 	CalculateSprintNumber(number uint64) uint64
 	CalculateSprintLength(number uint64) uint64
@@ -201,7 +203,7 @@ func (c *Config) String() string {
 	engine := c.getEngine()
 
 	if c.Bor != nil {
-		return fmt.Sprintf("{ChainID: %v, Agra: %v, Napoli: %v, Ahmedabad: %v, Bhilai: %v, Rio: %v, Madhugiri: %v, Engine: %v}",
+		return fmt.Sprintf("{ChainID: %v, Agra: %v, Napoli: %v, Ahmedabad: %v, Bhilai: %v, Rio: %v, Madhugiri: %v, MadhugiriPro: %v, Engine: %v}",
 			c.ChainID,
 			c.Bor.GetAgraBlock(),
 			c.Bor.GetNapoliBlock(),
@@ -209,6 +211,7 @@ func (c *Config) String() string {
 			c.Bor.GetBhilaiBlock(),
 			c.Bor.GetRioBlock(),
 			c.Bor.GetMadhugiriBlock(),
+			c.Bor.GetMadhugiriProBlock(),
 			engine,
 		)
 	}
@@ -342,6 +345,11 @@ func (c *Config) IsRio(num uint64) bool {
 // IsMadhugiri returns whether num is either equal to the Madhugiri fork block or greater.
 func (c *Config) IsMadhugiri(num uint64) bool {
 	return (c != nil) && (c.Bor != nil) && c.Bor.IsMadhugiri(num)
+}
+
+// IsMadhugiriPro returns whether num is either equal to the MadhugiriPro fork block or greater.
+func (c *Config) IsMadhugiriPro(num uint64) bool {
+	return (c != nil) && (c.Bor != nil) && c.Bor.IsMadhugiriPro(num)
 }
 
 // IsCancun returns whether time is either equal to the Cancun fork time or greater.
@@ -715,13 +723,13 @@ func ConfigValueLookup[T any](field map[uint64]T, number uint64) T {
 // Rules is a one time interface meaning that it shouldn't be used in between transition
 // phases.
 type Rules struct {
-	ChainID                                           *big.Int
-	IsHomestead, IsTangerineWhistle, IsSpuriousDragon bool
-	IsByzantium, IsConstantinople, IsPetersburg       bool
-	IsIstanbul, IsBerlin, IsLondon, IsShanghai        bool
-	IsCancun, IsNapoli, IsBhilai, IsRio, IsMadhugiri  bool
-	IsPrague, IsOsaka                                 bool
-	IsAura                                            bool
+	ChainID                                                          *big.Int
+	IsHomestead, IsTangerineWhistle, IsSpuriousDragon                bool
+	IsByzantium, IsConstantinople, IsPetersburg                      bool
+	IsIstanbul, IsBerlin, IsLondon, IsShanghai                       bool
+	IsCancun, IsNapoli, IsBhilai, IsRio, IsMadhugiri, IsMadhugiriPro bool
+	IsPrague, IsOsaka                                                bool
+	IsAura                                                           bool
 }
 
 // isForked returns whether a fork scheduled at block s is active at the given head block.

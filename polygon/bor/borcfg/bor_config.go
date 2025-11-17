@@ -37,15 +37,16 @@ type BorConfig struct {
 	OverrideStateSyncRecords map[string]int         `json:"overrideStateSyncRecords"` // override state records count
 	BlockAlloc               map[string]interface{} `json:"blockAlloc"`
 
-	JaipurBlock    *big.Int `json:"jaipurBlock"`    // Jaipur switch block (nil = no fork, 0 = already on Jaipur)
-	DelhiBlock     *big.Int `json:"delhiBlock"`     // Delhi switch block (nil = no fork, 0 = already on Delhi)
-	IndoreBlock    *big.Int `json:"indoreBlock"`    // Indore switch block (nil = no fork, 0 = already on Indore)
-	AgraBlock      *big.Int `json:"agraBlock"`      // Agra switch block (nil = no fork, 0 = already on Agra)
-	NapoliBlock    *big.Int `json:"napoliBlock"`    // Napoli switch block (nil = no fork, 0 = already on Napoli)
-	AhmedabadBlock *big.Int `json:"ahmedabadBlock"` // Ahmedabad switch block (nil = no fork, 0 = already on Ahmedabad)
-	BhilaiBlock    *big.Int `json:"bhilaiBlock"`    // Bhilai switch block (nil = no fork, 0 = already on Ahmedabad)
-	RioBlock       *big.Int `json:"rioBlock"`       // Rio switch block (nil = no fork, 0 = already on Rio)
-	MadhugiriBlock *big.Int `json:"madhugiriBlock"` // Madhugiri switch block (nil = no fork, 0 = already on Madhugiri)
+	JaipurBlock       *big.Int `json:"jaipurBlock"`       // Jaipur switch block (nil = no fork, 0 = already on Jaipur)
+	DelhiBlock        *big.Int `json:"delhiBlock"`        // Delhi switch block (nil = no fork, 0 = already on Delhi)
+	IndoreBlock       *big.Int `json:"indoreBlock"`       // Indore switch block (nil = no fork, 0 = already on Indore)
+	AgraBlock         *big.Int `json:"agraBlock"`         // Agra switch block (nil = no fork, 0 = already on Agra)
+	NapoliBlock       *big.Int `json:"napoliBlock"`       // Napoli switch block (nil = no fork, 0 = already on Napoli)
+	AhmedabadBlock    *big.Int `json:"ahmedabadBlock"`    // Ahmedabad switch block (nil = no fork, 0 = already on Ahmedabad)
+	BhilaiBlock       *big.Int `json:"bhilaiBlock"`       // Bhilai switch block (nil = no fork, 0 = already on Ahmedabad)
+	RioBlock          *big.Int `json:"rioBlock"`          // Rio switch block (nil = no fork, 0 = already on Rio)
+	MadhugiriBlock    *big.Int `json:"madhugiriBlock"`    // Madhugiri switch block (nil = no fork, 0 = already on Madhugiri)
+	MadhugiriProBlock *big.Int `json:"madhugiriProBlock"` // MadhugiriPro switch block (nil = no fork, 0 = already on MadhugiriPro)
 
 	StateSyncConfirmationDelay map[string]uint64         `json:"stateSyncConfirmationDelay"` // StateSync Confirmation Delay, in seconds, to calculate `to`
 	Coinbase                   map[string]common.Address `json:"coinbase"`                   // coinbase address
@@ -194,6 +195,14 @@ func (c *BorConfig) IsMadhugiri(number uint64) bool {
 
 func (c *BorConfig) GetMadhugiriBlock() *big.Int {
 	return c.MadhugiriBlock
+}
+
+func (c *BorConfig) IsMadhugiriPro(number uint64) bool {
+	return isForked(c.MadhugiriProBlock, number)
+}
+
+func (c *BorConfig) GetMadhugiriProBlock() *big.Int {
+	return c.MadhugiriProBlock
 }
 
 func (c *BorConfig) CalculateStateSyncDelay(number uint64) uint64 {

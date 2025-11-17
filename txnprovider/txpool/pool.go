@@ -148,6 +148,8 @@ type TxPool struct {
 	isPostOsaka             atomic.Bool
 	madhugiriBlock          *uint64
 	isPostMadhugiri         atomic.Bool
+	madhugiriProBlock       *uint64
+	isPostMadhugiriPro      atomic.Bool
 	feeCalculator           FeeCalculator
 	p2pFetcher              *Fetch
 	p2pSender               *Send
@@ -280,6 +282,14 @@ func New(
 			}
 			madhugiriBlockU64 := madhugiriBlock.Uint64()
 			res.madhugiriBlock = &madhugiriBlockU64
+		}
+		madhugiriProBlock := chainConfig.Bor.GetMadhugiriProBlock()
+		if madhugiriProBlock != nil {
+			if !madhugiriProBlock.IsUint64() {
+				return nil, errors.New("madhugiriProBlock overflow")
+			}
+			madhugiriProBlock := madhugiriProBlock.Uint64()
+			res.madhugiriProBlock = &madhugiriProBlock
 		}
 	}
 	if chainConfig.CancunTime != nil {
@@ -1300,6 +1310,10 @@ func (p *TxPool) isOsaka() bool {
 
 func (p *TxPool) isMadhugiri() bool {
 	return p.isBlockNumBasedForkActivated(&p.isPostMadhugiri, p.madhugiriBlock)
+}
+
+func (p *TxPool) isMadhugiriPro() bool {
+	return p.isBlockNumBasedForkActivated(&p.isPostMadhugiriPro, p.madhugiriProBlock)
 }
 
 func (p *TxPool) GetMaxBlobsPerBlock() uint64 {
