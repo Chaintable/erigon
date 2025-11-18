@@ -1269,7 +1269,8 @@ func ReadReceiptsCacheV2(tx kv.TemporalTx, block *types.Block, txNumReader rawdb
 		return nil, nil
 	}
 
-	out := make(types.Receipts, txCount) // fixed size, indexed by TransactionIndex
+	// fixed size, indexed by txIndex
+	out := make(types.Receipts, txCount)
 	found := 0
 
 	for txnID := minTxNum; txnID <= maxTxNum; txnID++ {
@@ -1281,7 +1282,6 @@ func ReadReceiptsCacheV2(tx kv.TemporalTx, block *types.Block, txNumReader rawdb
 			continue
 		}
 
-		// Deserialize
 		rs := new(types.ReceiptForStorage)
 		if err := rlp.DecodeBytes(v, rs); err != nil {
 			return nil, fmt.Errorf("ReadReceipts: deserialize %d, len(v)=%d, %w", blockNum, len(v), err)
@@ -1289,25 +1289,23 @@ func ReadReceiptsCacheV2(tx kv.TemporalTx, block *types.Block, txNumReader rawdb
 		r := (*types.Receipt)(rs)
 
 		idx := int(rs.TransactionIndex)
-		// Guard against out-of-range (and ignore state-sync synthetic index if present)
 		if idx < 0 || idx >= txCount {
 			continue
 		}
 
-		// Fill derived fields (e.g., logs’ BlockHash/TxHash/Index) for cache reads
+		// Fill derived fields for cache reads
 		if idx < len(block.Transactions()) {
 			txn := block.Transactions()[idx]
 			r.DeriveFieldsV4ForCachedReceipt(blockHash, blockNum, txn.Hash(), true)
 		}
 
-		// Place by index only if not already filled (defensive)
+		// Place by index only if not already filled
 		if out[idx] == nil {
 			out[idx] = r
 			found++
 		}
 	}
 
-	// Return only if we have the full set, in order; otherwise let caller regenerate
 	if found != txCount {
 		return nil, nil
 	}
