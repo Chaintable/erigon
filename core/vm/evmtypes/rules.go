@@ -49,5 +49,6 @@ func (bc *BlockContext) Rules(c *chain.Config) *chain.Rules {
 		IsAura:             c.Aura != nil,
 		IsRio:              c.IsRio(bc.BlockNumber),
 		IsMadhugiri:        c.IsMadhugiri(bc.BlockNumber),
+		IsMadhugiriPro:     c.IsMadhugiriPro(bc.BlockNumber),
 	}
 }
