@@ -165,11 +165,9 @@ func (api *APIImpl) GetLogs(ctx context.Context, crit filters.FilterCriteria) (t
 		}
 	}
 
-	// For a pure "whole block" query (blockHash set, no address/topics filters),
+	// For a whole block query (blockHash set, no address/topics filters),
 	// normalize logIndex to be continuous 0..N-1 in canonical order.
 	if isWholeBlockUnfiltered(crit) && len(rpcLogs) > 0 {
-		// They already come back in (blockNumber, txIndex, Index) order from getLogsV3,
-		// but sorting defensively doesn't hurt if you want:
 		sort.Slice(rpcLogs, func(i, j int) bool {
 			if rpcLogs[i].BlockNumber == rpcLogs[j].BlockNumber {
 				if rpcLogs[i].TxIndex == rpcLogs[j].TxIndex {
@@ -180,7 +178,7 @@ func (api *APIImpl) GetLogs(ctx context.Context, crit filters.FilterCriteria) (t
 			return rpcLogs[i].BlockNumber < rpcLogs[j].BlockNumber
 		})
 
-		// Now renumber per block so logIndex is 0..N-1 with no gaps, like Bor.
+		// Now renumber per block so logIndex is 0..N-1 with no gaps.
 		currentBlock := rpcLogs[0].BlockHash
 		var idx uint
 		idx = 0
@@ -587,16 +585,26 @@ func (api *APIImpl) GetBlockReceipts(ctx context.Context, numberOrHash rpc.Block
 	numTxs := len(block.Transactions())
 	result := make([]map[string]interface{}, 0, numReceipts)
 
+	// track if we already have a state-sync receipt coming from the generator
+	hasBorStateSyncReceipt := false
+
 	for _, receipt := range receipts {
 		// State-sync receipts' TransactionIndex is equal to numTxs.
 		if int(receipt.TransactionIndex) == numTxs {
 			// This is a state-sync transaction receipt.
+			hasBorStateSyncReceipt = true
 			result = append(result, ethutils.MarshalReceipt(receipt, bortypes.NewBorTransaction(), chainConfig, block.HeaderNoCopy(), receipt.TxHash, false, true))
 		} else {
 			// This is a normal transaction receipt.
 			txn := block.Transactions()[receipt.TransactionIndex]
 			result = append(result, ethutils.MarshalReceipt(receipt, txn, chainConfig, block.HeaderNoCopy(), txn.Hash(), true, true))
 		}
+	}
+
+	// if we've already included the state-sync
+	// receipt from the receipts generator, don't generate and append another one.
+	if chainConfig.Bor != nil && hasBorStateSyncReceipt {
+		return result, nil
 	}
 
 	var borTx types.Transaction = bortypes.NewBorTransaction()
@@ -624,7 +632,7 @@ func (api *APIImpl) GetBlockReceipts(ctx context.Context, numberOrHash rpc.Block
 	return result, nil
 }
 
-// isWholeBlockUnfiltered returns true if the filter is just "all logs for this block hash".
+// isWholeBlockUnfiltered returns true if the filter is to get all logs for a specific block hash.
 func isWholeBlockUnfiltered(crit filters.FilterCriteria) bool {
 	if crit.BlockHash == nil {
 		return false
@@ -635,6 +643,5 @@ func isWholeBlockUnfiltered(crit filters.FilterCriteria) bool {
 	if len(crit.Topics) > 0 {
 		return false
 	}
-	// FromBlock / ToBlock are ignored by spec when BlockHash is set.
 	return true
 }
