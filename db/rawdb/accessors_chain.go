@@ -1247,44 +1247,69 @@ func ReadReceiptCacheV2(tx kv.TemporalTx, query RCacheV2Query) (*types.Receipt, 
 	return res, true, nil
 }
 
-func ReadReceiptsCacheV2(tx kv.TemporalTx, block *types.Block, txNumReader rawdbv3.TxNumsReader) (res types.Receipts, err error) {
+func ReadReceiptsCacheV2(tx kv.TemporalTx, block *types.Block, txNumReader rawdbv3.TxNumsReader) (types.Receipts, error) {
 	blockHash := block.Hash()
 	blockNum := block.NumberU64()
 
-	_min, err := txNumReader.Min(tx, blockNum)
+	minTxNum, err := txNumReader.Min(tx, blockNum)
 	if err != nil {
-		return
+		return nil, err
 	}
-	_max, err := txNumReader.Max(tx, blockNum)
+	maxTxNum, err := txNumReader.Max(tx, blockNum)
 	if err != nil {
-		return
+		return nil, err
 	}
 
-	for txnID := _min; txnID < _max+1; txnID++ {
+	// Expected count = number of non-state-sync txs in this block
+	txCount := len(block.Transactions())
+	if txCount > 0 && block.Transactions()[txCount-1].Type() == types.StateSyncTxType {
+		txCount--
+	}
+	if txCount == 0 {
+		return nil, nil
+	}
+
+	// fixed size, indexed by txIndex
+	out := make(types.Receipts, txCount)
+	found := 0
+
+	for txnID := minTxNum; txnID <= maxTxNum; txnID++ {
 		v, ok, err := tx.HistorySeek(kv.RCacheDomain, receiptCacheKey, txnID+1)
 		if err != nil {
 			return nil, err
 		}
-		if !ok {
-			continue
-		}
-		if len(v) == 0 {
+		if !ok || len(v) == 0 {
 			continue
 		}
 
-		// Convert the receipts from their storage form to their internal representation
-		receipt := &types.ReceiptForStorage{}
-		if err := rlp.DecodeBytes(v, receipt); err != nil {
+		rs := new(types.ReceiptForStorage)
+		if err := rlp.DecodeBytes(v, rs); err != nil {
 			return nil, fmt.Errorf("ReadReceipts: deserialize %d, len(v)=%d, %w", blockNum, len(v), err)
 		}
-		x := (*types.Receipt)(receipt)
-		if int(receipt.TransactionIndex) < len(block.Transactions()) {
-			txn := block.Transactions()[receipt.TransactionIndex]
-			x.DeriveFieldsV4ForCachedReceipt(blockHash, blockNum, txn.Hash(), true)
+		r := (*types.Receipt)(rs)
+
+		idx := int(rs.TransactionIndex)
+		if idx < 0 || idx >= txCount {
+			continue
 		}
-		res = append(res, x)
+
+		// Fill derived fields for cache reads
+		if idx < len(block.Transactions()) {
+			txn := block.Transactions()[idx]
+			r.DeriveFieldsV4ForCachedReceipt(blockHash, blockNum, txn.Hash(), true)
+		}
+
+		// Place by index only if not already filled
+		if out[idx] == nil {
+			out[idx] = r
+			found++
+		}
 	}
-	return res, nil
+
+	if found != txCount {
+		return nil, nil
+	}
+	return out, nil
 }
 
 func WriteReceiptCacheV2(tx kv.TemporalPutDel, receipt *types.Receipt, txNum uint64) error {
