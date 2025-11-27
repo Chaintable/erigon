@@ -20,7 +20,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"sort"
 
 	"github.com/RoaringBitmap/roaring/v2"
 
@@ -162,33 +161,6 @@ func (api *APIImpl) GetLogs(ctx context.Context, crit filters.FilterCriteria) (t
 				Removed:     log.Removed,
 			},
 			BlockTimestamp: log.Timestamp,
-		}
-	}
-
-	// For a whole block query (blockHash set, no address/topics filters),
-	// normalize logIndex to be continuous 0..N-1 in canonical order.
-	if isWholeBlockUnfiltered(crit) && len(rpcLogs) > 0 {
-		sort.Slice(rpcLogs, func(i, j int) bool {
-			if rpcLogs[i].BlockNumber == rpcLogs[j].BlockNumber {
-				if rpcLogs[i].TxIndex == rpcLogs[j].TxIndex {
-					return rpcLogs[i].Index < rpcLogs[j].Index
-				}
-				return rpcLogs[i].TxIndex < rpcLogs[j].TxIndex
-			}
-			return rpcLogs[i].BlockNumber < rpcLogs[j].BlockNumber
-		})
-
-		// Now renumber per block so logIndex is 0..N-1 with no gaps.
-		currentBlock := rpcLogs[0].BlockHash
-		var idx uint
-		idx = 0
-		for _, l := range rpcLogs {
-			if l.BlockHash != currentBlock {
-				currentBlock = l.BlockHash
-				idx = 0
-			}
-			l.Index = idx
-			idx++
 		}
 	}
 
