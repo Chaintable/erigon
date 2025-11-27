@@ -164,6 +164,34 @@ func (api *APIImpl) GetLogs(ctx context.Context, crit filters.FilterCriteria) (t
 		}
 	}
 
+	// For a whole block query (blockHash set, no address/topics filters),
+	// normalize logIndex (if required) to be continuous 0..N-1 in canonical order.
+	/* TODO deactivated for memory spike, although already optimizated with `needsRenumber` addition
+	if isWholeBlockUnfiltered(crit) && len(rpcLogs) > 0 && needsRenumber(rpcLogs) {
+		sort.Slice(rpcLogs, func(i, j int) bool {
+			if rpcLogs[i].BlockNumber == rpcLogs[j].BlockNumber {
+				if rpcLogs[i].TxIndex == rpcLogs[j].TxIndex {
+					return rpcLogs[i].Index < rpcLogs[j].Index
+				}
+				return rpcLogs[i].TxIndex < rpcLogs[j].TxIndex
+			}
+			return rpcLogs[i].BlockNumber < rpcLogs[j].BlockNumber
+		})
+
+		currentBlock := rpcLogs[0].BlockHash
+		var idx uint
+		idx = 0
+		for _, l := range rpcLogs {
+			if l.BlockHash != currentBlock {
+				currentBlock = l.BlockHash
+				idx = 0
+			}
+			l.Index = idx
+			idx++
+		}
+	}
+	*/
+
 	return rpcLogs, nil
 }
 
@@ -616,4 +644,26 @@ func isWholeBlockUnfiltered(crit filters.FilterCriteria) bool {
 		return false
 	}
 	return true
+}
+
+// needsRenumber checks if the log indexes are continuous 0..N-1 per block.
+func needsRenumber(rpcLogs types.RPCLogs) bool {
+	if len(rpcLogs) == 0 {
+		return false
+	}
+	curBlock := rpcLogs[0].BlockHash
+	var expected uint
+	expected = 0
+
+	for _, l := range rpcLogs {
+		if l.BlockHash != curBlock {
+			curBlock = l.BlockHash
+			expected = 0
+		}
+		if l.Index != expected {
+			return true
+		}
+		expected++
+	}
+	return false
 }
