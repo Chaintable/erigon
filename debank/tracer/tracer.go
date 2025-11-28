@@ -350,7 +350,11 @@ func setParentFailed(cf *callFrame, parentFailed bool) {
 
 func (t *callTracer) setStorageChange(cf *callFrame) {
 	if cf.To != nil && cf.SelfStorageChange {
-		t.ChangeContracts[*cf.To] = struct{}{}
+		if cf.Type == vm.DELEGATECALL {
+			t.ChangeContracts[cf.From] = struct{}{}
+		} else {
+			t.ChangeContracts[*cf.To] = struct{}{}
+		}
 	}
 	subCallStorageChange := false
 	for i := range cf.Calls {
