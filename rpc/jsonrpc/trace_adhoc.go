@@ -1418,6 +1418,12 @@ func (api *TraceAPIImpl) doCallBlock(ctx context.Context, dbtx kv.Tx, stateReade
 		var txFinalized bool
 		var execResult *evmtypes.ExecutionResult
 		if args.isBorStateSyncTxn {
+			if chainConfig.Bor != nil && chainConfig.Bor.IsMadhugiri(header.Number.Uint64()) {
+				if msg == nil {
+					msg = &types.Message{}
+				}
+				msg.SetIsFree(true)
+			}
 			txFinalized = true
 			var stateSyncEvents []*types.Message
 			stateSyncEvents, err = api.bridgeReader.Events(ctx, header.Hash(), parentBlockNumber+1)
@@ -1631,6 +1637,10 @@ func (api *TraceAPIImpl) doCall(ctx context.Context, dbtx kv.Tx, stateReader sta
 	var txFinalized bool
 	var execResult *evmtypes.ExecutionResult
 	if args.isBorStateSyncTxn {
+		if msg == nil {
+			msg = &types.Message{}
+		}
+		msg.SetIsFree(true)
 		txFinalized = true
 		var stateSyncEvents []*types.Message
 		stateSyncEvents, err = api.bridgeReader.Events(ctx, header.Hash(), parentBlockNumber+1)

@@ -114,6 +114,12 @@ func traceBorStateSyncTxn(
 	refunds bool,
 ) (*evmtypes.ExecutionResult, error) {
 	for _, msg := range msgs {
+		if rules.IsMadhugiri {
+			if msg == nil {
+				msg = &types.Message{}
+			}
+			msg.SetIsFree(true)
+		}
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()

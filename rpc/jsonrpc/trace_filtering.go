@@ -786,6 +786,10 @@ func (api *TraceAPIImpl) callBlock(
 		var err error
 		if isBorStateSyncTxn {
 			txnHash = borStateSyncTxnHash
+			if msg == nil {
+				msg = &types.Message{}
+			}
+			msg.SetIsFree(true)
 			// we use an empty message for bor state sync txn since it gets handled differently
 		} else {
 			txnHash = txn.Hash()
@@ -896,6 +900,10 @@ func (api *TraceAPIImpl) callTransaction(
 	var msg *types.Message
 	if isBorStateSyncTxn {
 		txnHash = borStateSyncTxnHash
+		if msg == nil {
+			msg = &types.Message{}
+		}
+		msg.SetIsFree(true)
 		// we use an empty message for bor state sync txn since it gets handled differently
 	} else {
 		txnHash = txn.Hash()
