@@ -495,7 +495,8 @@ func (st *StateTransition) TransitionDb(refunds bool, gasBailout bool) (result *
 	if overflow {
 		return nil, ErrGasUintOverflow
 	}
-	if st.gasRemaining < gas || st.gasRemaining < floorGas7623 {
+	// Only enforce this intrinsic gas check if we're NOT in Madhugiri with a free msg (state sync tx).
+	if (st.gasRemaining < gas || st.gasRemaining < floorGas7623) && !(rules.IsMadhugiri && msg.IsFree()) {
 		return nil, fmt.Errorf("%w: have %d, want %d", ErrIntrinsicGas, st.gasRemaining, max(gas, floorGas7623))
 	}
 
