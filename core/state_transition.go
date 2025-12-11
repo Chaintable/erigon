@@ -344,6 +344,11 @@ func (st *StateTransition) preCheck(gasBailout bool) error {
 		return fmt.Errorf("%w: address %v, gas limit %d", ErrGasLimitTooHigh, st.msg.From().Hex(), st.msg.Gas())
 	}
 
+	// For free/system txs in tracing contexts, skip balance and gas prepayment entirely.
+	if gasBailout && st.msg.IsFree() {
+		return nil
+	}
+
 	return st.buyGas(gasBailout)
 }
 
@@ -495,7 +500,8 @@ func (st *StateTransition) TransitionDb(refunds bool, gasBailout bool) (result *
 	if overflow {
 		return nil, ErrGasUintOverflow
 	}
-	if st.gasRemaining < gas || st.gasRemaining < floorGas7623 {
+	// Free/system transactions should not be subject to intrinsic gas constraints.
+	if (st.gasRemaining < gas || st.gasRemaining < floorGas7623) && !st.msg.IsFree() {
 		return nil, fmt.Errorf("%w: have %d, want %d", ErrIntrinsicGas, st.gasRemaining, max(gas, floorGas7623))
 	}
 

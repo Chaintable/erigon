@@ -157,8 +157,11 @@ func (api *DebugAPIImpl) traceBlock(ctx context.Context, blockNrOrHash rpc.Block
 			return ctx.Err()
 		}
 		ibs.SetTxContext(blockCtx.BlockNumber, txnIndex)
-
+		msg := &types.Message{}
 		if isBorStateSyncTxn {
+			if rules.IsMadhugiri {
+				msg.SetIsFree(true)
+			}
 			var stateSyncEvents []*types.Message
 			stateSyncEvents, err = api.bridgeReader.Events(ctx, block.Hash(), blockNumber)
 			if err != nil {

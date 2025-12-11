@@ -80,6 +80,7 @@ func (tx *StateSyncTx) AsMessage(_ Signer, baseFee *big.Int, rules *chain.Rules)
 		data:       []byte{},
 		accessList: nil,
 		checkNonce: false,
+		isFree:     true,
 	}
 
 	if baseFee != nil {
