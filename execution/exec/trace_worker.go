@@ -121,12 +121,6 @@ func (e *TraceWorker) ExecTxn(txNum uint64, txIndex int, txn types.Transaction, 
 	}
 	e.evm.ResetBetweenBlocks(*e.blockCtx, txContext, e.ibs, *e.vmConfig, e.rules)
 
-<<<<<<<< HEAD:execution/exec3/trace_worker.go
-	gp := new(core.GasPool).AddGas(txn.GetGas()).AddBlobGas(txn.GetBlobGas())
-	res, err := core.ApplyMessage(e.evm, msg, gp, true /* refunds */, gasBailout /* gasBailout */, e.engine)
-	if err != nil {
-		return nil, fmt.Errorf("%w: blockNum=%d, txNum=%d, %s", err, e.blockNum, txNum, e.ibs.Error())
-========
 	gp := new(protocol.GasPool).AddGas(txn.GetGasLimit()).AddBlobGas(txn.GetBlobGas())
 
 	if txn.Type() == types.AccountAbstractionTxType {
@@ -149,7 +143,6 @@ func (e *TraceWorker) ExecTxn(txNum uint64, txIndex int, txn types.Transaction, 
 			}
 			return fmt.Errorf("%w: blockNum=%d, txNum=%d, %s", err, e.blockNum, txNum, result.Err)
 		}
->>>>>>>> v3.3.1:execution/exec/trace_worker.go
 	}
 
 	e.ibs.SoftFinalise()

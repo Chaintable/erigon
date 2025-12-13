@@ -5,7 +5,7 @@ import (
 	"compress/gzip"
 	"encoding/json"
 
-	"github.com/erigontech/erigon-lib/rlp"
+	"github.com/erigontech/erigon/execution/rlp"
 )
 
 func EncodeToJsonGzip(v any) ([]byte, error) {

@@ -8,30 +8,28 @@ import (
 	"strings"
 	"time"
 
-	"github.com/erigontech/erigon-lib/common"
-	"github.com/erigontech/erigon-lib/common/hexutility"
-	"github.com/erigontech/erigon-lib/kv"
-	"github.com/erigontech/erigon-lib/kv/rawdbv3"
-	"github.com/erigontech/erigon-lib/log/v3"
-	"github.com/erigontech/erigon-lib/metrics"
-	"github.com/erigontech/erigon-lib/rlp"
-	"github.com/erigontech/erigon/consensus"
-	"github.com/erigontech/erigon/core"
-	"github.com/erigontech/erigon/core/rawdb"
-	"github.com/erigontech/erigon/core/state"
-	"github.com/erigontech/erigon/core/tracing"
-	"github.com/erigontech/erigon/core/types"
-	"github.com/erigontech/erigon/core/vm"
-	"github.com/erigontech/erigon/core/vm/evmtypes"
+	"github.com/erigontech/erigon/common"
+	"github.com/erigontech/erigon/common/hexutil"
+	"github.com/erigontech/erigon/common/log/v3"
+	"github.com/erigontech/erigon/db/consensuschain"
+	"github.com/erigontech/erigon/db/kv"
+	"github.com/erigontech/erigon/db/kv/rawdbv3"
 	dtracer "github.com/erigontech/erigon/debank/tracer"
 	dtypes "github.com/erigontech/erigon/debank/types"
-	"github.com/erigontech/erigon/eth/consensuschain"
-	"github.com/erigontech/erigon/polygon/bor/borcfg"
+	"github.com/erigontech/erigon/diagnostics/metrics"
+	chainspec "github.com/erigontech/erigon/execution/chain/spec"
+	polygonchain "github.com/erigontech/erigon/polygon/chain"
+	"github.com/erigontech/erigon/execution/protocol"
+	"github.com/erigontech/erigon/execution/protocol/rules"
+	"github.com/erigontech/erigon/execution/rlp"
+	"github.com/erigontech/erigon/execution/state"
+	"github.com/erigontech/erigon/execution/types"
+	"github.com/erigontech/erigon/execution/vm"
+	"github.com/erigontech/erigon/execution/vm/evmtypes"
 	bortypes "github.com/erigontech/erigon/polygon/bor/types"
-	"github.com/erigontech/erigon/polygon/tracer"
 	"github.com/erigontech/erigon/rpc"
-	"github.com/erigontech/erigon/turbo/rpchelper"
-	"github.com/erigontech/erigon/turbo/transactions"
+	"github.com/erigontech/erigon/rpc/rpchelper"
+	"github.com/erigontech/erigon/rpc/transactions"
 	"github.com/holiman/uint256"
 )
 
@@ -77,7 +75,7 @@ func (api *TraceAPIImpl) DebankBlockRaw(ctx context.Context, blockNrOrHash rpc.B
 	header := block.Header()
 
 	if block.NumberU64() == 0 {
-		genesis := core.GenesisBlockByChainName(chainConfig.ChainName)
+		genesis := genesisBlockByChainName(chainConfig.ChainName)
 		return dtracer.OnGenesisBlock(block, genesis.Alloc)
 	}
 
@@ -100,17 +98,17 @@ func (api *TraceAPIImpl) DebankBlockRaw(ctx context.Context, blockNrOrHash rpc.B
 	ibs := state.New(stateReader)
 	usedGas := new(uint64)
 	usedBlobGas := new(uint64)
-	gp := new(core.GasPool).AddGas(header.GasLimit).AddBlobGas(chainConfig.GetMaxBlobGasPerBlock(header.Time))
+	gp := protocol.NewGasPool(header.GasLimit, chainConfig.GetMaxBlobGasPerBlock(header.Time))
 
-	engine, ok := api.engine().(consensus.Engine)
+	engine, ok := api.engine().(rules.Engine)
 	if !ok {
-		return nil, errors.New("engine is not consensus.Engine")
+		return nil, errors.New("engine is not rules.Engine")
 	}
 
 	consensusHeaderReader := consensuschain.NewReader(chainConfig, dbtx, api._blockReader, nil)
 	logger := log.New("trace_debankBlock")
 
-	err = core.InitializeBlockExecution(engine, consensusHeaderReader, block.HeaderNoCopy(), chainConfig, ibs, writer, logger, nil)
+	err = protocol.InitializeBlockExecution(engine, consensusHeaderReader, block.HeaderNoCopy(), chainConfig, ibs, writer, logger, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -119,12 +117,12 @@ func (api *TraceAPIImpl) DebankBlockRaw(ctx context.Context, blockNrOrHash rpc.B
 	receipts := make(types.Receipts, 0, block.Transactions().Len())
 	vmConfig := vm.Config{}
 
-	getHeader := func(hash common.Hash, number uint64) *types.Header {
+	getHeader := func(hash common.Hash, number uint64) (*types.Header, error) {
 		h, e := api._blockReader.Header(ctx, dbtx, hash, number)
 		if e != nil {
 			log.Error("getHeader error", "number", number, "hash", hash, "err", e)
 		}
-		return h
+		return h, e
 	}
 	blockFile := &dtypes.BlockFile{
 		Block:            dtracer.BuildPipelineBlock(block),
@@ -140,14 +138,11 @@ func (api *TraceAPIImpl) DebankBlockRaw(ctx context.Context, blockNrOrHash rpc.B
 	// Collect ChangeContracts from all tracers to deduplicate them
 	changeContractsMap := make(map[common.Address]struct{})
 	for i, txn := range block.Transactions() {
-		ibs.SetTxContext(i)
-		tracer := dtracer.NewCallTracer(blockFile, txn.Hash().Hex())
-		vmConfig.Debug = true
-		vmConfig.Tracer = tracer
-		ibs.SetHooks(&tracing.Hooks{
-			OnLog: tracer.OnLog,
-		})
-		receipt, _, err := core.ApplyTransaction(chainConfig, core.GetHashFn(header, getHeader), engine, nil, gp, ibs, writer, header, txn, usedGas, usedBlobGas, vmConfig)
+		ibs.SetTxContext(header.Number.Uint64(), i)
+		hooks, tracer := dtracer.GetCallTracer(blockFile, txn.Hash().Hex())
+		vmConfig.Tracer = hooks
+		ibs.SetHooks(hooks)
+		receipt, _, err := protocol.ApplyTransaction(chainConfig, protocol.GetHashFn(header, getHeader), engine, nil, gp, ibs, writer, header, txn, usedGas, usedBlobGas, vmConfig)
 		if err != nil {
 			return nil, fmt.Errorf("trace_debankBlock: bn=%d, txnIdx=%d, %w", header.Number.Uint64(), i, err)
 		}
@@ -156,12 +151,7 @@ func (api *TraceAPIImpl) DebankBlockRaw(ctx context.Context, blockNrOrHash rpc.B
 		}
 		includedTxs = append(includedTxs, txn)
 		receipts = append(receipts, receipt)
-		var from common.Address
-		if tracer.Evm != nil {
-			from = tracer.Evm.Origin
-		} else {
-			from = getFrom(txn)
-		}
+		from := getFrom(txn)
 		tx := dtracer.BuildPipelineTransaction(txn, receipt, from, chainConfig, header)
 		blockFile.Txs = append(blockFile.Txs, tx)
 	}
@@ -169,50 +159,36 @@ func (api *TraceAPIImpl) DebankBlockRaw(ctx context.Context, blockNrOrHash rpc.B
 	if chainConfig.Bor != nil {
 		var borTx types.Transaction
 		var borTxHash common.Hash
-		if api.useBridgeReader {
-			possibleBorTxnHash := bortypes.ComputeBorTxHash(block.NumberU64(), block.Hash())
-			_, ok, err := api.bridgeReader.EventTxnLookup(ctx, possibleBorTxnHash)
-			if err != nil {
-				return nil, err
-			}
-			if ok {
-				borTx = bortypes.NewBorTransaction()
-				borTxHash = possibleBorTxnHash
-			}
-		} else {
-			borTx = rawdb.ReadBorTransactionForBlock(dbtx, block.NumberU64())
-			if borTx != nil {
-				borTxHash = bortypes.ComputeBorTxHash(block.NumberU64(), block.Hash())
-			}
+		possibleBorTxnHash := bortypes.ComputeBorTxHash(block.NumberU64(), block.Hash())
+		_, ok, err := api.bridgeReader.EventTxnLookup(ctx, possibleBorTxnHash)
+		if err != nil {
+			return nil, err
+		}
+		if ok {
+			borTx = bortypes.NewBorTransaction()
+			borTxHash = possibleBorTxnHash
 		}
 		if borTx != nil {
 			var stateSyncEvents []*types.Message
-			stateSyncEvents, err = api.stateSyncEvents(ctx, dbtx, header.Hash(), blockNumber, chainConfig)
+			stateSyncEvents, err = api.bridgeReader.Events(ctx, header.Hash(), blockNumber)
 			if err != nil {
 				return nil, err
 			}
-			stateReceiverContract := chainConfig.Bor.(*borcfg.BorConfig).StateReceiverContractAddress()
 			txCtx := evmtypes.TxContext{
 				TxHash:   bortypes.ComputeBorTxHash(blockNumber, blockHash),
 				Origin:   common.Address{},
-				GasPrice: uint256.NewInt(0),
+				GasPrice: *uint256.NewInt(0),
 			}
-			vmConfig.Debug = true
-			atracer := dtracer.NewCallTracer(blockFile, txCtx.TxHash.Hex())
-			vmConfig.Tracer = atracer
-			if vmConfig.Tracer != nil {
-				vmConfig.Tracer = tracer.NewBorStateSyncTxnTracer(vmConfig.Tracer, len(stateSyncEvents), stateReceiverContract)
-			}
-			ibs.SetTxContext(len(block.Transactions()))
-			ibs.SetHooks(&tracing.Hooks{
-				OnLog: atracer.OnLog,
-			})
+			hooks := dtracer.NewCallTracer(blockFile, txCtx.TxHash.Hex())
+			vmConfig.Tracer = hooks
+			ibs.SetTxContext(header.Number.Uint64(), len(block.Transactions()))
+			ibs.SetHooks(hooks)
 			blockCtx := transactions.NewEVMBlockContext(engine, header, true, dbtx, api._blockReader, chainConfig)
 			evm := vm.NewEVM(blockCtx, txCtx, ibs, chainConfig, vmConfig)
-			rules := chainConfig.Rules(blockNumber, block.Time())
+			rules := blockCtx.Rules(chainConfig)
 			for _, msg := range stateSyncEvents {
-				gp := new(core.GasPool).AddGas(msg.Gas()).AddBlobGas(msg.BlobGas())
-				_, err := core.ApplyMessage(evm, msg, gp, true, false /* gasBailout */, api.engine())
+				gp := protocol.NewGasPool(msg.Gas(), msg.BlobGas())
+				_, err := protocol.ApplyMessage(evm, msg, gp, true, false /* gasBailout */, engine)
 				if err != nil {
 					return nil, err
 				}
@@ -243,7 +219,7 @@ func (api *TraceAPIImpl) DebankBlockRaw(ctx context.Context, blockNrOrHash rpc.B
 
 	chainReader := consensuschain.NewReader(chainConfig, dbtx, api._blockReader, logger)
 
-	newBlock, _, _, _, err := core.FinalizeBlockExecution(engine, stateReader, block.Header(), block.Transactions(), block.Uncles(), writer, chainConfig, ibs, receipts, block.Withdrawals(), chainReader, true, logger)
+	newBlock, _, err := protocol.FinalizeBlockExecution(engine, stateReader, block.Header(), block.Transactions(), block.Uncles(), writer, chainConfig, ibs, receipts, block.Withdrawals(), chainReader, true, logger, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -304,7 +280,7 @@ func (api *TraceAPIImpl) DebankBlockRaw(ctx context.Context, blockNrOrHash rpc.B
 type DebankOutPutJs struct {
 	BlockFile      *dtypes.BlockFile `json:"block_file"`
 	Header         *dtypes.Header    `json:"header"`
-	StateDiff      hexutility.Bytes  `json:"state_diff"`
+	StateDiff      hexutil.Bytes  `json:"state_diff"`
 	ValidationHash int64             `json:"validation_hash"`
 }
 
@@ -412,4 +388,30 @@ func getFrom(txn types.Transaction) common.Address {
 	signer := types.LatestSignerForChainID(chainId)
 	from, _ = txn.Sender(*signer)
 	return from
+}
+
+// genesisBlockByChainName returns the genesis block for the given chain name
+func genesisBlockByChainName(chainName string) *types.Genesis {
+	switch chainName {
+	case "mainnet":
+		return chainspec.MainnetGenesisBlock()
+	case "sepolia":
+		return chainspec.SepoliaGenesisBlock()
+	case "hoodi":
+		return chainspec.HoodiGenesisBlock()
+	case "gnosis":
+		return chainspec.GnosisGenesisBlock()
+	case "chiado":
+		return chainspec.ChiadoGenesisBlock()
+	case "bor-mainnet":
+		return polygonchain.BorMainnetGenesisBlock()
+	case "mumbai":
+		return polygonchain.MumbaiGenesisBlock()
+	case "amoy":
+		return polygonchain.AmoyGenesisBlock()
+	case "bor-devnet":
+		return polygonchain.BorDevnetGenesisBlock()
+	default:
+		return nil
+	}
 }

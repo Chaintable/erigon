@@ -6,7 +6,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/erigontech/erigon-lib/log/v3"
+	"github.com/erigontech/erigon/common/log/v3"
 	dtypes "github.com/erigontech/erigon/debank/types"
 	"github.com/erigontech/erigon/debank/util"
 	"github.com/erigontech/erigon/rpc"

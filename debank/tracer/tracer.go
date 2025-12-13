@@ -6,16 +6,17 @@ import (
 	"math/big"
 	"strings"
 
-	"github.com/erigontech/erigon-lib/common"
-	"github.com/erigontech/erigon-lib/common/hexutil"
-	"github.com/erigontech/erigon-lib/common/hexutility"
-	"github.com/erigontech/erigon-lib/crypto"
-	"github.com/erigontech/erigon-lib/types/accounts"
-	"github.com/erigontech/erigon/accounts/abi"
-	"github.com/erigontech/erigon/core/types"
-	"github.com/erigontech/erigon/core/vm"
+	"github.com/erigontech/erigon/common"
+	"github.com/erigontech/erigon/common/crypto"
+	"github.com/erigontech/erigon/common/hexutil"
 	dtypes "github.com/erigontech/erigon/debank/types"
 	"github.com/erigontech/erigon/debank/util"
+	"github.com/erigontech/erigon/execution/abi"
+	"github.com/erigontech/erigon/execution/commitment/trie"
+	"github.com/erigontech/erigon/execution/tracing"
+	"github.com/erigontech/erigon/execution/types"
+	"github.com/erigontech/erigon/execution/types/accounts"
+	"github.com/erigontech/erigon/execution/vm"
 	"github.com/holiman/uint256"
 )
 
@@ -95,13 +96,14 @@ func (bs *BlockStorageDiffMap) DeleteAccount(address common.Address, original *a
 	return nil
 }
 
-func (bs *BlockStorageDiffMap) WriteAccountStorage(address common.Address, incarnation uint64, key *common.Hash, original, value *uint256.Int) error {
+func (bs *BlockStorageDiffMap) WriteAccountStorage(address common.Address, incarnation uint64, key common.Hash, original, value uint256.Int) error {
 	addrhash := crypto.Keccak256Hash(address.Bytes())
 	if _, ok := bs.StorageDiff[addrhash]; !ok {
 		bs.StorageDiff[addrhash] = make(map[common.Hash]*uint256.Int)
 	}
 	storageDiff := bs.StorageDiff[addrhash]
-	storageDiff[crypto.Keccak256Hash(key.Bytes())] = value
+	valueCopy := value.Clone()
+	storageDiff[crypto.Keccak256Hash(key.Bytes())] = valueCopy
 	bs.StorageChanges[address] = struct{}{}
 	return nil
 }
@@ -178,7 +180,7 @@ func (f *callFrame) processOutput(output []byte, err error, reverted bool) {
 	}
 }
 
-var _ vm.EVMLogger = (*callTracer)(nil)
+// Removed vm.EVMLogger interface check - now using tracing.Hooks
 
 func (t *callTracer) ToTrace(f *callFrame, traceAddress []int64) dtypes.Trace {
 	CallCreateType := ""
@@ -213,11 +215,11 @@ func (t *callTracer) ToTrace(f *callFrame, traceAddress []int64) dtypes.Trace {
 		ID:                f.TraceID,
 		From:              strings.ToLower(f.From.Hex()),
 		Gas:               big.NewInt(int64(f.Gas)),
-		Input:             (hexutility.Bytes)(f.Input),
+		Input:             (hexutil.Bytes)(f.Input),
 		To:                strings.ToLower(to.Hex()),
 		Value:             (*hexutil.Big)(value),
 		GasUsed:           big.NewInt(int64(f.GasUsed)),
-		Output:            (hexutility.Bytes)(f.Output),
+		Output:            (hexutil.Bytes)(f.Output),
 		CallCreateType:    CallCreateType,
 		CallType:          CallType,
 		TxID:              t.txID,
@@ -235,32 +237,71 @@ type callTracer struct {
 	callstack   []callFrame
 	gasLimit    uint64
 	txID        string
-	Evm         *vm.EVM
 	BlockFile   *dtypes.BlockFile
 	PendingLogs []*types.Log // only for polygon TransferLogs
 
 	ChangeContracts map[common.Address]struct{}
 }
 
-func NewCallTracer(BlockFile *dtypes.BlockFile, txID string) *callTracer {
-	return &callTracer{
-		BlockFile: BlockFile,
-		txID:      txID,
+// CallTracer is exported for use in trace_debank.go
+type CallTracer = callTracer
 
+func NewCallTracer(BlockFile *dtypes.BlockFile, txID string) *tracing.Hooks {
+	t := &callTracer{
+		BlockFile:       BlockFile,
+		txID:            txID,
 		ChangeContracts: make(map[common.Address]struct{}),
 	}
-}
-
-func (t *callTracer) CaptureTxStart(gasLimit uint64) {
-	t.gasLimit = gasLimit
-}
-
-func (t *callTracer) CaptureStart(env *vm.EVM, from common.Address, to common.Address, precompile bool, create bool, input []byte, gas uint64, value *uint256.Int, code []byte) {
-	toCopy := to
-	tpy := vm.CALL
-	if create {
-		tpy = vm.CREATE
+	return &tracing.Hooks{
+		OnEnter:   t.OnEnter,
+		OnExit:    t.OnExit,
+		OnOpcode:  t.OnOpcode,
+		OnFault:   t.OnFault,
+		OnLog:     t.OnLog,
+		OnTxStart: t.OnTxStart,
+		OnTxEnd:   t.OnTxEnd,
 	}
+}
+
+// GetCallTracer creates a callTracer and returns both the hooks and the tracer itself
+func GetCallTracer(BlockFile *dtypes.BlockFile, txID string) (*tracing.Hooks, *callTracer) {
+	t := &callTracer{
+		BlockFile:       BlockFile,
+		txID:            txID,
+		ChangeContracts: make(map[common.Address]struct{}),
+	}
+	hooks := &tracing.Hooks{
+		OnEnter:   t.OnEnter,
+		OnExit:    t.OnExit,
+		OnOpcode:  t.OnOpcode,
+		OnFault:   t.OnFault,
+		OnLog:     t.OnLog,
+		OnTxStart: t.OnTxStart,
+		OnTxEnd:   t.OnTxEnd,
+	}
+	return hooks, t
+}
+
+// OnTxStart is called when transaction execution starts
+func (t *callTracer) OnTxStart(vm *tracing.VMContext, txn types.Transaction, from common.Address) {
+	t.gasLimit = txn.GetGasLimit()
+}
+
+// OnTxEnd is called when transaction execution ends
+func (t *callTracer) OnTxEnd(receipt *types.Receipt, err error) {
+	// Process pending logs
+	if len(t.PendingLogs) > 0 {
+		for _, logg := range t.PendingLogs {
+			t.OnLog(logg)
+		}
+		t.PendingLogs = nil
+	}
+}
+
+// OnEnter is called when entering a call frame
+func (t *callTracer) OnEnter(depth int, typ byte, from common.Address, to common.Address, precompile bool, input []byte, gas uint64, value uint256.Int, code []byte) {
+	toCopy := to
+	tpy := vm.OpCode(typ)
 	call := callFrame{
 		Type:  tpy,
 		From:  from,
@@ -269,75 +310,43 @@ func (t *callTracer) CaptureStart(env *vm.EVM, from common.Address, to common.Ad
 		Gas:   gas,
 		Value: value.ToBig(),
 	}
-	t.Evm = env
-	t.callstack = append(t.callstack, call)
-	if len(t.PendingLogs) > 0 {
-		for _, logg := range t.PendingLogs {
-			t.OnLog(logg)
-		}
-		t.PendingLogs = nil
-	}
-}
-func (t *callTracer) CaptureEnter(typ vm.OpCode, from common.Address, to common.Address, precompile bool, create bool, input []byte, gas uint64, value *uint256.Int, code []byte) {
-	toCopy := to
-	call := callFrame{
-		Type:  vm.OpCode(typ),
-		From:  from,
-		To:    &toCopy,
-		Input: common.CopyBytes(input),
-		Gas:   gas,
-		Value: value.ToBig(),
-	}
 	t.callstack = append(t.callstack, call)
 }
 
-func (t *callTracer) CaptureExit(output []byte, usedGas uint64, err error) {
-	var reverted bool
-	if err != nil {
-		reverted = true
-	}
-	if !t.Evm.ChainRules().IsHomestead && errors.Is(err, vm.ErrCodeStoreOutOfGas) {
-		reverted = false
-	}
+// OnExit is called when exiting a call frame
+func (t *callTracer) OnExit(depth int, output []byte, gasUsed uint64, err error, reverted bool) {
 	size := len(t.callstack)
 	if size <= 1 {
+		// Top-level call exit
+		if size == 1 {
+			t.callstack[0].GasUsed = gasUsed
+			t.callstack[0].processOutput(output, err, reverted)
+		}
 		return
 	}
-	// Pop call.
+	// Pop call
 	call := t.callstack[size-1]
 	t.callstack = t.callstack[:size-1]
 	size -= 1
 
-	call.GasUsed = usedGas
+	call.GasUsed = gasUsed
 	call.processOutput(output, err, reverted)
 	call.PosInParentTrace = len(t.callstack[size-1].Calls) + len(t.callstack[size-1].Logs)
 	t.callstack[size-1].Calls = append(t.callstack[size-1].Calls, call)
 }
 
-func (t *callTracer) CaptureEnd(output []byte, usedGas uint64, err error) {
-	var reverted bool
-	if err != nil {
-		reverted = true
-	}
-	if !t.Evm.ChainRules().IsHomestead && errors.Is(err, vm.ErrCodeStoreOutOfGas) {
-		reverted = false
-	}
-	if len(t.callstack) != 1 {
-		return
-	}
-	t.callstack[0].GasUsed = usedGas
-	t.callstack[0].processOutput(output, err, reverted)
-}
-
-func (t *callTracer) CaptureState(pc uint64, op vm.OpCode, gas, cost uint64, scope *vm.ScopeContext, rData []byte, opDepth int, err error) {
-	if op == vm.SSTORE {
-		t.callstack[len(t.callstack)-1].SelfStorageChange = true
-		t.callstack[len(t.callstack)-1].StorageChange = true
+// OnOpcode is the hook for opcode execution - replaces CaptureState
+func (t *callTracer) OnOpcode(pc uint64, op byte, gas, cost uint64, scope tracing.OpContext, rData []byte, depth int, err error) {
+	if vm.OpCode(op) == vm.SSTORE {
+		if len(t.callstack) > 0 {
+			t.callstack[len(t.callstack)-1].SelfStorageChange = true
+			t.callstack[len(t.callstack)-1].StorageChange = true
+		}
 	}
 }
 
-func (t *callTracer) CaptureFault(pc uint64, op vm.OpCode, gas, cost uint64, scope *vm.ScopeContext, depth int, err error) {
-
+// OnFault is the hook for opcode faults - replaces CaptureFault
+func (t *callTracer) OnFault(pc uint64, op byte, gas, cost uint64, scope tracing.OpContext, depth int, err error) {
 }
 
 func setParentFailed(cf *callFrame, parentFailed bool) {
@@ -441,7 +450,7 @@ func OnGenesisBlock(block *types.Block, alloc types.GenesisAlloc) (*dtypes.Deban
 	header := BuildPilelineBlockHeader(block)
 	blockDiff := GenesisAllocToStateDiff(alloc)
 	blockDiff.Hash = block.Root()
-	blockDiff.ParentHash = types.EmptyRootHash
+	blockDiff.ParentHash = trie.EmptyRoot
 
 	blockFile := &dtypes.BlockFile{
 		Block:            BuildPipelineBlock(block),

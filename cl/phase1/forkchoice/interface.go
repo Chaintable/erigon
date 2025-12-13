@@ -80,11 +80,6 @@ type ForkChoiceStorageReader interface {
 	GetPendingPartialWithdrawals(blockRoot common.Hash) (*solid.ListSSZ[*solid.PendingPartialWithdrawal], bool)
 	GetProposerLookahead(slot uint64) (solid.Uint64VectorSSZ, bool)
 
-	// New stuff added for ssz queues in the beacon state.
-	GetPendingConsolidations(blockRoot common.Hash) (*solid.ListSSZ[*solid.PendingConsolidation], bool)
-	GetPendingDeposits(blockRoot common.Hash) (*solid.ListSSZ[*solid.PendingDeposit], bool)
-	GetPendingPartialWithdrawals(blockRoot common.Hash) (*solid.ListSSZ[*solid.PendingPartialWithdrawal], bool)
-
 	ValidateOnAttestation(attestation *solid.Attestation) error
 	IsRootOptimistic(root common.Hash) bool
 	IsHeadOptimistic() bool
