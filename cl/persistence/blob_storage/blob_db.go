@@ -23,32 +23,36 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"os"
 	"strconv"
 	"sync"
 	"sync/atomic"
 
-	gokzg4844 "github.com/crate-crypto/go-kzg-4844"
-	libcommon "github.com/erigontech/erigon-lib/common"
-	"github.com/erigontech/erigon-lib/crypto/kzg"
-	"github.com/erigontech/erigon-lib/kv"
+	goethkzg "github.com/crate-crypto/go-eth-kzg"
+	"github.com/spf13/afero"
+
 	"github.com/erigontech/erigon/cl/clparams"
 	"github.com/erigontech/erigon/cl/cltypes"
 	"github.com/erigontech/erigon/cl/cltypes/solid"
 	"github.com/erigontech/erigon/cl/sentinel/communication/ssz_snappy"
 	"github.com/erigontech/erigon/cl/utils/eth_clock"
-	"github.com/spf13/afero"
+	"github.com/erigontech/erigon/common"
+	"github.com/erigontech/erigon/common/crypto/kzg"
+	"github.com/erigontech/erigon/db/kv"
 )
 
 const (
 	subdivisionSlot = 10_000
 )
 
+//go:generate mockgen -typed=true -destination=./mock_services/blob_storage_mock.go -package=mock_services . BlobStorage
 type BlobStorage interface {
-	WriteBlobSidecars(ctx context.Context, blockRoot libcommon.Hash, blobSidecars []*cltypes.BlobSidecar) error
-	RemoveBlobSidecars(ctx context.Context, slot uint64, blockRoot libcommon.Hash) error
-	ReadBlobSidecars(ctx context.Context, slot uint64, blockRoot libcommon.Hash) (out []*cltypes.BlobSidecar, found bool, err error)
-	WriteStream(w io.Writer, slot uint64, blockRoot libcommon.Hash, idx uint64) error // Used for P2P networking
-	KzgCommitmentsCount(ctx context.Context, blockRoot libcommon.Hash) (uint32, error)
+	WriteBlobSidecars(ctx context.Context, blockRoot common.Hash, blobSidecars []*cltypes.BlobSidecar) error
+	RemoveBlobSidecars(ctx context.Context, slot uint64, blockRoot common.Hash) error
+	ReadBlobSidecars(ctx context.Context, slot uint64, blockRoot common.Hash) (out []*cltypes.BlobSidecar, found bool, err error)
+	BlobSidecarExists(ctx context.Context, slot uint64, blockRoot common.Hash, idx uint64) (bool, error)
+	WriteStream(w io.Writer, slot uint64, blockRoot common.Hash, idx uint64) error // Used for P2P networking
+	KzgCommitmentsCount(ctx context.Context, blockRoot common.Hash) (uint32, error)
 	Prune() error
 }
 
@@ -64,7 +68,7 @@ func NewBlobStore(db kv.RwDB, fs afero.Fs, slotsKept uint64, beaconChainConfig *
 	return &BlobStore{fs: fs, db: db, slotsKept: slotsKept, beaconChainConfig: beaconChainConfig, ethClock: ethClock}
 }
 
-func blobSidecarFilePath(slot, index uint64, blockRoot libcommon.Hash) (folderpath, filepath string) {
+func blobSidecarFilePath(slot, index uint64, blockRoot common.Hash) (folderpath, filepath string) {
 	subdir := slot / subdivisionSlot
 	folderpath = strconv.FormatUint(subdir, 10)
 	filepath = fmt.Sprintf("%s/%s_%d", folderpath, blockRoot.String(), index)
@@ -78,7 +82,7 @@ indicies:
 */
 
 // WriteBlobSidecars writes the sidecars on the database. it assumes that all blobSidecars are for the same blockRoot and we have all of them.
-func (bs *BlobStore) WriteBlobSidecars(ctx context.Context, blockRoot libcommon.Hash, blobSidecars []*cltypes.BlobSidecar) error {
+func (bs *BlobStore) WriteBlobSidecars(ctx context.Context, blockRoot common.Hash, blobSidecars []*cltypes.BlobSidecar) error {
 
 	for _, blobSidecar := range blobSidecars {
 		folderPath, filePath := blobSidecarFilePath(
@@ -115,7 +119,7 @@ func (bs *BlobStore) WriteBlobSidecars(ctx context.Context, blockRoot libcommon.
 }
 
 // ReadBlobSidecars reads the sidecars from the database. it assumes that all blobSidecars are for the same blockRoot and we have all of them.
-func (bs *BlobStore) ReadBlobSidecars(ctx context.Context, slot uint64, blockRoot libcommon.Hash) ([]*cltypes.BlobSidecar, bool, error) {
+func (bs *BlobStore) ReadBlobSidecars(ctx context.Context, slot uint64, blockRoot common.Hash) ([]*cltypes.BlobSidecar, bool, error) {
 	tx, err := bs.db.BeginRo(ctx)
 	if err != nil {
 		return nil, false, err
@@ -173,7 +177,17 @@ func (bs *BlobStore) Prune() error {
 	return nil
 }
 
-func (bs *BlobStore) WriteStream(w io.Writer, slot uint64, blockRoot libcommon.Hash, idx uint64) error {
+func (bs *BlobStore) BlobSidecarExists(ctx context.Context, slot uint64, blockRoot common.Hash, idx uint64) (bool, error) {
+	_, filePath := blobSidecarFilePath(slot, idx, blockRoot)
+	_, err := bs.fs.Stat(filePath)
+	if os.IsNotExist(err) {
+		return false, nil
+	} else if err != nil {
+		return false, err
+	}
+	return true, nil
+}
+func (bs *BlobStore) WriteStream(w io.Writer, slot uint64, blockRoot common.Hash, idx uint64) error {
 	_, filePath := blobSidecarFilePath(slot, idx, blockRoot)
 	file, err := bs.fs.Open(filePath)
 	if err != nil {
@@ -184,7 +198,7 @@ func (bs *BlobStore) WriteStream(w io.Writer, slot uint64, blockRoot libcommon.H
 	return err
 }
 
-func (bs *BlobStore) KzgCommitmentsCount(ctx context.Context, blockRoot libcommon.Hash) (uint32, error) {
+func (bs *BlobStore) KzgCommitmentsCount(ctx context.Context, blockRoot common.Hash) (uint32, error) {
 	tx, err := bs.db.BeginRo(context.Background())
 	if err != nil {
 		return 0, err
@@ -200,7 +214,7 @@ func (bs *BlobStore) KzgCommitmentsCount(ctx context.Context, blockRoot libcommo
 	return binary.LittleEndian.Uint32(val), nil
 }
 
-func (bs *BlobStore) RemoveBlobSidecars(ctx context.Context, slot uint64, blockRoot libcommon.Hash) error {
+func (bs *BlobStore) RemoveBlobSidecars(ctx context.Context, slot uint64, blockRoot common.Hash) error {
 	tx, err := bs.db.BeginRw(ctx)
 	if err != nil {
 		return err
@@ -219,13 +233,13 @@ func (bs *BlobStore) RemoveBlobSidecars(ctx context.Context, slot uint64, blockR
 		if err := bs.fs.Remove(filePath); err != nil {
 			return err
 		}
-		tx.Delete(kv.BlockRootToKzgCommitments, blockRoot[:])
 	}
+	tx.Delete(kv.BlockRootToKzgCommitments, blockRoot[:])
 	return tx.Commit()
 }
 
 type sidecarsPayload struct {
-	blockRoot libcommon.Hash
+	blockRoot common.Hash
 	sidecars  []*cltypes.BlobSidecar
 }
 
@@ -295,17 +309,17 @@ func VerifyAgainstIdentifiersAndInsertIntoTheBlobStore(ctx context.Context, stor
 		wg.Add(1)
 		go func(sds *sidecarsPayload) {
 			defer wg.Done()
-			blobs := make([]gokzg4844.BlobRef, len(sds.sidecars))
+			blobs := make([]*goethkzg.Blob, len(sds.sidecars))
 			for i, sidecar := range sds.sidecars {
-				blobs[i] = sidecar.Blob[:]
+				blobs[i] = (*goethkzg.Blob)(&sidecar.Blob)
 			}
-			kzgCommitments := make([]gokzg4844.KZGCommitment, len(sds.sidecars))
+			kzgCommitments := make([]goethkzg.KZGCommitment, len(sds.sidecars))
 			for i, sidecar := range sds.sidecars {
-				kzgCommitments[i] = gokzg4844.KZGCommitment(sidecar.KzgCommitment)
+				kzgCommitments[i] = goethkzg.KZGCommitment(sidecar.KzgCommitment)
 			}
-			kzgProofs := make([]gokzg4844.KZGProof, len(sds.sidecars))
+			kzgProofs := make([]goethkzg.KZGProof, len(sds.sidecars))
 			for i, sidecar := range sds.sidecars {
-				kzgProofs[i] = gokzg4844.KZGProof(sidecar.KzgProof)
+				kzgProofs[i] = goethkzg.KZGProof(sidecar.KzgProof)
 			}
 			if err := kzgCtx.VerifyBlobKZGProofBatch(blobs, kzgCommitments, kzgProofs); err != nil {
 				errAtomic.Store(errors.New("sidecar is wrong"))

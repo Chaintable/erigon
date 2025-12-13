@@ -24,20 +24,20 @@ import (
 	"slices"
 	"sync"
 
-	"github.com/Giulio2002/bls"
-
-	libcommon "github.com/erigontech/erigon-lib/common"
-	sentinel "github.com/erigontech/erigon-lib/gointerfaces/sentinelproto"
 	"github.com/erigontech/erigon/cl/beacon/beaconevents"
 	"github.com/erigontech/erigon/cl/beacon/synced_data"
 	"github.com/erigontech/erigon/cl/clparams"
 	"github.com/erigontech/erigon/cl/cltypes"
 	"github.com/erigontech/erigon/cl/cltypes/solid"
 	"github.com/erigontech/erigon/cl/fork"
+	"github.com/erigontech/erigon/cl/gossip"
 	"github.com/erigontech/erigon/cl/phase1/core/state"
 	"github.com/erigontech/erigon/cl/utils"
+	"github.com/erigontech/erigon/cl/utils/bls"
 	"github.com/erigontech/erigon/cl/utils/eth_clock"
 	"github.com/erigontech/erigon/cl/validator/sync_contribution_pool"
+	"github.com/erigontech/erigon/common"
+	"github.com/erigontech/erigon/node/gointerfaces/sentinelproto"
 )
 
 type seenSyncCommitteeContribution struct {
@@ -62,7 +62,7 @@ type syncContributionService struct {
 // SignedContributionAndProofWithGossipData type represents SignedContributionAndProof with the gossip data where it's coming from.
 type SignedContributionAndProofForGossip struct {
 	SignedContributionAndProof *cltypes.SignedContributionAndProof
-	Receiver                   *sentinel.Peer
+	Receiver                   *sentinelproto.Peer
 	ImmediateVerification      bool
 }
 
@@ -86,6 +86,21 @@ func NewSyncContributionService(
 		batchSignatureVerifier:         batchSignatureVerifier,
 		test:                           test,
 	}
+}
+
+func (s *syncContributionService) IsMyGossipMessage(name string) bool {
+	return name == gossip.TopicNameSyncCommitteeContributionAndProof
+}
+
+func (s *syncContributionService) DecodeGossipMessage(data *sentinelproto.GossipData, version clparams.StateVersion) (*SignedContributionAndProofForGossip, error) {
+	obj := &SignedContributionAndProofForGossip{
+		Receiver:                   copyOfPeerData(data),
+		SignedContributionAndProof: &cltypes.SignedContributionAndProof{},
+	}
+	if err := obj.SignedContributionAndProof.DecodeSSZ(data.Data, int(version)); err != nil {
+		return nil, err
+	}
+	return obj, nil
 }
 
 // ProcessMessage processes a sync contribution message
@@ -182,7 +197,7 @@ func (s *syncContributionService) GetSignaturesOnContributionSignatures(
 	headState *state.CachingBeaconState,
 	contributionAndProof *cltypes.ContributionAndProof,
 	signedContribution *SignedContributionAndProofForGossip,
-	subcommiteePubsKeys []libcommon.Bytes48) (*AggregateVerificationData, error) {
+	subcommiteePubsKeys []common.Bytes48) (*AggregateVerificationData, error) {
 
 	// [REJECT] The contribution_and_proof.selection_proof is a valid signature of the SyncAggregatorSelectionData derived from the contribution by the validator with index contribution_and_proof.aggregator_index.
 	signature1, signatureRoot1, pubKey1, err := verifySyncContributionSelectionProof(headState, contributionAndProof)
@@ -224,7 +239,7 @@ func (s *syncContributionService) GetSignaturesOnContributionSignatures(
 //	return sync_committee.pubkeys[i:i + sync_subcommittee_size]
 
 // getSyncSubcommitteePubkeys returns the public keys of the validators in the given subcommittee.
-func (s *syncContributionService) getSyncSubcommitteePubkeys(st *state.CachingBeaconState, subcommitteeIndex uint64) ([]libcommon.Bytes48, error) {
+func (s *syncContributionService) getSyncSubcommitteePubkeys(st *state.CachingBeaconState, subcommitteeIndex uint64) ([]common.Bytes48, error) {
 	var syncCommittee *solid.SyncCommittee
 	if s.beaconCfg.SyncCommitteePeriod(st.Slot()) == s.beaconCfg.SyncCommitteePeriod(st.Slot()+1) {
 		syncCommittee = st.CurrentSyncCommittee()
@@ -285,7 +300,7 @@ func verifySyncContributionSelectionProof(st *state.CachingBeaconState, contribu
 }
 
 // verifySyncContributionProof verifies the contribution aggregated signature.
-func verifySyncContributionProofAggregatedSignature(s *state.CachingBeaconState, contribution *cltypes.Contribution, subCommitteeKeys []libcommon.Bytes48) ([]byte, []byte, []byte, error) {
+func verifySyncContributionProofAggregatedSignature(s *state.CachingBeaconState, contribution *cltypes.Contribution, subCommitteeKeys []common.Bytes48) ([]byte, []byte, []byte, error) {
 	domain, err := s.GetDomain(s.BeaconConfig().DomainSyncCommittee, state.Epoch(s))
 	if err != nil {
 		return nil, nil, nil, err
@@ -296,7 +311,7 @@ func verifySyncContributionProofAggregatedSignature(s *state.CachingBeaconState,
 	subCommitteePubsKeys := make([][]byte, 0, len(subCommitteeKeys))
 	for i, key := range subCommitteeKeys {
 		if utils.IsBitOn(contribution.AggregationBits, i) {
-			subCommitteePubsKeys = append(subCommitteePubsKeys, libcommon.CopyBytes(key[:]))
+			subCommitteePubsKeys = append(subCommitteePubsKeys, common.CopyBytes(key[:]))
 		}
 	}
 

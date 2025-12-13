@@ -23,11 +23,11 @@ import (
 
 	"github.com/urfave/cli/v2"
 
-	"github.com/erigontech/erigon-lib/chain/snapcfg"
-	libcommon "github.com/erigontech/erigon-lib/common"
-	diaglib "github.com/erigontech/erigon-lib/diagnostics"
-	"github.com/erigontech/erigon-lib/log/v3"
-	"github.com/erigontech/erigon/turbo/node"
+	"github.com/erigontech/erigon/cmd/erigon/node"
+	"github.com/erigontech/erigon/common"
+	"github.com/erigontech/erigon/common/log/v3"
+	"github.com/erigontech/erigon/db/snapcfg"
+	"github.com/erigontech/erigon/diagnostics/diaglib"
 )
 
 var (
@@ -70,7 +70,7 @@ func Setup(ctx *cli.Context, node *node.ErigonNode, metricsMux *http.ServeMux, p
 	}
 
 	chain := ctx.String(chainFlag)
-	webseedsList := libcommon.CliString2Array(ctx.String(webSeedsFlag))
+	webseedsList := common.CliString2Array(ctx.String(webSeedsFlag))
 	if known, ok := snapcfg.KnownWebseeds[chain]; ok {
 		webseedsList = append(webseedsList, known...)
 	}

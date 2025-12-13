@@ -23,11 +23,6 @@ import (
 	"sync"
 	"time"
 
-	libcommon "github.com/erigontech/erigon-lib/common"
-	"github.com/erigontech/erigon-lib/downloader/snaptype"
-	proto_downloader "github.com/erigontech/erigon-lib/gointerfaces/downloaderproto"
-	"github.com/erigontech/erigon-lib/kv"
-	"github.com/erigontech/erigon-lib/log/v3"
 	"github.com/erigontech/erigon/cl/clparams"
 	"github.com/erigontech/erigon/cl/clparams/initial_state"
 	"github.com/erigontech/erigon/cl/cltypes"
@@ -40,7 +35,12 @@ import (
 	"github.com/erigontech/erigon/cl/phase1/core/state/raw"
 	"github.com/erigontech/erigon/cl/transition"
 	"github.com/erigontech/erigon/cl/transition/impl/eth2"
-	"github.com/erigontech/erigon/turbo/snapshotsync"
+	"github.com/erigontech/erigon/common"
+	"github.com/erigontech/erigon/common/log/v3"
+	"github.com/erigontech/erigon/db/kv"
+	"github.com/erigontech/erigon/db/snapshotsync"
+	"github.com/erigontech/erigon/db/snaptype"
+	"github.com/erigontech/erigon/node/gointerfaces/downloaderproto"
 )
 
 // pool for buffers
@@ -172,7 +172,7 @@ func FillStaticValidatorsTableIfNeeded(ctx context.Context, logger log.Logger, s
 			func(validatorIndex uint64, withdrawableEpoch uint64) error {
 				return validatorsTable.AddWithdrawableEpoch(validatorIndex, slot, withdrawableEpoch)
 			},
-			func(validatorIndex uint64, withdrawalCredentials libcommon.Hash) error {
+			func(validatorIndex uint64, withdrawalCredentials common.Hash) error {
 				return validatorsTable.AddWithdrawalCredentials(validatorIndex, slot, withdrawalCredentials)
 			},
 			func(validatorIndex uint64, activationEpoch uint64) error {
@@ -250,11 +250,11 @@ func (s *Antiquary) IncrementBeaconState(ctx context.Context, to uint64) error {
 
 	var prevValSet []byte
 	events := state_accessors.NewStateEvents()
-	slashingOccured := false
+	slashingOccurred := false
 	// setup the events handler for historical states replay.
 	s.currentState.SetEvents(raw.Events{
 		OnNewSlashingSegment: func(index int, segment uint64) error {
-			slashingOccured = true
+			slashingOccurred = true
 			return nil
 		},
 		OnRandaoMixChange: func(index int, mix [32]byte) error {
@@ -292,8 +292,8 @@ func (s *Antiquary) IncrementBeaconState(ctx context.Context, to uint64) error {
 		},
 		OnNewValidatorWithdrawalCredentials: func(index int, wc []byte) error {
 			changedValidators.Store(uint64(index), struct{}{})
-			events.ChangeWithdrawalCredentials(uint64(index), libcommon.BytesToHash(wc))
-			return s.validatorsTable.AddWithdrawalCredentials(uint64(index), slot, libcommon.BytesToHash(wc))
+			events.ChangeWithdrawalCredentials(uint64(index), common.BytesToHash(wc))
+			return s.validatorsTable.AddWithdrawalCredentials(uint64(index), slot, common.BytesToHash(wc))
 		},
 		OnEpochBoundary: func(epoch uint64) error {
 			if err := stateAntiquaryCollector.storeEpochData(s.currentState); err != nil {
@@ -322,10 +322,10 @@ func (s *Antiquary) IncrementBeaconState(ctx context.Context, to uint64) error {
 			}
 			return nil
 		},
-		OnNewBlockRoot: func(index int, root libcommon.Hash) error {
+		OnNewBlockRoot: func(index int, root common.Hash) error {
 			return stateAntiquaryCollector.collectBlockRoot(s.currentState.Slot(), root)
 		},
-		OnNewStateRoot: func(index int, root libcommon.Hash) error {
+		OnNewStateRoot: func(index int, root common.Hash) error {
 			return stateAntiquaryCollector.collectStateRoot(s.currentState.Slot(), root)
 		},
 		OnNewNextSyncCommittee: func(committee *solid.SyncCommittee) error {
@@ -350,7 +350,7 @@ func (s *Antiquary) IncrementBeaconState(ctx context.Context, to uint64) error {
 	startLoop := time.Now()
 
 	for ; slot < to && startLoop.Add(timeBeforeCommit).After(time.Now()); slot++ {
-		slashingOccured = false // Set this to false at the beginning of each slot.
+		slashingOccurred = false // Set this to false at the beginning of each slot.
 
 		isDumpSlot := slot%clparams.SlotsPerDump == 0
 		block, err := s.snReader.ReadBlockBySlot(ctx, tx, slot)
@@ -370,7 +370,6 @@ func (s *Antiquary) IncrementBeaconState(ctx context.Context, to uint64) error {
 					return err
 				}
 				if s.currentState.Version() >= clparams.ElectraVersion {
-					fmt.Println("not-found dumping electra queues", "slot", slot, "pendingDeposits", s.currentState.PendingDeposits().Len(), "pendingConsolidations", s.currentState.PendingConsolidations().Len(), "pendingWithdrawals", s.currentState.PendingPartialWithdrawals().Len())
 					if err := stateAntiquaryCollector.collectPendingDepositsDump(slot, s.currentState.PendingDeposits()); err != nil {
 						return err
 					}
@@ -411,8 +410,8 @@ func (s *Antiquary) IncrementBeaconState(ctx context.Context, to uint64) error {
 
 		first = false
 
-		// dump the whole slashings vector, if the slashing actually occured.
-		if slashingOccured {
+		// dump the whole slashings vector, if the slashing actually occurred.
+		if slashingOccurred {
 			if err := stateAntiquaryCollector.collectSlashings(slot, s.currentState.RawSlashings()); err != nil {
 				return err
 			}
@@ -516,7 +515,7 @@ func (s *Antiquary) IncrementBeaconState(ctx context.Context, to uint64) error {
 		if err = validator.WriteTo(buf); err != nil {
 			return false
 		}
-		if err = rwTx.Put(kv.StaticValidators, base_encoding.Encode64ToBytes4(validatorIndex), libcommon.Copy(buf.Bytes())); err != nil {
+		if err = rwTx.Put(kv.StaticValidators, base_encoding.Encode64ToBytes4(validatorIndex), common.Copy(buf.Bytes())); err != nil {
 			return false
 		}
 		return true
@@ -533,7 +532,7 @@ func (s *Antiquary) IncrementBeaconState(ctx context.Context, to uint64) error {
 		return err
 	}
 
-	log.Info("[Caplin-Archive] Historical states antiquated", "slot", s.currentState.Slot(), "root", libcommon.Hash(stateRoot), "latency", endTime)
+	log.Info("[Caplin-Archive] Historical states antiquated", "slot", s.currentState.Slot(), "root", common.Hash(stateRoot), "latency", endTime)
 	if s.stateSn != nil {
 		if err := s.stateSn.OpenFolder(); err != nil {
 			return err
@@ -568,15 +567,15 @@ func (s *Antiquary) IncrementBeaconState(ctx context.Context, to uint64) error {
 			return err
 		}
 		paths := s.stateSn.SegFileNames(from, to)
-		downloadItems := make([]*proto_downloader.AddItem, len(paths))
+		downloadItems := make([]*downloaderproto.AddItem, len(paths))
 		for i, path := range paths {
-			downloadItems[i] = &proto_downloader.AddItem{
+			downloadItems[i] = &downloaderproto.AddItem{
 				Path: path,
 			}
 		}
 		if s.downloader != nil {
 			// Notify bittorent to seed the new snapshots
-			if _, err := s.downloader.Add(s.ctx, &proto_downloader.AddRequest{Items: downloadItems}); err != nil {
+			if _, err := s.downloader.Add(s.ctx, &downloaderproto.AddRequest{Items: downloadItems}); err != nil {
 				s.logger.Warn("[Antiquary] Failed to add items to bittorent", "err", err)
 			}
 		}

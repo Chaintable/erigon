@@ -22,8 +22,6 @@ import (
 	"io"
 	"net/http"
 
-	libcommon "github.com/erigontech/erigon-lib/common"
-	"github.com/erigontech/erigon-lib/kv"
 	"github.com/erigontech/erigon/cl/beacon/beaconhttp"
 	"github.com/erigontech/erigon/cl/clparams"
 	"github.com/erigontech/erigon/cl/cltypes"
@@ -32,6 +30,8 @@ import (
 	state_accessors "github.com/erigontech/erigon/cl/persistence/state"
 	"github.com/erigontech/erigon/cl/transition/impl/eth2/statechange"
 	"github.com/erigontech/erigon/cl/utils"
+	"github.com/erigontech/erigon/common"
+	"github.com/erigontech/erigon/db/kv"
 )
 
 type IdealReward struct {
@@ -109,13 +109,13 @@ func (a *ApiHandler) PostEthV1BeaconRewardsAttestations(w http.ResponseWriter, r
 	if epoch > a.forkchoiceStore.LowestAvailableSlot()/a.beaconChainCfg.SlotsPerEpoch {
 		minRange := epoch * a.beaconChainCfg.SlotsPerEpoch
 		maxRange := (epoch + 1) * a.beaconChainCfg.SlotsPerEpoch
-		var blockRoot libcommon.Hash
+		var blockRoot common.Hash
 		for i := maxRange - 1; i >= minRange; i-- {
 			blockRoot, err = beacon_indicies.ReadCanonicalBlockRoot(tx, i)
 			if err != nil {
 				return nil, err
 			}
-			if blockRoot == (libcommon.Hash{}) {
+			if blockRoot == (common.Hash{}) {
 				continue
 			}
 			if version == clparams.Phase0Version {
@@ -183,7 +183,7 @@ func (a *ApiHandler) PostEthV1BeaconRewardsAttestations(w http.ResponseWriter, r
 
 	stateGetter := state_accessors.GetValFnTxAndSnapshot(tx, snRoTx)
 
-	epochData, err := state_accessors.ReadEpochData(stateGetter, a.beaconChainCfg.RoundSlotToEpoch(lastSlot))
+	epochData, err := state_accessors.ReadEpochData(stateGetter, a.beaconChainCfg.RoundSlotToEpoch(lastSlot), a.beaconChainCfg)
 	if err != nil {
 		return nil, err
 	}
@@ -201,7 +201,7 @@ func (a *ApiHandler) PostEthV1BeaconRewardsAttestations(w http.ResponseWriter, r
 		return nil, err
 	}
 
-	_, _, finalizedCheckpoint, ok, err := state_accessors.ReadCheckpoints(stateGetter, epoch*a.beaconChainCfg.SlotsPerEpoch)
+	_, _, finalizedCheckpoint, ok, err := state_accessors.ReadCheckpoints(stateGetter, epoch*a.beaconChainCfg.SlotsPerEpoch, a.beaconChainCfg)
 	if err != nil {
 		return nil, err
 	}

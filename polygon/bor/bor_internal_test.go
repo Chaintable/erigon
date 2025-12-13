@@ -26,48 +26,23 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.uber.org/mock/gomock"
 
-	libcommon "github.com/erigontech/erigon-lib/common"
-	"github.com/erigontech/erigon/consensus"
-	"github.com/erigontech/erigon/core/types"
-	"github.com/erigontech/erigon/params"
+	"github.com/erigontech/erigon/common"
+	"github.com/erigontech/erigon/execution/protocol/rules"
+	"github.com/erigontech/erigon/execution/types"
 	"github.com/erigontech/erigon/polygon/bor/statefull"
-	"github.com/erigontech/erigon/polygon/bor/valset"
+	polychain "github.com/erigontech/erigon/polygon/chain"
 	"github.com/erigontech/erigon/polygon/heimdall"
 )
-
-func TestUseBridgeReader(t *testing.T) {
-	// test for Go's interface nil-ness caveat - https://codefibershq.com/blog/golang-why-nil-is-not-always-nil
-	var br *mockBridgeReader
-	bor := New(params.AmoyChainConfig, nil, nil, nil, nil, nil, nil, br, nil)
-	require.False(t, bor.useBridgeReader)
-	br = &mockBridgeReader{}
-	bor = New(params.AmoyChainConfig, nil, nil, nil, nil, nil, nil, br, nil)
-	require.True(t, bor.useBridgeReader)
-}
-
-func TestUseSpanReader(t *testing.T) {
-	// test for Go's interface nil-ness caveat - https://codefibershq.com/blog/golang-why-nil-is-not-always-nil
-	var sr *mockSpanReader
-	b := New(params.AmoyChainConfig, nil, nil, nil, nil, nil, nil, nil, sr)
-	require.False(t, b.useSpanReader)
-	sr = &mockSpanReader{}
-	b = New(params.AmoyChainConfig, nil, nil, nil, nil, nil, nil, nil, sr)
-	require.True(t, b.useSpanReader)
-}
 
 var _ bridgeReader = mockBridgeReader{}
 
 type mockBridgeReader struct{}
 
-func (m mockBridgeReader) Events(context.Context, libcommon.Hash, uint64) ([]*types.Message, error) {
+func (m mockBridgeReader) Events(context.Context, common.Hash, uint64) ([]*types.Message, error) {
 	panic("mock")
 }
 
 func (m mockBridgeReader) EventsWithinTime(context.Context, time.Time, time.Time) ([]*types.Message, error) {
-	panic("mock")
-}
-
-func (m mockBridgeReader) EventTxnLookup(context.Context, libcommon.Hash) (uint64, bool, error) {
 	panic("mock")
 }
 
@@ -79,23 +54,23 @@ func (m mockSpanReader) Span(context.Context, uint64) (*heimdall.Span, bool, err
 	panic("mock")
 }
 
-func (m mockSpanReader) Producers(context.Context, uint64) (*valset.ValidatorSet, error) {
+func (m mockSpanReader) Producers(context.Context, uint64) (*heimdall.ValidatorSet, error) {
 	panic("mock")
 }
 
 func TestCommitStatesIndore(t *testing.T) {
 	ctrl := gomock.NewController(t)
-	cr := consensus.NewMockChainReader(ctrl)
+	cr := rules.NewMockChainReader(ctrl)
 	br := NewMockbridgeReader(ctrl)
 
-	bor := New(params.BorDevnetChainConfig, nil, nil, nil, nil, nil, nil, br, nil)
+	bor := New(polychain.BorDevnet.Config, nil, nil, nil, nil, br, nil)
 
 	header := &types.Header{
 		Number: big.NewInt(112),
 		Time:   1744000028,
 	}
 
-	contractAddr := libcommon.HexToAddress("a1")
+	contractAddr := common.HexToAddress("a1")
 
 	cr.EXPECT().GetHeaderByNumber(uint64(96)).Return(&types.Header{
 		Number: big.NewInt(96),
@@ -104,7 +79,7 @@ func TestCommitStatesIndore(t *testing.T) {
 	br.EXPECT().EventsWithinTime(gomock.Any(), time.Unix(1744000000-128, 0), time.Unix(1744000028-128, 0)).Return(
 		[]*types.Message{
 			types.NewMessage(
-				libcommon.HexToAddress(""),
+				common.HexToAddress(""),
 				&contractAddr,
 				0,
 				uint256.NewInt(0),
@@ -114,8 +89,10 @@ func TestCommitStatesIndore(t *testing.T) {
 				nil,
 				nil,
 				nil,
-				false,
-				false,
+				false, // checkNonce
+				false, // checkTransaction
+				false, // checkGas
+				false, // isFree
 				nil,
 			),
 		}, nil,
@@ -123,17 +100,14 @@ func TestCommitStatesIndore(t *testing.T) {
 
 	called := 0
 
-	syscall := func(contract libcommon.Address, data []byte) ([]byte, error) {
+	syscall := func(contract common.Address, data []byte) ([]byte, error) {
 		require.Equal(t, contract, contractAddr)
 		called++
 
 		return nil, nil
 	}
 
-	err := bor.CommitStates(nil, header, statefull.ChainContext{
-		Chain: cr,
-	}, syscall, nil, true)
-
-	require.Nil(t, err)
-	require.Equal(t, called, 1)
+	err := bor.CommitStates(header, statefull.ChainContext{Chain: cr}, syscall, true)
+	require.NoError(t, err)
+	require.Equal(t, 1, called)
 }

@@ -26,23 +26,23 @@ import (
 
 	"github.com/spf13/cobra"
 
-	libcommon "github.com/erigontech/erigon-lib/common"
-	"github.com/erigontech/erigon-lib/common/datadir"
-	"github.com/erigontech/erigon-lib/common/paths"
-	"github.com/erigontech/erigon-lib/direct"
-	"github.com/erigontech/erigon-lib/gointerfaces"
-	"github.com/erigontech/erigon-lib/gointerfaces/grpcutil"
-	remote "github.com/erigontech/erigon-lib/gointerfaces/remoteproto"
-	proto_sentry "github.com/erigontech/erigon-lib/gointerfaces/sentryproto"
-	"github.com/erigontech/erigon-lib/kv/kvcache"
-	"github.com/erigontech/erigon-lib/kv/remotedb"
-	"github.com/erigontech/erigon-lib/kv/remotedbserver"
-	"github.com/erigontech/erigon-lib/log/v3"
 	"github.com/erigontech/erigon/cmd/rpcdaemon/rpcdaemontest"
 	"github.com/erigontech/erigon/cmd/utils"
-	"github.com/erigontech/erigon/ethdb/privateapi"
-	"github.com/erigontech/erigon/turbo/debug"
-	"github.com/erigontech/erigon/turbo/logging"
+	"github.com/erigontech/erigon/common"
+	"github.com/erigontech/erigon/common/log/v3"
+	"github.com/erigontech/erigon/db/datadir"
+	"github.com/erigontech/erigon/db/kv/kvcache"
+	"github.com/erigontech/erigon/db/kv/remotedb"
+	"github.com/erigontech/erigon/db/kv/remotedbserver"
+	"github.com/erigontech/erigon/node/debug"
+	"github.com/erigontech/erigon/node/direct"
+	"github.com/erigontech/erigon/node/gointerfaces"
+	"github.com/erigontech/erigon/node/gointerfaces/grpcutil"
+	"github.com/erigontech/erigon/node/gointerfaces/remoteproto"
+	"github.com/erigontech/erigon/node/gointerfaces/sentryproto"
+	"github.com/erigontech/erigon/node/logging"
+	"github.com/erigontech/erigon/node/paths"
+	"github.com/erigontech/erigon/node/privateapi"
 	"github.com/erigontech/erigon/txnprovider/txpool"
 	"github.com/erigontech/erigon/txnprovider/txpool/txpoolcfg"
 )
@@ -131,7 +131,8 @@ func doTxpool(ctx context.Context, logger log.Logger) error {
 		return fmt.Errorf("could not connect to remoteKv: %w", err)
 	}
 
-	kvClient := remote.NewKVClient(coreConn)
+	ethBackendClient := remoteproto.NewETHBACKENDClient(coreConn)
+	kvClient := remoteproto.NewKVClient(coreConn)
 	coreDB, err := remotedb.NewRemote(gointerfaces.VersionFromProto(remotedbserver.KvServiceAPIVersion), log.New(), kvClient).Open()
 	if err != nil {
 		return fmt.Errorf("could not connect to remoteKv: %w", err)
@@ -139,7 +140,7 @@ func doTxpool(ctx context.Context, logger log.Logger) error {
 
 	log.Info("TxPool started", "db", filepath.Join(datadirCli, "txpool"))
 
-	sentryClients := make([]proto_sentry.SentryClient, len(sentryAddr))
+	sentryClients := make([]sentryproto.SentryClient, len(sentryAddr))
 	for i := range sentryAddr {
 		creds, err := grpcutil.TLS(TLSCACert, TLSCertfile, TLSKeyFile)
 		if err != nil {
@@ -150,7 +151,7 @@ func doTxpool(ctx context.Context, logger log.Logger) error {
 			return fmt.Errorf("could not connect to sentry: %w", err)
 		}
 
-		sentryClients[i] = direct.NewSentryClientRemote(proto_sentry.NewSentryClient(sentryConn))
+		sentryClients[i] = direct.NewSentryClientRemote(sentryproto.NewSentryClient(sentryConn))
 	}
 
 	cfg := txpoolcfg.DefaultConfig
@@ -158,7 +159,7 @@ func doTxpool(ctx context.Context, logger log.Logger) error {
 
 	cfg.DBDir = dirs.TxPool
 
-	cfg.CommitEvery = libcommon.RandomizeDuration(commitEvery)
+	cfg.CommitEvery = common.RandomizeDuration(commitEvery)
 	cfg.PendingSubPoolLimit = pendingPoolLimit
 	cfg.BaseFeeSubPoolLimit = baseFeePoolLimit
 	cfg.QueuedSubPoolLimit = queuedPoolLimit
@@ -176,7 +177,7 @@ func doTxpool(ctx context.Context, logger log.Logger) error {
 
 	cfg.TracedSenders = make([]string, len(traceSenders))
 	for i, senderHex := range traceSenders {
-		sender := libcommon.HexToAddress(senderHex)
+		sender := common.HexToAddress(senderHex)
 		cfg.TracedSenders[i] = string(sender[:])
 	}
 
@@ -190,6 +191,7 @@ func doTxpool(ctx context.Context, logger log.Logger) error {
 		kvClient,
 		notifyMiner,
 		logger,
+		ethBackendClient,
 	)
 	if err != nil {
 		return err
@@ -211,7 +213,7 @@ func doTxpool(ctx context.Context, logger log.Logger) error {
 }
 
 func main() {
-	ctx, cancel := libcommon.RootContext()
+	ctx, cancel := common.RootContext()
 	defer cancel()
 
 	if err := rootCmd.ExecuteContext(ctx); err != nil {

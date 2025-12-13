@@ -21,13 +21,13 @@ import (
 	"encoding/json"
 	"errors"
 
-	libcommon "github.com/erigontech/erigon-lib/common"
-	"github.com/erigontech/erigon-lib/common/length"
-	"github.com/erigontech/erigon-lib/types/clonable"
-	"github.com/erigontech/erigon-lib/types/ssz"
 	"github.com/erigontech/erigon/cl/clparams"
 	"github.com/erigontech/erigon/cl/merkle_tree"
 	ssz2 "github.com/erigontech/erigon/cl/ssz"
+	"github.com/erigontech/erigon/common"
+	"github.com/erigontech/erigon/common/clonable"
+	"github.com/erigontech/erigon/common/length"
+	"github.com/erigontech/erigon/common/ssz"
 )
 
 const (
@@ -39,10 +39,10 @@ const (
 
 // Attestation type represents a statement or confirmation of some occurrence or phenomenon.
 type Attestation struct {
-	AggregationBits *BitList          `json:"aggregation_bits"`
-	Data            *AttestationData  `json:"data"`
-	Signature       libcommon.Bytes96 `json:"signature"`
-	CommitteeBits   *BitVector        `json:"committee_bits,omitempty"` // Electra EIP-7549
+	AggregationBits *BitList         `json:"aggregation_bits"`
+	Data            *AttestationData `json:"data"`
+	Signature       common.Bytes96   `json:"signature"`
+	CommitteeBits   *BitVector       `json:"committee_bits,omitempty"` // Electra EIP-7549
 }
 
 func (a *Attestation) GetCommitteeIndexFromBits() (uint64, error) {
@@ -131,10 +131,10 @@ func (a *Attestation) Clone() clonable.Clonable {
 func (a *Attestation) UnmarshalJSON(data []byte) error {
 	// Unmarshal as normal into a temporary struct
 	type tempAttestation struct {
-		AggregationBits *BitList          `json:"aggregation_bits"`
-		Data            *AttestationData  `json:"data"`
-		Signature       libcommon.Bytes96 `json:"signature"`
-		CommitteeBits   *BitVector        `json:"committee_bits,omitempty"`
+		AggregationBits *BitList         `json:"aggregation_bits"`
+		Data            *AttestationData `json:"data"`
+		Signature       common.Bytes96   `json:"signature"`
+		CommitteeBits   *BitVector       `json:"committee_bits,omitempty"`
 	}
 
 	// For Electra, the committee bits are present in the JSON
@@ -173,10 +173,10 @@ func (a *Attestation) UnmarshalJSON(data []byte) error {
 //	data: AttestationData
 //	signature: BLSSignature
 type SingleAttestation struct {
-	CommitteeIndex uint64            `json:"committee_index,string"`
-	AttesterIndex  uint64            `json:"attester_index,string"`
-	Data           *AttestationData  `json:"data"`
-	Signature      libcommon.Bytes96 `json:"signature"`
+	CommitteeIndex uint64           `json:"committee_index,string"`
+	AttesterIndex  uint64           `json:"attester_index,string"`
+	Data           *AttestationData `json:"data"`
+	Signature      common.Bytes96   `json:"signature"`
 }
 
 func (s *SingleAttestation) EncodeSSZ(dst []byte) ([]byte, error) {

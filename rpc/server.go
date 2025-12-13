@@ -27,9 +27,9 @@ import (
 	"time"
 
 	mapset "github.com/deckarep/golang-set"
-	jsoniter "github.com/json-iterator/go"
 
-	"github.com/erigontech/erigon-lib/log/v3"
+	"github.com/erigontech/erigon/common/log/v3"
+	"github.com/erigontech/erigon/rpc/jsonstream"
 )
 
 const MetadataApi = "rpc"
@@ -52,7 +52,7 @@ type Server struct {
 	services        serviceRegistry
 	methodAllowList AllowList
 	idgen           func() ID
-	run             int32
+	run             atomic.Bool
 	codecs          mapset.Set // mapset.Set[ServerCodec] requires go 1.20
 
 	batchConcurrency    uint
@@ -66,8 +66,9 @@ type Server struct {
 
 // NewServer creates a new server instance with no registered handlers.
 func NewServer(batchConcurrency uint, traceRequests, debugSingleRequest, disableStreaming bool, logger log.Logger, rpcSlowLogThreshold time.Duration) *Server {
-	server := &Server{services: serviceRegistry{logger: logger}, idgen: randomIDGenerator(), codecs: mapset.NewSet(), run: 1, batchConcurrency: batchConcurrency,
+	server := &Server{services: serviceRegistry{logger: logger}, idgen: randomIDGenerator(), codecs: mapset.NewSet(), batchConcurrency: batchConcurrency,
 		disableStreaming: disableStreaming, traceRequests: traceRequests, debugSingleRequest: debugSingleRequest, logger: logger, rpcSlowLogThreshold: rpcSlowLogThreshold}
+	server.run.Store(true)
 	// Register the default service providing meta information about the RPC service such
 	// as the services and methods it offers.
 	rpcService := &RPCService{server: server}
@@ -89,7 +90,7 @@ func (s *Server) SetBatchLimit(limit int) {
 // methods on the given receiver match the criteria to be either a RPC method or a
 // subscription an error is returned. Otherwise a new service is created and added to the
 // service collection this server provides to clients.
-func (s *Server) RegisterName(name string, receiver interface{}) error {
+func (s *Server) RegisterName(name string, receiver any) error {
 	return s.services.registerName(name, receiver)
 }
 
@@ -102,7 +103,7 @@ func (s *Server) ServeCodec(codec ServerCodec, options CodecOption) {
 	defer codec.Close()
 
 	// Don't serve if server is stopped.
-	if atomic.LoadInt32(&s.run) == 0 {
+	if !s.run.Load() {
 		return
 	}
 
@@ -110,7 +111,7 @@ func (s *Server) ServeCodec(codec ServerCodec, options CodecOption) {
 	s.codecs.Add(codec)
 	defer s.codecs.Remove(codec)
 
-	c := initClient(codec, s.idgen, &s.services, s.logger)
+	c := initClient(codec, s.idgen, &s.services, s.batchLimit, s.logger)
 	<-codec.closed()
 	c.Close()
 }
@@ -118,10 +119,10 @@ func (s *Server) ServeCodec(codec ServerCodec, options CodecOption) {
 // serveSingleRequest reads and processes a single RPC request from the given codec. This
 // is used to serve HTTP connections. Subscriptions and reverse calls are not allowed in
 // this mode.
-func (s *Server) serveSingleRequest(ctx context.Context, codec ServerCodec, stream *jsoniter.Stream) {
+func (s *Server) serveSingleRequest(ctx context.Context, codec ServerCodec, stream jsonstream.Stream) *jsonrpcMessage {
 	// Don't serve if server is stopped.
-	if atomic.LoadInt32(&s.run) == 0 {
-		return
+	if !s.run.Load() {
+		return nil
 	}
 
 	h := newHandler(ctx, codec, s.idgen, &s.services, s.methodAllowList, s.batchConcurrency, s.traceRequests, s.logger, s.rpcSlowLogThreshold)
@@ -131,28 +132,29 @@ func (s *Server) serveSingleRequest(ctx context.Context, codec ServerCodec, stre
 	reqs, batch, err := codec.ReadBatch()
 	if err != nil {
 		if err != io.EOF {
-			codec.WriteJSON(ctx, errorMessage(&invalidMessageError{"parse error"}))
+			return errorMessage(&invalidMessageError{"parse error"})
 		}
-		return
+		return nil
 	}
 	if batch {
 		if s.batchLimit > 0 && len(reqs) > s.batchLimit {
-			codec.WriteJSON(ctx, errorMessage(fmt.Errorf("batch limit %d exceeded (can increase by --rpc.batch.limit). Requested batch of size: %d", s.batchLimit, len(reqs))))
+			return errorMessage(fmt.Errorf("batch limit %d exceeded (can increase by --rpc.batch.limit). Requested batch of size: %d", s.batchLimit, len(reqs)))
 		} else {
 			h.handleBatch(reqs)
 		}
 	} else {
 		h.handleMsg(reqs[0], stream)
 	}
+	return nil
 }
 
 // Stop stops reading new requests, waits for stopPendingRequestTimeout to allow pending
 // requests to finish, then closes all codecs which will cancel pending requests and
 // subscriptions.
 func (s *Server) Stop() {
-	if atomic.CompareAndSwapInt32(&s.run, 1, 0) {
+	if s.run.CompareAndSwap(true, false) {
 		s.logger.Info("RPC server shutting down")
-		s.codecs.Each(func(c interface{}) bool {
+		s.codecs.Each(func(c any) bool {
 			c.(ServerCodec).Close()
 			return true
 		})

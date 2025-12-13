@@ -24,7 +24,6 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.uber.org/mock/gomock"
 
-	libcommon "github.com/erigontech/erigon-lib/common"
 	"github.com/erigontech/erigon/cl/antiquary/tests"
 	"github.com/erigontech/erigon/cl/beacon/synced_data"
 	"github.com/erigontech/erigon/cl/clparams"
@@ -33,6 +32,7 @@ import (
 	"github.com/erigontech/erigon/cl/phase1/core/state"
 	"github.com/erigontech/erigon/cl/phase1/forkchoice/mock_services"
 	"github.com/erigontech/erigon/cl/pool"
+	"github.com/erigontech/erigon/common"
 )
 
 func getAggregateAndProofAndState(t *testing.T) (*SignedAggregateAndProofForGossip, *state.CachingBeaconState) {
@@ -76,8 +76,10 @@ func setupAggregateAndProofTest(t *testing.T) (AggregateAndProofService, *synced
 	syncedDataManager := synced_data.NewSyncedDataManager(cfg, true)
 	forkchoiceMock := mock_services.NewForkChoiceStorageMock(t)
 	p := pool.OperationsPool{}
-	p.AttestationsPool = pool.NewOperationPool[libcommon.Bytes96, *solid.Attestation](100, "test")
-	batchSignatureVerifier := NewBatchSignatureVerifier(context.TODO(), nil)
+	p.AttestationsPool = pool.NewOperationPool[common.Bytes96, *solid.Attestation](100, "test")
+	verifierCtx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	batchSignatureVerifier := NewBatchSignatureVerifier(verifierCtx, nil)
 	go batchSignatureVerifier.Start()
 	blockService := NewAggregateAndProofService(ctx, syncedDataManager, forkchoiceMock, cfg, p, true, batchSignatureVerifier)
 	return blockService, syncedDataManager, forkchoiceMock

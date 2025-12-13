@@ -19,10 +19,13 @@ package cltypes
 import (
 	"encoding/json"
 
-	"github.com/erigontech/erigon-lib/common/hexutility"
-	"github.com/erigontech/erigon-lib/types/clonable"
+	ssz2 "github.com/erigontech/erigon/cl/ssz"
 	"github.com/erigontech/erigon/cl/utils"
+	"github.com/erigontech/erigon/common/clonable"
+	"github.com/erigontech/erigon/common/hexutil"
 )
+
+var _ ssz2.SizedObjectSSZ = (*JustificationBits)(nil)
 
 const JustificationBitsLength = 4
 
@@ -86,11 +89,11 @@ func (j JustificationBits) MarshalJSON() ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	return json.Marshal(hexutility.Bytes(enc))
+	return json.Marshal(hexutil.Bytes(enc))
 }
 
 func (j *JustificationBits) UnmarshalJSON(input []byte) error {
-	var hex hexutility.Bytes
+	var hex hexutil.Bytes
 	if err := json.Unmarshal(input, &hex); err != nil {
 		return err
 	}

@@ -5,8 +5,8 @@ import (
 	"sync"
 	"sync/atomic"
 
-	libcommon "github.com/erigontech/erigon-lib/common"
-	"github.com/erigontech/erigon-lib/common/length"
+	"github.com/erigontech/erigon/common"
+	"github.com/erigontech/erigon/common/length"
 )
 
 func ceil(num, divisor int) int {
@@ -130,10 +130,10 @@ func (m *MerkleTree) extendLayer(layerIdx int) {
 }
 
 // ComputeRoot computes the root of the Merkle tree.
-func (m *MerkleTree) ComputeRoot() libcommon.Hash {
+func (m *MerkleTree) ComputeRoot() common.Hash {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	var root libcommon.Hash
+	var root common.Hash
 	if len(m.layers) == 0 {
 		return ZeroHashes[0]
 	}
@@ -170,7 +170,7 @@ func (m *MerkleTree) ComputeRoot() libcommon.Hash {
 	}
 
 	if len(m.layers[0]) == length.Hash {
-		var node libcommon.Hash
+		var node common.Hash
 		m.computeLeaf(0, node[:])
 		if m.limit != nil {
 			if err := MerkleRootFromFlatFromIntermediateLevelWithLimit(node[:], root[:], int(*m.limit), 0); err != nil {

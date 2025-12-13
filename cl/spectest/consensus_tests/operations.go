@@ -23,18 +23,17 @@ import (
 	"os"
 	"testing"
 
-	"github.com/Giulio2002/bls"
-	"github.com/erigontech/erigon/spectest"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"github.com/erigontech/erigon/cl/clparams"
+	"github.com/erigontech/erigon/cl/cltypes"
 	"github.com/erigontech/erigon/cl/cltypes/solid"
 	"github.com/erigontech/erigon/cl/fork"
 	"github.com/erigontech/erigon/cl/phase1/core/state"
+	"github.com/erigontech/erigon/cl/spectest/spectest"
 	"github.com/erigontech/erigon/cl/utils"
-
-	"github.com/erigontech/erigon/cl/cltypes"
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
+	"github.com/erigontech/erigon/cl/utils/bls"
 )
 
 const (
@@ -75,7 +74,7 @@ func operationAttestationHandler(t *testing.T, root fs.FS, c spectest.TestCase) 
 	expectedRoot, err := postState.HashSSZ()
 	require.NoError(t, err)
 
-	assert.EqualValues(t, haveRoot, expectedRoot)
+	assert.EqualValues(t, expectedRoot, haveRoot)
 	return nil
 }
 
@@ -105,7 +104,7 @@ func operationAttesterSlashingHandler(t *testing.T, root fs.FS, c spectest.TestC
 	expectedRoot, err := postState.HashSSZ()
 	require.NoError(t, err)
 
-	assert.EqualValues(t, haveRoot, expectedRoot)
+	assert.EqualValues(t, expectedRoot, haveRoot)
 	return nil
 }
 
@@ -162,7 +161,7 @@ func operationProposerSlashingHandler(t *testing.T, root fs.FS, c spectest.TestC
 	expectedRoot, err := postState.HashSSZ()
 	require.NoError(t, err)
 
-	assert.EqualValues(t, haveRoot, expectedRoot)
+	assert.EqualValues(t, expectedRoot, haveRoot)
 	return nil
 }
 
@@ -194,7 +193,7 @@ func operationBlockHeaderHandler(t *testing.T, root fs.FS, c spectest.TestCase) 
 	expectedRoot, err := postState.HashSSZ()
 	require.NoError(t, err)
 
-	assert.EqualValues(t, haveRoot, expectedRoot)
+	assert.EqualValues(t, expectedRoot, haveRoot)
 	return nil
 }
 
@@ -224,7 +223,7 @@ func operationDepositHandler(t *testing.T, root fs.FS, c spectest.TestCase) erro
 	expectedRoot, err := postState.HashSSZ()
 	require.NoError(t, err)
 
-	assert.EqualValues(t, haveRoot, expectedRoot)
+	assert.EqualValues(t, expectedRoot, haveRoot)
 	return nil
 }
 
@@ -254,7 +253,7 @@ func operationSyncAggregateHandler(t *testing.T, root fs.FS, c spectest.TestCase
 	expectedRoot, err := postState.HashSSZ()
 	require.NoError(t, err)
 
-	assert.EqualValues(t, haveRoot, expectedRoot)
+	assert.EqualValues(t, expectedRoot, haveRoot)
 	return nil
 }
 
@@ -309,7 +308,7 @@ func operationVoluntaryExitHandler(t *testing.T, root fs.FS, c spectest.TestCase
 	expectedRoot, err := postState.HashSSZ()
 	require.NoError(t, err)
 
-	assert.EqualValues(t, haveRoot, expectedRoot)
+	assert.EqualValues(t, expectedRoot, haveRoot)
 	return nil
 }
 
@@ -325,6 +324,7 @@ func operationWithdrawalHandler(t *testing.T, root fs.FS, c spectest.TestCase) e
 	if err := spectest.ReadSszOld(root, executionPayload, c.Version(), executionPayloadFileName); err != nil {
 		return err
 	}
+
 	if err := c.Machine.ProcessWithdrawals(preState, executionPayload.Withdrawals); err != nil {
 		if expectedError {
 			return nil
@@ -339,7 +339,7 @@ func operationWithdrawalHandler(t *testing.T, root fs.FS, c spectest.TestCase) e
 	expectedRoot, err := postState.HashSSZ()
 	require.NoError(t, err)
 
-	assert.EqualValues(t, haveRoot, expectedRoot)
+	assert.EqualValues(t, expectedRoot, haveRoot)
 	return nil
 }
 
@@ -370,7 +370,7 @@ func operationSignedBlsChangeHandler(t *testing.T, root fs.FS, c spectest.TestCa
 	expectedRoot, err := postState.HashSSZ()
 	require.NoError(t, err)
 
-	assert.EqualValues(t, haveRoot, expectedRoot)
+	assert.EqualValues(t, expectedRoot, haveRoot)
 	return nil
 }
 
@@ -401,7 +401,7 @@ func operationConsolidationRequestHandler(t *testing.T, root fs.FS, c spectest.T
 	expectedRoot, err := postState.HashSSZ()
 	require.NoError(t, err)
 
-	assert.EqualValues(t, haveRoot, expectedRoot)
+	assert.EqualValues(t, expectedRoot, haveRoot)
 	return nil
 }
 
@@ -432,7 +432,7 @@ func operationDepositRequstHandler(t *testing.T, root fs.FS, c spectest.TestCase
 	expectedRoot, err := postState.HashSSZ()
 	require.NoError(t, err)
 
-	assert.EqualValues(t, haveRoot, expectedRoot)
+	assert.EqualValues(t, expectedRoot, haveRoot)
 	return nil
 }
 
@@ -463,7 +463,7 @@ func operationWithdrawalRequstHandler(t *testing.T, root fs.FS, c spectest.TestC
 	expectedRoot, err := postState.HashSSZ()
 	require.NoError(t, err)
 
-	assert.EqualValues(t, haveRoot, expectedRoot)
+	assert.EqualValues(t, expectedRoot, haveRoot)
 	return nil
 }
 
@@ -494,6 +494,6 @@ func operationExecutionPayloadHandler(t *testing.T, root fs.FS, c spectest.TestC
 	expectedRoot, err := postState.HashSSZ()
 	require.NoError(t, err)
 
-	assert.EqualValues(t, haveRoot, expectedRoot)
+	assert.EqualValues(t, expectedRoot, haveRoot)
 	return nil
 }

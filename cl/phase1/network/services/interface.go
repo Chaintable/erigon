@@ -19,12 +19,16 @@ package services
 import (
 	"context"
 
+	"github.com/erigontech/erigon/cl/clparams"
 	"github.com/erigontech/erigon/cl/cltypes"
+	"github.com/erigontech/erigon/node/gointerfaces/sentinelproto"
 )
 
 // Note: BlobSidecarService and BlockService are tested in spectests
 
 type Service[T any] interface {
+	IsMyGossipMessage(name string) bool
+	DecodeGossipMessage(data *sentinelproto.GossipData, version clparams.StateVersion) (T, error)
 	ProcessMessage(ctx context.Context, subnet *uint64, msg T) error
 }
 
@@ -54,3 +58,6 @@ type BLSToExecutionChangeService Service[*SignedBLSToExecutionChangeForGossip]
 
 //go:generate mockgen -typed=true -destination=./mock_services/proposer_slashing_service_mock.go -package=mock_services . ProposerSlashingService
 type ProposerSlashingService Service[*cltypes.ProposerSlashing]
+
+//go:generate mockgen -typed=true -destination=./mock_services/data_column_sidecar_service_mock.go -package=mock_services . DataColumnSidecarService
+type DataColumnSidecarService Service[*cltypes.DataColumnSidecar]

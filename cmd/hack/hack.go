@@ -33,33 +33,30 @@ import (
 	"strings"
 
 	"github.com/RoaringBitmap/roaring/v2/roaring64"
-	"github.com/holiman/uint256"
 
-	"github.com/erigontech/erigon-lib/log/v3"
-
-	libcommon "github.com/erigontech/erigon-lib/common"
-	"github.com/erigontech/erigon-lib/common/hexutility"
-	"github.com/erigontech/erigon-lib/kv"
-	"github.com/erigontech/erigon-lib/kv/mdbx"
-	"github.com/erigontech/erigon-lib/recsplit"
-	"github.com/erigontech/erigon-lib/recsplit/eliasfano32"
-	"github.com/erigontech/erigon-lib/seg"
-
-	"github.com/erigontech/erigon-lib/rlp"
 	hackdb "github.com/erigontech/erigon/cmd/hack/db"
-	"github.com/erigontech/erigon/cmd/hack/flow"
 	"github.com/erigontech/erigon/cmd/hack/tool"
-	"github.com/erigontech/erigon/core"
-	"github.com/erigontech/erigon/core/rawdb"
-	"github.com/erigontech/erigon/core/rawdb/blockio"
-	"github.com/erigontech/erigon/core/types"
-	"github.com/erigontech/erigon/eth/ethconfig"
-	"github.com/erigontech/erigon/eth/stagedsync/stages"
-	"github.com/erigontech/erigon/params"
-	"github.com/erigontech/erigon/turbo/debug"
-	"github.com/erigontech/erigon/turbo/logging"
-	"github.com/erigontech/erigon/turbo/services"
-	"github.com/erigontech/erigon/turbo/snapshotsync/freezeblocks"
+	"github.com/erigontech/erigon/common"
+	"github.com/erigontech/erigon/common/hexutil"
+	"github.com/erigontech/erigon/common/log/v3"
+	"github.com/erigontech/erigon/db/kv"
+	"github.com/erigontech/erigon/db/kv/mdbx"
+	"github.com/erigontech/erigon/db/rawdb"
+	"github.com/erigontech/erigon/db/rawdb/blockio"
+	"github.com/erigontech/erigon/db/recsplit"
+	"github.com/erigontech/erigon/db/recsplit/eliasfano32"
+	"github.com/erigontech/erigon/db/seg"
+	"github.com/erigontech/erigon/db/services"
+	"github.com/erigontech/erigon/db/snapshotsync/freezeblocks"
+	chainspec "github.com/erigontech/erigon/execution/chain/spec"
+	"github.com/erigontech/erigon/execution/rlp"
+	"github.com/erigontech/erigon/execution/stagedsync/stages"
+	"github.com/erigontech/erigon/execution/types"
+	"github.com/erigontech/erigon/node/debug"
+	"github.com/erigontech/erigon/node/ethconfig"
+	"github.com/erigontech/erigon/node/logging"
+
+	_ "github.com/erigontech/erigon/polygon/chain" // Register Polygon chains
 )
 
 var (
@@ -95,7 +92,7 @@ func dbSlice(chaindata string, bucket string, prefix []byte) {
 }
 
 // Searches 1000 blocks from the given one to try to find the one with the given state root hash
-func testBlockHashes(chaindata string, block int, stateRoot libcommon.Hash) {
+func testBlockHashes(chaindata string, block int, stateRoot common.Hash) {
 	ethDb := mdbx.MustOpen(chaindata)
 	defer ethDb.Close()
 	br, _ := blocksIO(ethDb)
@@ -106,7 +103,7 @@ func testBlockHashes(chaindata string, block int, stateRoot libcommon.Hash) {
 			if err != nil {
 				panic(err)
 			}
-			if header.Root == stateRoot || stateRoot == (libcommon.Hash{}) {
+			if header.Root == stateRoot || stateRoot == (common.Hash{}) {
 				fmt.Printf("\n===============\nCanonical hash for %d: %x\n", i, hash)
 				fmt.Printf("Header.Root: %x\n", header.Root)
 				fmt.Printf("Header.TxHash: %x\n", header.TxHash)
@@ -138,7 +135,7 @@ func blocksIO(db kv.RoDB) (services.FullBlockReader, *blockio.BlockWriter) {
 	cc := tool.ChainConfigFromDB(db)
 	freezeCfg := ethconfig.Defaults.Snapshot
 	freezeCfg.ChainName = cc.ChainName
-	br := freezeblocks.NewBlockReader(freezeblocks.NewRoSnapshots(freezeCfg, "", 0, log.New()), nil, nil, nil)
+	br := freezeblocks.NewBlockReader(freezeblocks.NewRoSnapshots(freezeCfg, "", log.New()), nil)
 	bw := blockio.NewBlockWriter()
 	return br, bw
 }
@@ -230,7 +227,7 @@ func extractHashes(chaindata string, blockStep uint64, blockTotalOrOffset int64,
 				return err
 			}
 
-			if hash == (libcommon.Hash{}) {
+			if hash == (common.Hash{}) {
 				break
 			}
 
@@ -260,14 +257,14 @@ func extractHeaders(chaindata string, block uint64, blockTotalOrOffset int64) er
 		return err
 	}
 	defer c.Close()
-	blockEncoded := hexutility.EncodeTs(block)
+	blockEncoded := hexutil.EncodeTs(block)
 	blockTotal := getBlockTotal(tx, block, blockTotalOrOffset)
 	for k, v, err := c.Seek(blockEncoded); k != nil && blockTotal > 0; k, v, err = c.Next() {
 		if err != nil {
 			return err
 		}
 		blockNumber := binary.BigEndian.Uint64(k[:8])
-		blockHash := libcommon.BytesToHash(k[8:])
+		blockHash := common.BytesToHash(k[8:])
 		var header types.Header
 		if err = rlp.DecodeBytes(v, &header); err != nil {
 			return fmt.Errorf("decoding header from %x: %w", v, err)
@@ -284,7 +281,7 @@ func extractBodies(datadir string) error {
 	cc := tool.ChainConfigFromDB(db)
 	freezeCfg := ethconfig.Defaults.Snapshot
 	freezeCfg.ChainName = cc.ChainName
-	snaps := freezeblocks.NewRoSnapshots(freezeCfg, filepath.Join(datadir, "snapshots"), 0, log.New())
+	snaps := freezeblocks.NewRoSnapshots(freezeCfg, filepath.Join(datadir, "snapshots"), log.New())
 	snaps.OpenFolder()
 
 	/* method Iterate was removed, need re-implement
@@ -340,8 +337,8 @@ func extractBodies(datadir string) error {
 			return err
 		}
 		blockNumber := binary.BigEndian.Uint64(k[:8])
-		blockHash := libcommon.BytesToHash(k[8:])
-		var hash libcommon.Hash
+		blockHash := common.BytesToHash(k[8:])
+		var hash common.Hash
 		if hash, _, err = br.CanonicalHash(context.Background(), tx, blockNumber); err != nil {
 			return err
 		}
@@ -647,29 +644,10 @@ func scanTxs(chaindata string) error {
 	return nil
 }
 
-func devTx(chaindata string) error {
-	db := mdbx.MustOpen(chaindata)
-	defer db.Close()
-	tx, err := db.BeginRo(context.Background())
+func chainConfig(name string) error {
+	spec, err := chainspec.ChainSpecByName(name)
 	if err != nil {
 		return err
-	}
-	defer tx.Rollback()
-	cc := tool.ChainConfig(tx)
-	txn := types.NewTransaction(2, libcommon.Address{}, uint256.NewInt(100), 100_000, uint256.NewInt(1), []byte{1})
-	signedTx, err := types.SignTx(txn, *types.LatestSigner(cc), core.DevnetSignPrivateKey)
-	tool.Check(err)
-	buf := bytes.NewBuffer(nil)
-	err = signedTx.MarshalBinary(buf)
-	tool.Check(err)
-	fmt.Printf("%x\n", buf.Bytes())
-	return nil
-}
-
-func chainConfig(name string) error {
-	chainConfig := params.ChainConfigByChainName(name)
-	if chainConfig == nil {
-		return fmt.Errorf("unknown name: %s", name)
 	}
 	f, err := os.Create(filepath.Join("params", "chainspecs", name+".json"))
 	if err != nil {
@@ -678,7 +656,7 @@ func chainConfig(name string) error {
 	w := bufio.NewWriter(f)
 	encoder := json.NewEncoder(w)
 	encoder.SetIndent("", "  ")
-	if err = encoder.Encode(chainConfig); err != nil {
+	if err = encoder.Encode(spec.Config); err != nil {
 		return err
 	}
 	if err = w.Flush(); err != nil {
@@ -702,7 +680,7 @@ func keybytesToHex(str []byte) []byte {
 }
 
 func iterate(filename string, prefix string) error {
-	pBytes := libcommon.FromHex(prefix)
+	pBytes := common.FromHex(prefix)
 	efFilename := filename + ".ef"
 	viFilename := filename + ".vi"
 	vFilename := filename + ".v"
@@ -789,11 +767,9 @@ func main() {
 
 	var err error
 	switch *action {
-	case "cfg":
-		flow.TestGenCfg()
 
 	case "testBlockHashes":
-		testBlockHashes(*chaindata, *block, libcommon.HexToHash(*hash))
+		testBlockHashes(*chaindata, *block, common.HexToHash(*hash))
 
 	case "current":
 		printCurrentBlockNumber(*chaindata)
@@ -802,7 +778,7 @@ func main() {
 		printBucket(*chaindata)
 
 	case "slice":
-		dbSlice(*chaindata, *bucket, libcommon.FromHex(*hash))
+		dbSlice(*chaindata, *bucket, common.FromHex(*hash))
 
 	case "extractHeaders":
 		err = extractHeaders(*chaindata, uint64(*block), int64(*blockTotal))
@@ -840,8 +816,6 @@ func main() {
 	case "scanTxs":
 		err = scanTxs(*chaindata)
 
-	case "devTx":
-		err = devTx(*chaindata)
 	case "chainConsfig":
 		err = chainConfig(*name)
 	case "iterate":

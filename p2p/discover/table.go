@@ -36,10 +36,9 @@ import (
 	"sync/atomic"
 	"time"
 
-	libcommon "github.com/erigontech/erigon-lib/common"
-	"github.com/erigontech/erigon-lib/log/v3"
-
-	"github.com/erigontech/erigon-lib/common/debug"
+	"github.com/erigontech/erigon/common"
+	"github.com/erigontech/erigon/common/dbg"
+	"github.com/erigontech/erigon/common/log/v3"
 	"github.com/erigontech/erigon/p2p/enode"
 	"github.com/erigontech/erigon/p2p/netutil"
 )
@@ -51,7 +50,7 @@ const (
 
 	// We keep buckets for the upper 1/15 of distances because
 	// it's very unlikely we'll ever encounter a node that's closer.
-	hashBits          = len(libcommon.Hash{}) * 8
+	hashBits          = len(common.Hash{}) * 8
 	nBuckets          = hashBits / 15       // Number of buckets
 	bucketMinDistance = hashBits - nBuckets // Log distance of closest bucket
 
@@ -159,7 +158,9 @@ func (tab *Table) self() *enode.Node {
 
 func (tab *Table) seedRand() {
 	var b [8]byte
-	crand.Read(b[:])
+	if _, err := crand.Read(b[:]); err != nil {
+		panic("crypto/rand failed in seedRand: " + err.Error())
+	}
 
 	tab.mutex.Lock()
 	defer tab.mutex.Unlock()
@@ -253,7 +254,7 @@ func (tab *Table) loop() {
 		revalidateDone  chan struct{}                   // where doRevalidate reports completion
 		waiting         = []chan struct{}{tab.initDone} // holds waiting callers while doRefresh runs
 	)
-	defer debug.LogPanic()
+	defer dbg.LogPanic()
 	defer refresh.Stop()
 	defer revalidate.Stop()
 	defer tableMainenance.Stop()
@@ -354,7 +355,7 @@ loop:
 // doRefresh performs a lookup for a random target to keep buckets full. seed nodes are
 // inserted if the table is empty (initial bootstrap or discarded faulty peers).
 func (tab *Table) doRefresh(done chan struct{}) {
-	defer debug.LogPanic()
+	defer dbg.LogPanic()
 	defer close(done)
 
 	// Load nodes from the database and insert
@@ -394,7 +395,7 @@ func (tab *Table) loadSeedNodes() {
 // doRevalidate checks that the last node in a random bucket is still live and replaces or
 // deletes the node if it isn't.
 func (tab *Table) doRevalidate(done chan<- struct{}) {
-	defer debug.LogPanic()
+	defer dbg.LogPanic()
 	defer func() { done <- struct{}{} }()
 
 	tab.revalidates.Add(1)
@@ -461,7 +462,7 @@ func (tab *Table) nodeToRevalidate() (n *node, bi int) {
 // longer than seedMinTableTime.
 func (tab *Table) copyLiveNodes() {
 	tab.mutex.Lock()
-	defer debug.LogPanic()
+	defer dbg.LogPanic()
 	defer tab.mutex.Unlock()
 
 	now := time.Now()

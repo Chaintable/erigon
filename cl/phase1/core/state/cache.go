@@ -27,10 +27,9 @@ import (
 	"github.com/erigontech/erigon/cl/phase1/core/state/shuffling"
 	"github.com/erigontech/erigon/cl/utils/threading"
 
-	"github.com/erigontech/erigon-lib/common"
-	libcommon "github.com/erigontech/erigon-lib/common"
 	"github.com/erigontech/erigon/cl/clparams"
 	"github.com/erigontech/erigon/cl/utils"
+	"github.com/erigontech/erigon/common"
 )
 
 const (
@@ -73,7 +72,7 @@ func NewFromRaw(r *raw.BeaconState) *CachingBeaconState {
 	return state
 }
 
-func (b *CachingBeaconState) SetPreviousStateRoot(root libcommon.Hash) {
+func (b *CachingBeaconState) SetPreviousStateRoot(root common.Hash) {
 	b.previousStateRoot = root
 }
 

@@ -27,20 +27,21 @@ import (
 	"runtime"
 	"time"
 
-	"github.com/erigontech/erigon-lib/chain"
-	"github.com/erigontech/erigon-lib/chain/networkname"
-	"github.com/erigontech/erigon-lib/chain/snapcfg"
-	"github.com/erigontech/erigon-lib/common"
-	"github.com/erigontech/erigon-lib/common/background"
-	"github.com/erigontech/erigon-lib/common/dbg"
-	"github.com/erigontech/erigon-lib/common/hexutility"
-	"github.com/erigontech/erigon-lib/common/length"
-	"github.com/erigontech/erigon-lib/downloader/snaptype"
-	"github.com/erigontech/erigon-lib/kv"
-	"github.com/erigontech/erigon-lib/log/v3"
-	"github.com/erigontech/erigon-lib/recsplit"
-	"github.com/erigontech/erigon-lib/seg"
-	coresnaptype "github.com/erigontech/erigon/core/snaptype"
+	"github.com/erigontech/erigon/common"
+	"github.com/erigontech/erigon/common/background"
+	"github.com/erigontech/erigon/common/dbg"
+	"github.com/erigontech/erigon/common/hexutil"
+	"github.com/erigontech/erigon/common/length"
+	"github.com/erigontech/erigon/common/log/v3"
+	"github.com/erigontech/erigon/db/kv"
+	"github.com/erigontech/erigon/db/recsplit"
+	"github.com/erigontech/erigon/db/seg"
+	"github.com/erigontech/erigon/db/snapcfg"
+	"github.com/erigontech/erigon/db/snaptype"
+	"github.com/erigontech/erigon/db/snaptype2"
+	"github.com/erigontech/erigon/db/version"
+	"github.com/erigontech/erigon/execution/chain"
+	"github.com/erigontech/erigon/execution/chain/networkname"
 	bortypes "github.com/erigontech/erigon/polygon/bor/types"
 )
 
@@ -49,9 +50,10 @@ func init() {
 }
 
 func initTypes() {
-	borTypes := append(coresnaptype.BlockSnapshotTypes, SnapshotTypes()...)
-	borTypes = append(borTypes, coresnaptype.E3StateTypes...)
+	borTypes := append(snaptype2.BlockSnapshotTypes, SnapshotTypes()...)
+	borTypes = append(borTypes, snaptype2.E3StateTypes...)
 
+	snapcfg.RegisterKnownTypes(networkname.Mumbai, borTypes)
 	snapcfg.RegisterKnownTypes(networkname.Amoy, borTypes)
 	snapcfg.RegisterKnownTypes(networkname.BorMainnet, borTypes)
 }
@@ -76,10 +78,10 @@ var Indexes = struct {
 	BorCheckpointId,
 	BorMilestoneId snaptype.Index
 }{
-	BorTxnHash:      snaptype.Index{Name: "borevents"},
-	BorSpanId:       snaptype.Index{Name: "borspans"},
-	BorCheckpointId: snaptype.Index{Name: "borcheckpoints"},
-	BorMilestoneId:  snaptype.Index{Name: "bormilestones"},
+	BorTxnHash:      snaptype.Index{Name: "borevents", Version: version.V1_1_standart},
+	BorSpanId:       snaptype.Index{Name: "borspans", Version: version.V1_1_standart},
+	BorCheckpointId: snaptype.Index{Name: "borcheckpoints", Version: version.V1_1_standart},
+	BorMilestoneId:  snaptype.Index{Name: "bormilestones", Version: version.V1_1_standart},
 }
 
 var ErrHeimdallDataIsNotReady = errors.New("heimdall data is not ready to extract for the specified interval")
@@ -92,7 +94,7 @@ func (e EventRangeExtractor) Extract(ctx context.Context, blockFrom, blockTo uin
 	logEvery := time.NewTicker(20 * time.Second)
 	defer logEvery.Stop()
 
-	from := hexutility.EncodeTs(blockFrom)
+	from := hexutil.EncodeTs(blockFrom)
 	startEventId := firstEventId(ctx)
 	var lastEventId uint64
 
@@ -160,10 +162,7 @@ var (
 	Events = snaptype.RegisterType(
 		Enums.Events,
 		"borevents",
-		snaptype.Versions{
-			Current:      1, //2,
-			MinSupported: 1,
-		},
+		version.V1_1_standart,
 		EventRangeExtractor{},
 		[]snaptype.Index{Indexes.BorTxnHash},
 		snaptype.IndexBuilderFunc(
@@ -214,9 +213,10 @@ var (
 				if err != nil {
 					return err
 				}
-				rs.LogLvl(log.LvlDebug)
+				defer rs.Close()
+				rs.LogLvl(log.LvlInfo)
 
-				defer d.EnableReadAhead().DisableReadAhead()
+				defer d.MadvSequential().DisableReadAhead()
 
 				for {
 					g.Reset(0)
@@ -257,14 +257,33 @@ var (
 	Spans = snaptype.RegisterType(
 		Enums.Spans,
 		"borspans",
-		snaptype.Versions{
-			Current:      1, //2,
-			MinSupported: 1,
-		},
+		version.V1_1_standart,
 		snaptype.RangeExtractorFunc(
 			func(ctx context.Context, blockFrom, blockTo uint64, firstKeyGetter snaptype.FirstKeyGetter, db kv.RoDB, _ *chain.Config, collect func([]byte) error, workers int, lvl log.Lvl, logger log.Logger, hashResolver snaptype.BlockHashResolver) (uint64, error) {
-				spanFrom := uint64(SpanIdAt(blockFrom))
-				spanTo := uint64(SpanIdAt(blockTo))
+				var spanFrom, spanTo uint64
+				err := db.View(ctx, func(tx kv.Tx) (err error) {
+					rangeIndex := NewTxSpanRangeIndex(db, kv.BorSpansIndex, tx)
+
+					spanIds, ok, err := rangeIndex.GetIDsBetween(ctx, blockFrom, blockTo)
+					if err != nil {
+						return err
+					}
+
+					if !ok {
+						return ErrHeimdallDataIsNotReady
+					}
+
+					if len(spanIds) > 0 {
+						spanFrom = spanIds[0]
+						spanTo = spanIds[len(spanIds)-1]
+					}
+
+					return nil
+				})
+
+				if err != nil {
+					return 0, err
+				}
 
 				logger.Debug("Extracting spans to snapshots", "blockFrom", blockFrom, "blockTo", blockTo, "spanFrom", spanFrom, "spanTo", spanTo)
 
@@ -279,20 +298,27 @@ var (
 					return err
 				}
 				defer d.Close()
+				var baseSpanId = uint64(0)
+				getter := d.MakeGetter()
+				getter.Reset(0)
+				if getter.HasNext() {
+					firstSpanRaw, _ := getter.Next(nil) // first span in this .seg file
+					var firstSpan Span
+					err = json.Unmarshal(firstSpanRaw, &firstSpan)
+					if err != nil {
+						return err
+					}
+					baseSpanId = uint64(firstSpan.Id)
+				}
 
-				baseSpanId := uint64(SpanIdAt(sn.From))
-
-				return buildValueIndex(ctx, sn, salt, d, baseSpanId, tmpDir, p, lvl, logger)
+				return buildValueIndex(ctx, Indexes.BorSpanId.Version, sn, salt, d, baseSpanId, tmpDir, p, lvl, logger)
 			}),
 	)
 
 	Checkpoints = snaptype.RegisterType(
 		Enums.Checkpoints,
 		"borcheckpoints",
-		snaptype.Versions{
-			Current:      1, //2,
-			MinSupported: 1,
-		},
+		version.V1_1_standart,
 		snaptype.RangeExtractorFunc(
 			func(ctx context.Context, blockFrom, blockTo uint64, firstKeyGetter snaptype.FirstKeyGetter, db kv.RoDB, _ *chain.Config, collect func([]byte) error, workers int, lvl log.Lvl, logger log.Logger, hashResolver snaptype.BlockHashResolver) (uint64, error) {
 				var checkpointTo, checkpointFrom CheckpointId
@@ -350,17 +376,14 @@ var (
 					firstCheckpointId = uint64(firstCheckpoint.Id)
 				}
 
-				return buildValueIndex(ctx, sn, salt, d, firstCheckpointId, tmpDir, p, lvl, logger)
+				return buildValueIndex(ctx, Indexes.BorCheckpointId.Version, sn, salt, d, firstCheckpointId, tmpDir, p, lvl, logger)
 			}),
 	)
 
 	Milestones = snaptype.RegisterType(
 		Enums.Milestones,
 		"bormilestones",
-		snaptype.Versions{
-			Current:      1, //2,
-			MinSupported: 1,
-		},
+		version.V1_1_standart,
 		snaptype.RangeExtractorFunc(
 			func(ctx context.Context, blockFrom, blockTo uint64, firstKeyGetter snaptype.FirstKeyGetter, db kv.RoDB, _ *chain.Config, collect func([]byte) error, workers int, lvl log.Lvl, logger log.Logger, hashResolver snaptype.BlockHashResolver) (uint64, error) {
 				var milestoneFrom, milestoneTo MilestoneId
@@ -416,7 +439,7 @@ var (
 					}
 				}
 
-				return buildValueIndex(ctx, sn, salt, d, firstMilestoneId, tmpDir, p, lvl, logger)
+				return buildValueIndex(ctx, Indexes.BorMilestoneId.Version, sn, salt, d, firstMilestoneId, tmpDir, p, lvl, logger)
 			}),
 	)
 )
@@ -451,7 +474,7 @@ func extractValueRange(ctx context.Context, table string, valueFrom, valueTo uin
 	logEvery := time.NewTicker(20 * time.Second)
 	defer logEvery.Stop()
 
-	if err := kv.BigChunks(db, table, hexutility.EncodeTs(valueFrom), func(tx kv.Tx, idBytes, valueBytes []byte) (bool, error) {
+	if err := kv.BigChunks(db, table, hexutil.EncodeTs(valueFrom), func(tx kv.Tx, idBytes, valueBytes []byte) (bool, error) {
 		id := binary.BigEndian.Uint64(idBytes)
 		if id >= valueTo {
 			return false, nil
@@ -479,7 +502,7 @@ func extractValueRange(ctx context.Context, table string, valueFrom, valueTo uin
 	return valueTo, nil
 }
 
-func buildValueIndex(ctx context.Context, sn snaptype.FileInfo, salt uint32, d *seg.Decompressor, baseId uint64, tmpDir string, p *background.Progress, lvl log.Lvl, logger log.Logger) (err error) {
+func buildValueIndex(ctx context.Context, version version.Versions, sn snaptype.FileInfo, salt uint32, d *seg.Decompressor, baseId uint64, tmpDir string, p *background.Progress, lvl log.Lvl, logger log.Logger) (err error) {
 	defer func() {
 		if rec := recover(); rec != nil {
 			err = fmt.Errorf("BorSpansIdx: at=%d-%d, %v, %s", sn.From, sn.To, rec, dbg.Stack())
@@ -492,16 +515,17 @@ func buildValueIndex(ctx context.Context, sn snaptype.FileInfo, salt uint32, d *
 		BucketSize: recsplit.DefaultBucketSize,
 		LeafSize:   recsplit.DefaultLeafSize,
 		TmpDir:     tmpDir,
-		IndexFile:  filepath.Join(sn.Dir(), sn.Type.IdxFileName(sn.Version, sn.From, sn.To)),
+		IndexFile:  filepath.Join(sn.Dir(), sn.Type.IdxFileName(version.Current, sn.From, sn.To)),
 		BaseDataID: baseId,
 		Salt:       &salt,
 	}, logger)
 	if err != nil {
 		return err
 	}
-	rs.LogLvl(log.LvlDebug)
+	defer rs.Close()
+	rs.LogLvl(log.LvlInfo)
 
-	defer d.EnableReadAhead().DisableReadAhead()
+	defer d.MadvSequential().DisableReadAhead()
 
 	for {
 		g := d.MakeGetter()

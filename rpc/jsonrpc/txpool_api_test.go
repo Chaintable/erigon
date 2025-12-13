@@ -1,0 +1,80 @@
+// Copyright 2024 The Erigon Authors
+// This file is part of Erigon.
+//
+// Erigon is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Lesser General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// Erigon is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU Lesser General Public License for more details.
+//
+// You should have received a copy of the GNU Lesser General Public License
+// along with Erigon. If not, see <http://www.gnu.org/licenses/>.
+
+package jsonrpc
+
+import (
+	"bytes"
+	"fmt"
+	"testing"
+
+	"github.com/holiman/uint256"
+	"github.com/stretchr/testify/require"
+
+	"github.com/erigontech/erigon/cmd/rpcdaemon/rpcdaemontest"
+	"github.com/erigontech/erigon/common"
+	"github.com/erigontech/erigon/common/hexutil"
+	"github.com/erigontech/erigon/db/kv/kvcache"
+	"github.com/erigontech/erigon/execution/protocol/params"
+	"github.com/erigontech/erigon/execution/tests/blockgen"
+	"github.com/erigontech/erigon/execution/tests/mock"
+	"github.com/erigontech/erigon/execution/types"
+	"github.com/erigontech/erigon/node/gointerfaces/txpoolproto"
+	"github.com/erigontech/erigon/rpc/rpccfg"
+	"github.com/erigontech/erigon/rpc/rpchelper"
+)
+
+func TestTxPoolContent(t *testing.T) {
+	m, require := mock.MockWithTxPool(t), require.New(t)
+	chain, err := blockgen.GenerateChain(m.ChainConfig, m.Genesis, m.Engine, m.DB, 1, func(i int, b *blockgen.BlockGen) {
+		b.SetCoinbase(common.Address{1})
+	})
+	require.NoError(err)
+	err = m.InsertChain(chain)
+	require.NoError(err)
+
+	ctx, conn := rpcdaemontest.CreateTestGrpcConn(t, m)
+	txPool := txpoolproto.NewTxpoolClient(conn)
+	ff := rpchelper.New(ctx, rpchelper.DefaultFiltersConfig, nil, txPool, txpoolproto.NewMiningClient(conn), func() {}, m.Log)
+	api := NewTxPoolAPI(NewBaseApi(ff, kvcache.New(kvcache.DefaultCoherentConfig), m.BlockReader, false, rpccfg.DefaultEvmCallTimeout, m.Engine, m.Dirs, nil), m.DB, txPool)
+
+	expectValue := uint64(1234)
+	txn, err := types.SignTx(types.NewTransaction(0, common.Address{1}, uint256.NewInt(expectValue), params.TxGas, uint256.NewInt(10*common.GWei), nil), *types.LatestSignerForChainID(m.ChainConfig.ChainID), m.Key)
+	require.NoError(err)
+
+	buf := bytes.NewBuffer(nil)
+	err = txn.MarshalBinary(buf)
+	require.NoError(err)
+
+	reply, err := txPool.Add(ctx, &txpoolproto.AddRequest{RlpTxs: [][]byte{buf.Bytes()}})
+	require.NoError(err)
+	for _, res := range reply.Imported {
+		require.Equal(txpoolproto.ImportResult_SUCCESS, res, fmt.Sprintf("%s", reply.Errors))
+	}
+
+	content, err := api.Content(ctx)
+	require.NoError(err)
+
+	sender := m.Address.String()
+	require.Len(content["pending"][sender], 1)
+	require.Equal(expectValue, content["pending"][sender]["0"].Value.ToInt().Uint64())
+
+	status, err := api.Status(ctx)
+	require.NoError(err)
+	require.Len(status, 3)
+	require.Equal(status["pending"], hexutil.Uint(1))
+	require.Equal(status["queued"], hexutil.Uint(0))
+}

@@ -20,17 +20,17 @@ import (
 	"errors"
 	"fmt"
 
-	libcommon "github.com/erigontech/erigon-lib/common"
-	"github.com/erigontech/erigon-lib/kv"
 	"github.com/erigontech/erigon/cl/clparams"
 	"github.com/erigontech/erigon/cl/cltypes/solid"
 	"github.com/erigontech/erigon/cl/persistence/base_encoding"
 	state_accessors "github.com/erigontech/erigon/cl/persistence/state"
 	"github.com/erigontech/erigon/cl/phase1/core/state/shuffling"
 	"github.com/erigontech/erigon/cl/utils"
+	"github.com/erigontech/erigon/common"
+	"github.com/erigontech/erigon/db/kv"
 )
 
-func (r *HistoricalStatesReader) attestingIndicies(attestation *solid.Attestation, checkBitsLength bool, mix libcommon.Hash, idxs []uint64) ([]uint64, error) {
+func (r *HistoricalStatesReader) attestingIndicies(attestation *solid.Attestation, checkBitsLength bool, mix common.Hash, idxs []uint64) ([]uint64, error) {
 	slot := attestation.Data.Slot
 	epoch := slot / r.cfg.SlotsPerEpoch
 	clversion := r.cfg.GetCurrentStateVersion(epoch)
@@ -97,7 +97,7 @@ func (r *HistoricalStatesReader) attestingIndicies(attestation *solid.Attestatio
 }
 
 // computeCommittee uses cache to compute compittee
-func (r *HistoricalStatesReader) ComputeCommittee(mix libcommon.Hash, indicies []uint64, slot uint64, count, index uint64) ([]uint64, error) {
+func (r *HistoricalStatesReader) ComputeCommittee(mix common.Hash, indicies []uint64, slot uint64, count, index uint64) ([]uint64, error) {
 	cfg := r.cfg
 	lenIndicies := uint64(len(indicies))
 
@@ -116,17 +116,14 @@ func (r *HistoricalStatesReader) ComputeCommittee(mix libcommon.Hash, indicies [
 }
 
 func committeeCount(cfg *clparams.BeaconChainConfig, epoch uint64, idxs []uint64) uint64 {
-	committeCount := uint64(len(idxs)) / cfg.SlotsPerEpoch / cfg.TargetCommitteeSize
-	if cfg.MaxCommitteesPerSlot < committeCount {
-		committeCount = cfg.MaxCommitteesPerSlot
-	}
+	committeCount := min(cfg.MaxCommitteesPerSlot, uint64(len(idxs))/cfg.SlotsPerEpoch/cfg.TargetCommitteeSize)
 	if committeCount < 1 {
 		committeCount = 1
 	}
 	return committeCount
 }
 
-func (r *HistoricalStatesReader) readHistoricalBlockRoot(kvGetter state_accessors.GetValFn, slot, index uint64) (libcommon.Hash, error) {
+func (r *HistoricalStatesReader) readHistoricalBlockRoot(kvGetter state_accessors.GetValFn, slot, index uint64) (common.Hash, error) {
 	slotSubIndex := slot % r.cfg.SlotsPerHistoricalRoot
 	needFromGenesis := true
 
@@ -148,18 +145,18 @@ func (r *HistoricalStatesReader) readHistoricalBlockRoot(kvGetter state_accessor
 	}
 	br, err := kvGetter(kv.BlockRoot, base_encoding.Encode64ToBytes4(slotLookup))
 	if err != nil {
-		return libcommon.Hash{}, err
+		return common.Hash{}, err
 	}
 	if len(br) != 32 {
-		return libcommon.Hash{}, fmt.Errorf("invalid block root length %d", len(br))
+		return common.Hash{}, fmt.Errorf("invalid block root length %d", len(br))
 	}
-	return libcommon.BytesToHash(br), nil
+	return common.BytesToHash(br), nil
 
 }
 
 func (r *HistoricalStatesReader) getAttestationParticipationFlagIndicies(tx kv.Tx, getter state_accessors.GetValFn, version clparams.StateVersion, stateSlot uint64, data solid.AttestationData, inclusionDelay uint64, skipAssert bool) ([]uint8, error) {
 
-	currentCheckpoint, previousCheckpoint, _, ok, err := state_accessors.ReadCheckpoints(getter, r.cfg.RoundSlotToEpoch(stateSlot))
+	currentCheckpoint, previousCheckpoint, _, ok, err := state_accessors.ReadCheckpoints(getter, r.cfg.RoundSlotToEpoch(stateSlot), r.cfg)
 	if err != nil {
 		return nil, err
 	}

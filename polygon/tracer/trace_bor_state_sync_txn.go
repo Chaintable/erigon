@@ -21,19 +21,20 @@ import (
 	"time"
 
 	"github.com/holiman/uint256"
-	jsoniter "github.com/json-iterator/go"
 
-	"github.com/erigontech/erigon-lib/chain"
-	libcommon "github.com/erigontech/erigon-lib/common"
-	"github.com/erigontech/erigon/core"
-	"github.com/erigontech/erigon/core/state"
-	"github.com/erigontech/erigon/core/types"
-	"github.com/erigontech/erigon/core/vm"
-	"github.com/erigontech/erigon/core/vm/evmtypes"
-	tracersConfig "github.com/erigontech/erigon/eth/tracers/config"
+	"github.com/erigontech/erigon/common"
+	"github.com/erigontech/erigon/execution/chain"
+	"github.com/erigontech/erigon/execution/protocol"
+	"github.com/erigontech/erigon/execution/state"
+	"github.com/erigontech/erigon/execution/tracing/tracers"
+	tracersConfig "github.com/erigontech/erigon/execution/tracing/tracers/config"
+	"github.com/erigontech/erigon/execution/types"
+	"github.com/erigontech/erigon/execution/vm"
+	"github.com/erigontech/erigon/execution/vm/evmtypes"
 	"github.com/erigontech/erigon/polygon/bor/borcfg"
 	bortypes "github.com/erigontech/erigon/polygon/bor/types"
-	"github.com/erigontech/erigon/turbo/transactions"
+	"github.com/erigontech/erigon/rpc/jsonstream"
+	"github.com/erigontech/erigon/rpc/transactions"
 )
 
 func TraceBorStateSyncTxnDebugAPI(
@@ -41,38 +42,40 @@ func TraceBorStateSyncTxnDebugAPI(
 	chainConfig *chain.Config,
 	traceConfig *tracersConfig.TraceConfig,
 	ibs *state.IntraBlockState,
-	blockHash libcommon.Hash,
+	blockHash common.Hash,
 	blockNum uint64,
 	blockTime uint64,
 	blockCtx evmtypes.BlockContext,
-	stream *jsoniter.Stream,
+	stream jsonstream.Stream,
 	callTimeout time.Duration,
 	msgs []*types.Message,
 	txIndex int,
-) (usedGas uint64, err error) {
+) (gasUsed uint64, err error) {
 	txCtx := initStateSyncTxContext(blockNum, blockHash)
 	tracer, streaming, cancel, err := transactions.AssembleTracer(ctx, traceConfig, txCtx.TxHash, blockHash, txIndex, stream, callTimeout)
 	if err != nil {
 		stream.WriteNil()
-		return usedGas, err
+		return gasUsed, err
 	}
 
 	defer cancel()
 	stateReceiverContract := chainConfig.Bor.(*borcfg.BorConfig).StateReceiverContractAddress()
-	tracer = NewBorStateSyncTxnTracer(tracer, len(msgs), stateReceiverContract)
-	rules := chainConfig.Rules(blockNum, blockTime)
+	tracer = NewBorStateSyncTxnTracer(tracer, stateReceiverContract)
+	rules := blockCtx.Rules(chainConfig)
 	stateWriter := state.NewNoopWriter()
 	execCb := func(evm *vm.EVM, refunds bool) (*evmtypes.ExecutionResult, error) {
+		tracer.OnTxStart(evm.GetVMContext(), bortypes.NewBorTransaction(), common.Address{})
 		res, err := traceBorStateSyncTxn(ctx, ibs, stateWriter, msgs, evm, rules, txCtx, refunds)
+		tracer.OnTxEnd(&types.Receipt{}, err)
 		if err != nil {
 			return res, err
 		}
-		usedGas = res.UsedGas
+		gasUsed = res.GasUsed
 		return res, nil
 	}
 
 	err = transactions.ExecuteTraceTx(blockCtx, txCtx, ibs, traceConfig, chainConfig, stream, tracer, streaming, execCb)
-	return usedGas, err
+	return gasUsed, err
 }
 
 func TraceBorStateSyncTxnTraceAPI(
@@ -82,19 +85,20 @@ func TraceBorStateSyncTxnTraceAPI(
 	ibs *state.IntraBlockState,
 	stateWriter state.StateWriter,
 	blockCtx evmtypes.BlockContext,
-	blockHash libcommon.Hash,
+	blockHash common.Hash,
 	blockNum uint64,
 	blockTime uint64,
 	msgs []*types.Message,
+	tracer *tracers.Tracer,
 ) (*evmtypes.ExecutionResult, error) {
 	stateReceiverContract := chainConfig.Bor.(*borcfg.BorConfig).StateReceiverContractAddress()
-	if vmConfig.Tracer != nil {
-		vmConfig.Tracer = NewBorStateSyncTxnTracer(vmConfig.Tracer, len(msgs), stateReceiverContract)
+	if tracer != nil {
+		vmConfig.Tracer = NewBorStateSyncTxnTracer(tracer, stateReceiverContract).Hooks
 	}
 
 	txCtx := initStateSyncTxContext(blockNum, blockHash)
-	rules := chainConfig.Rules(blockNum, blockTime)
 	evm := vm.NewEVM(blockCtx, txCtx, ibs, chainConfig, *vmConfig)
+	rules := evm.ChainRules()
 
 	return traceBorStateSyncTxn(ctx, ibs, stateWriter, msgs, evm, rules, txCtx, true)
 }
@@ -116,8 +120,8 @@ func traceBorStateSyncTxn(
 		default:
 		}
 
-		gp := new(core.GasPool).AddGas(msg.Gas()).AddBlobGas(msg.BlobGas())
-		_, err := core.ApplyMessage(evm, msg, gp, refunds, false /* gasBailout */, nil /* engine */)
+		gp := new(protocol.GasPool).AddGas(msg.Gas()).AddBlobGas(msg.BlobGas())
+		_, err := protocol.ApplyMessage(evm, msg, gp, refunds, false /* gasBailout */, nil /* engine */)
 		if err != nil {
 			return nil, err
 		}
@@ -134,10 +138,10 @@ func traceBorStateSyncTxn(
 	return &evmtypes.ExecutionResult{}, nil
 }
 
-func initStateSyncTxContext(blockNum uint64, blockHash libcommon.Hash) evmtypes.TxContext {
+func initStateSyncTxContext(blockNum uint64, blockHash common.Hash) evmtypes.TxContext {
 	return evmtypes.TxContext{
 		TxHash:   bortypes.ComputeBorTxHash(blockNum, blockHash),
-		Origin:   libcommon.Address{},
-		GasPrice: uint256.NewInt(0),
+		Origin:   common.Address{},
+		GasPrice: uint256.Int{},
 	}
 }

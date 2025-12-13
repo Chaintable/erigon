@@ -23,8 +23,6 @@ import (
 	"net/http"
 	"strconv"
 
-	libcommon "github.com/erigontech/erigon-lib/common"
-	"github.com/erigontech/erigon-lib/kv"
 	"github.com/erigontech/erigon/cl/beacon/beaconhttp"
 	"github.com/erigontech/erigon/cl/clparams"
 	"github.com/erigontech/erigon/cl/cltypes"
@@ -33,9 +31,11 @@ import (
 	state_accessors "github.com/erigontech/erigon/cl/persistence/state"
 	"github.com/erigontech/erigon/cl/persistence/state/historical_states_reader"
 	"github.com/erigontech/erigon/cl/utils"
+	"github.com/erigontech/erigon/common"
+	"github.com/erigontech/erigon/db/kv"
 )
 
-func (a *ApiHandler) blockRootFromStateId(ctx context.Context, tx kv.Tx, stateId *beaconhttp.SegmentID) (root libcommon.Hash, httpStatusErr int, err error) {
+func (a *ApiHandler) blockRootFromStateId(ctx context.Context, tx kv.Tx, stateId *beaconhttp.SegmentID) (root common.Hash, httpStatusErr int, err error) {
 
 	switch {
 	case stateId.Head():
@@ -50,34 +50,34 @@ func (a *ApiHandler) blockRootFromStateId(ctx context.Context, tx kv.Tx, stateId
 	case stateId.Genesis():
 		root, err = beacon_indicies.ReadCanonicalBlockRoot(tx, 0)
 		if err != nil {
-			return libcommon.Hash{}, http.StatusInternalServerError, err
+			return common.Hash{}, http.StatusInternalServerError, err
 		}
-		if root == (libcommon.Hash{}) {
-			return libcommon.Hash{}, http.StatusNotFound, errors.New("genesis block not found")
+		if root == (common.Hash{}) {
+			return common.Hash{}, http.StatusNotFound, errors.New("genesis block not found")
 		}
 		return
 	case stateId.GetSlot() != nil:
 		root, err = beacon_indicies.ReadCanonicalBlockRoot(tx, *stateId.GetSlot())
 		if err != nil {
-			return libcommon.Hash{}, http.StatusInternalServerError, err
+			return common.Hash{}, http.StatusInternalServerError, err
 		}
-		if root == (libcommon.Hash{}) {
-			return libcommon.Hash{}, http.StatusNotFound, fmt.Errorf("block not found %d", *stateId.GetSlot())
+		if root == (common.Hash{}) {
+			return common.Hash{}, http.StatusNotFound, fmt.Errorf("block not found %d", *stateId.GetSlot())
 		}
 		return
 	case stateId.GetRoot() != nil:
 		root, err = beacon_indicies.ReadBlockRootByStateRoot(tx, *stateId.GetRoot())
 		if err != nil {
-			return libcommon.Hash{}, http.StatusInternalServerError, err
+			return common.Hash{}, http.StatusInternalServerError, err
 		}
 		return
 	default:
-		return libcommon.Hash{}, http.StatusInternalServerError, errors.New("cannot parse state id")
+		return common.Hash{}, http.StatusInternalServerError, errors.New("cannot parse state id")
 	}
 }
 
 type rootResponse struct {
-	Root libcommon.Hash `json:"root"`
+	Root common.Hash `json:"root"`
 }
 
 func previousVersion(v clparams.StateVersion) clparams.StateVersion {
@@ -149,7 +149,7 @@ func (a *ApiHandler) getStateRoot(w http.ResponseWriter, r *http.Request) (*beac
 	if err != nil {
 		return nil, err
 	}
-	if stateRoot == (libcommon.Hash{}) {
+	if stateRoot == (common.Hash{}) {
 		return nil, beaconhttp.NewEndpointError(http.StatusNotFound, fmt.Errorf("could not read block header: %x", root))
 	}
 
@@ -184,12 +184,23 @@ func (a *ApiHandler) getFullState(w http.ResponseWriter, r *http.Request) (*beac
 	if err != nil {
 		return nil, beaconhttp.NewEndpointError(http.StatusBadRequest, err)
 	}
-
 	blockRoot, httpStatus, err := a.blockRootFromStateId(ctx, tx, blockId)
 	if err != nil {
 		return nil, beaconhttp.NewEndpointError(httpStatus, err)
 	}
-	isOptimistic := a.forkchoiceStore.IsRootOptimistic(blockRoot)
+
+	slot, err := beacon_indicies.ReadBlockSlotByBlockRoot(tx, blockRoot)
+	if err != nil {
+		return nil, beaconhttp.NewEndpointError(http.StatusInternalServerError, fmt.Errorf("could not read block slot: %x", blockRoot))
+	}
+	if slot == nil {
+		return nil, beaconhttp.NewEndpointError(http.StatusNotFound, fmt.Errorf("could not read block slot: %x", blockRoot))
+	}
+	canonicalRoot, err := beacon_indicies.ReadCanonicalBlockRoot(tx, *slot)
+	if err != nil {
+		return nil, beaconhttp.NewEndpointError(http.StatusInternalServerError, fmt.Errorf("could not read canonical block root: %x", blockRoot))
+	}
+
 	state, err := a.forkchoiceStore.GetStateAtBlockRoot(blockRoot, true)
 	if err != nil {
 		return nil, beaconhttp.NewEndpointError(http.StatusBadRequest, err)
@@ -210,17 +221,21 @@ func (a *ApiHandler) getFullState(w http.ResponseWriter, r *http.Request) (*beac
 		if canonicalRoot != blockRoot {
 			return nil, beaconhttp.NewEndpointError(http.StatusNotFound, fmt.Errorf("could not read state: %x", blockRoot))
 		}
-		state, err := a.stateReader.ReadHistoricalState(ctx, tx, *slot)
+		historicalState, err := a.stateReader.ReadHistoricalState(ctx, tx, *slot)
 		if err != nil {
 			return nil, err
 		}
-		if state == nil {
+		if historicalState == nil {
 			return nil, beaconhttp.NewEndpointError(http.StatusNotFound, fmt.Errorf("could not read state: %x", blockRoot))
 		}
-		return newBeaconResponse(state).WithFinalized(true).WithVersion(state.Version()).WithOptimistic(isOptimistic), nil
+		state = historicalState
 	}
 
-	return newBeaconResponse(state).WithFinalized(false).WithVersion(state.Version()).WithOptimistic(isOptimistic), nil
+	return newBeaconResponse(state).
+		WithHeader("Eth-Consensus-Version", state.Version().String()).
+		WithFinalized(canonicalRoot == blockRoot && *slot <= a.forkchoiceStore.FinalizedSlot()).
+		WithVersion(state.Version()).
+		WithOptimistic(a.forkchoiceStore.IsRootOptimistic(blockRoot)), nil
 }
 
 type finalityCheckpointsResponse struct {
@@ -262,7 +277,7 @@ func (a *ApiHandler) getFinalityCheckpoints(w http.ResponseWriter, r *http.Reque
 
 	stateGetter := state_accessors.GetValFnTxAndSnapshot(tx, snRoTx)
 	if !ok {
-		currentJustifiedCheckpoint, previousJustifiedCheckpoint, finalizedCheckpoint, ok, err = state_accessors.ReadCheckpoints(stateGetter, a.beaconChainCfg.RoundSlotToEpoch(*slot))
+		currentJustifiedCheckpoint, previousJustifiedCheckpoint, finalizedCheckpoint, ok, err = state_accessors.ReadCheckpoints(stateGetter, a.beaconChainCfg.RoundSlotToEpoch(*slot), a.beaconChainCfg)
 		if err != nil {
 			return nil, beaconhttp.NewEndpointError(http.StatusBadRequest, err)
 		}
@@ -384,7 +399,7 @@ func (a *ApiHandler) getSyncCommittees(w http.ResponseWriter, r *http.Request) (
 }
 
 type randaoResponse struct {
-	Randao libcommon.Hash `json:"randao"`
+	Randao common.Hash `json:"randao"`
 }
 
 func (a *ApiHandler) getRandao(w http.ResponseWriter, r *http.Request) (*beaconhttp.BeaconResponse, error) {
@@ -623,7 +638,84 @@ func (a *ApiHandler) GetEthV1BeaconStatesPendingPartialWithdrawals(w http.Respon
 		}
 	}
 
+	version := a.ethClock.StateVersionByEpoch(*slot / a.beaconChainCfg.SlotsPerEpoch)
 	return newBeaconResponse(pendingWithdrawals).
+		WithHeader("Eth-Consensus-Version", version.String()).
+		WithVersion(version).
 		WithOptimistic(isOptimistic).
+		WithFinalized(canonicalRoot == blockRoot && *slot <= a.forkchoiceStore.FinalizedSlot()), nil
+}
+
+func (a *ApiHandler) GetEthV1BeaconStatesProposerLookahead(w http.ResponseWriter, r *http.Request) (*beaconhttp.BeaconResponse, error) {
+	ctx := r.Context()
+
+	stateId, err := beaconhttp.StateIdFromRequest(r)
+	if err != nil {
+		return nil, beaconhttp.NewEndpointError(
+			http.StatusBadRequest,
+			err)
+	}
+
+	tx, err := a.indiciesDB.BeginRo(ctx)
+	if err != nil {
+		return nil, beaconhttp.NewEndpointError(
+			http.StatusInternalServerError,
+			fmt.Errorf("failed to read indicies db: %w", err),
+		)
+	}
+	defer tx.Rollback()
+	blockRoot, httpStatus, err := a.blockRootFromStateId(ctx, tx, stateId)
+	if err != nil {
+		return nil, beaconhttp.NewEndpointError(httpStatus, err)
+	}
+
+	slot, err := beacon_indicies.ReadBlockSlotByBlockRoot(tx, blockRoot)
+	if err != nil {
+		return nil, beaconhttp.NewEndpointError(
+			http.StatusInternalServerError,
+			fmt.Errorf("failed to read block slot: %w", err),
+		)
+	}
+	if slot == nil {
+		return nil, beaconhttp.NewEndpointError(
+			http.StatusNotFound,
+			fmt.Errorf("could not read block slot: %x", blockRoot),
+		)
+	}
+
+	canonicalRoot, err := beacon_indicies.ReadCanonicalBlockRoot(tx, *slot)
+	if err != nil {
+		return nil, beaconhttp.NewEndpointError(
+			http.StatusInternalServerError,
+			fmt.Errorf("failed to read canonical block root: %w", err),
+		)
+	}
+
+	proposerLookahead, ok := a.forkchoiceStore.GetProposerLookahead(*slot)
+	if !ok {
+		stateView := a.caplinStateSnapshots.View()
+		defer stateView.Close()
+		// read epoch data
+		epochData, err := state_accessors.ReadEpochData(state_accessors.GetValFnTxAndSnapshot(tx, stateView), *slot/a.beaconChainCfg.SlotsPerEpoch, a.beaconChainCfg)
+		if err != nil {
+			return nil, beaconhttp.NewEndpointError(
+				http.StatusInternalServerError,
+				fmt.Errorf("failed to read historical epoch data: %w", err),
+			)
+		}
+		proposerLookahead = epochData.ProposerLookahead
+	}
+
+	respProposerLookahead := []string{}
+	proposerLookahead.Range(func(i int, v uint64, length int) bool {
+		respProposerLookahead = append(respProposerLookahead, strconv.FormatUint(v, 10))
+		return true
+	})
+
+	version := a.ethClock.StateVersionByEpoch(*slot / a.beaconChainCfg.SlotsPerEpoch)
+	return newBeaconResponse(respProposerLookahead).
+		WithHeader("Eth-Consensus-Version", version.String()).
+		WithVersion(version).
+		WithOptimistic(a.forkchoiceStore.IsRootOptimistic(blockRoot)).
 		WithFinalized(canonicalRoot == blockRoot && *slot <= a.forkchoiceStore.FinalizedSlot()), nil
 }

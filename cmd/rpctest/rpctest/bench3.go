@@ -20,24 +20,24 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"maps"
 
-	libcommon "github.com/erigontech/erigon-lib/common"
-
-	"github.com/erigontech/erigon/core/state"
+	"github.com/erigontech/erigon/common"
+	"github.com/erigontech/erigon/execution/state"
 )
 
 func Bench3(erigon_url, geth_url string) error {
 
-	blockhash := libcommon.HexToHash("0xdf15213766f00680c6a20ba76ba2cc9534435e19bc490039f3a7ef42095c8d13")
+	blockhash := common.HexToHash("0xdf15213766f00680c6a20ba76ba2cc9534435e19bc490039f3a7ef42095c8d13")
 	req_id := 1
 
 	pageSize := 256
 	req_id++
 	template := `{ "jsonrpc": "2.0", "method": "debug_accountRange", "params": ["0x1", "%s", %d, true, true, true], "id":%d}`
 
-	page := libcommon.Hash{}.Bytes()
+	page := common.Hash{}.Bytes()
 
-	accRangeTG := make(map[libcommon.Address]state.DumpAccount)
+	accRangeTG := make(map[common.Address]state.DumpAccount)
 
 	for len(page) > 0 {
 		encodedKey := base64.StdEncoding.EncodeToString(page)
@@ -50,15 +50,13 @@ func Bench3(erigon_url, geth_url string) error {
 			break
 		} else {
 			page = sr.Result.Next
-			for k, v := range sr.Result.Accounts {
-				accRangeTG[k] = v
-			}
+			maps.Copy(accRangeTG, sr.Result.Accounts)
 		}
 	}
 
-	accRangeGeth := make(map[libcommon.Address]state.DumpAccount)
+	accRangeGeth := make(map[common.Address]state.DumpAccount)
 
-	page = libcommon.Hash{}.Bytes()
+	page = common.Hash{}.Bytes()
 	for len(page) > 0 {
 		encodedKey := base64.StdEncoding.EncodeToString(page)
 		var sr DebugAccountRange
@@ -70,9 +68,7 @@ func Bench3(erigon_url, geth_url string) error {
 			break
 		} else {
 			page = sr.Result.Next
-			for k, v := range sr.Result.Accounts {
-				accRangeTG[k] = v
-			}
+			maps.Copy(accRangeTG, sr.Result.Accounts)
 		}
 	}
 
@@ -116,9 +112,9 @@ func Bench3(erigon_url, geth_url string) error {
 			return fmt.Errorf("Different traces block %d, txn %s\n", 1720000, txhash)
 		}
 	}
-	to := libcommon.HexToAddress("0xbb9bc244d798123fde783fcc1c72d3bb8c189413")
-	sm := make(map[libcommon.Hash]storageEntry)
-	start := libcommon.HexToHash("0x5aa12c260b07325d83f0c9170a2c667948d0247cad4ad999cd00148658b0552d")
+	to := common.HexToAddress("0xbb9bc244d798123fde783fcc1c72d3bb8c189413")
+	sm := make(map[common.Hash]storageEntry)
+	start := common.HexToHash("0x5aa12c260b07325d83f0c9170a2c667948d0247cad4ad999cd00148658b0552d")
 
 	req_id++
 	template = `
@@ -136,13 +132,11 @@ func Bench3(erigon_url, geth_url string) error {
 			break
 		} else {
 			nextKey = sr.Result.NextKey
-			for k, v := range sr.Result.Storage {
-				sm[k] = v
-			}
+			maps.Copy(sm, sr.Result.Storage)
 		}
 	}
 	fmt.Printf("storageRange: %d\n", len(sm))
-	smg := make(map[libcommon.Hash]storageEntry)
+	smg := make(map[common.Hash]storageEntry)
 	nextKey = &start
 	for nextKey != nil {
 		var srg DebugStorageRange
@@ -154,9 +148,7 @@ func Bench3(erigon_url, geth_url string) error {
 			break
 		} else {
 			nextKey = srg.Result.NextKey
-			for k, v := range srg.Result.Storage {
-				smg[k] = v
-			}
+			maps.Copy(smg, srg.Result.Storage)
 		}
 	}
 	fmt.Printf("storageRange g: %d\n", len(smg))

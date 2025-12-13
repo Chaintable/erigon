@@ -19,7 +19,7 @@ package txpool
 import (
 	"sync"
 
-	"github.com/erigontech/erigon/consensus/misc"
+	"github.com/erigontech/erigon/execution/protocol/rules/misc"
 )
 
 type Option func(*options)
