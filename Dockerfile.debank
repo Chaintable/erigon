@@ -1,5 +1,5 @@
 # syntax = docker/dockerfile:1.2
-FROM docker.io/library/golang:1.23-bullseye as builder
+FROM docker.io/library/golang:1.24-bookworm as builder
 
 ARG ACCESS_TOKEN
 
@@ -7,7 +7,6 @@ RUN apt-get update && apt-get install -y build-essential git bash ca-certificate
 
 WORKDIR /go/src/github.com/ledgerwatch/erigon
 
-ADD erigon-lib erigon-lib
 ADD go.mod go.mod
 ADD go.sum go.sum
 
