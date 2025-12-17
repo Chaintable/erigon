@@ -304,12 +304,12 @@ func (api *TraceAPIImpl) DebankBlock(ctx context.Context, blockNrOrHash rpc.Bloc
 	}, nil
 }
 
-func (api *TraceAPIImpl) DebankBGTraceStart(ctx context.Context, region string, nodeXBucket string, chainTableBucket string, broker string, topic string, chainID string, startBlock, endBlock, maxTask uint64) (*BGTraceStatus, error) {
+func (api *TraceAPIImpl) DebankBGTraceStart(ctx context.Context, region string, nodeXBucket string, chainTableBucket string, broker string, topic string, chainID string, version string, startBlock, endBlock, maxTask uint64) (*BGTraceStatus, error) {
 	if region == "" || nodeXBucket == "" || chainTableBucket == "" || broker == "" || topic == "" || chainID == "" || endBlock == 0 || startBlock > endBlock || maxTask == 0 {
 		return nil, errors.New("missing required parameters")
 	}
 
-	err := dtracer.DebankTraceBackGroundMangeInstance.Start(api, region, nodeXBucket, chainTableBucket, broker, topic, chainID, startBlock, endBlock, maxTask)
+	err := dtracer.DebankTraceBackGroundMangeInstance.Start(api, region, nodeXBucket, chainTableBucket, broker, topic, chainID, version, startBlock, endBlock, maxTask)
 	if err != nil {
 		return nil, err
 	}

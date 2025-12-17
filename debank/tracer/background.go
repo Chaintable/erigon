@@ -149,7 +149,7 @@ type DebankTraceManger struct {
 	sync.Mutex
 }
 
-func (m *DebankTraceManger) Start(api DebankTrace, region string, nodeXBucket string, chainTableBucket string, broker string, topic string, chainID string, startBlock, endBlock, maxTask uint64) error {
+func (m *DebankTraceManger) Start(api DebankTrace, region string, nodeXBucket string, chainTableBucket string, broker string, topic string, chainID string, version string, startBlock, endBlock, maxTask uint64) error {
 	m.Lock()
 	defer m.Unlock()
 	if m.currentTaskGroup != nil {
@@ -157,7 +157,7 @@ func (m *DebankTraceManger) Start(api DebankTrace, region string, nodeXBucket st
 		return fmt.Errorf("DebankTraceManger is already running")
 	}
 	m.currentTaskGroup = NewDebankTraceTaskGroup(startBlock, endBlock, maxTask)
-	uploader, err := util.NewUploader(region, nodeXBucket, chainTableBucket, broker, topic, chainID)
+	uploader, err := util.NewUploader(region, nodeXBucket, chainTableBucket, broker, topic, chainID, version)
 	if err != nil {
 		log.Error("NewUploader error", "err", err)
 		return err
