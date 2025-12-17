@@ -13,7 +13,8 @@ ADD go.sum go.sum
 RUN go mod download
 ADD . .
 
-RUN make erigon
+RUN make erigon && \
+    find $(go env GOMODCACHE)/github.com/erigontech -name libsilkworm_capi.so -exec install {} /go/src/github.com/ledgerwatch/erigon/build/bin \;
 # RUN make db-tools
 
 
@@ -26,6 +27,11 @@ WORKDIR /app
 
 COPY --from=builder /go/src/github.com/ledgerwatch/erigon/build/bin /app/
 
+# Install libsilkworm_capi.so to system library path
+RUN if [ -f /app/libsilkworm_capi.so ]; then \
+        install -m a=r -v /app/libsilkworm_capi.so /lib/x86_64-linux-gnu/ && \
+        rm /app/libsilkworm_capi.so; \
+    fi
 
 EXPOSE 8545 \
        8551 \
