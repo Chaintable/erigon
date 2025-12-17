@@ -27,7 +27,6 @@ import (
 	"github.com/erigontech/erigon/common"
 	"github.com/erigontech/erigon/common/crypto"
 	"github.com/erigontech/erigon/polygon/heimdall/heimdalltest"
-	"github.com/stretchr/testify/require"
 )
 
 func TestCheckpointListResponse(t *testing.T) {

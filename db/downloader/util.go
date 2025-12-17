@@ -263,10 +263,6 @@ func AllTorrentPaths(dirs datadir.Dirs) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	l5, err := dir2.ListFiles(dirs.SnapCaplin, ".torrent")
-	if err != nil {
-		return nil, err
-	}
 	if dbg.DownloaderOnlyBlocks {
 		return files, nil
 	}
@@ -283,6 +279,10 @@ func AllTorrentPaths(dirs datadir.Dirs) ([]string, error) {
 		return nil, err
 	}
 	l4, err := dir2.ListFiles(dirs.SnapAccessors, ".torrent")
+	if err != nil {
+		return nil, err
+	}
+	l5, err := dir2.ListFiles(dirs.SnapCaplin, ".torrent")
 	if err != nil {
 		return nil, err
 	}
