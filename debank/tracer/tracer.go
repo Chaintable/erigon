@@ -289,12 +289,17 @@ func (t *callTracer) OnTxStart(vm *tracing.VMContext, txn types.Transaction, fro
 
 // OnTxEnd is called when transaction execution ends
 func (t *callTracer) OnTxEnd(receipt *types.Receipt, err error) {
-	// Process pending logs
-	if len(t.PendingLogs) > 0 {
-		for _, logg := range t.PendingLogs {
-			t.OnLog(logg)
+	setParentFailed(&t.callstack[0], false)
+	t.setStorageChange(&t.callstack[0])
+	if len(t.callstack) == 1 {
+		topCall := &t.callstack[0]
+		topCall.TraceID = util.ToHash([]string{t.txID, "", "0"})
+		if topCall.failed() {
+			t.BlockFile.ErrorTraces = append(t.BlockFile.ErrorTraces, t.ToTrace(topCall, []int64{}))
+		} else {
+			t.BlockFile.Traces = append(t.BlockFile.Traces, t.ToTrace(topCall, []int64{}))
 		}
-		t.PendingLogs = nil
+		t.addTraceAndLog(topCall, []int64{})
 	}
 }
 
@@ -311,6 +316,13 @@ func (t *callTracer) OnEnter(depth int, typ byte, from common.Address, to common
 		Value: value.ToBig(),
 	}
 	t.callstack = append(t.callstack, call)
+	// Process pending logs
+	if len(t.PendingLogs) > 0 {
+		for _, logg := range t.PendingLogs {
+			t.OnLog(logg)
+		}
+		t.PendingLogs = nil
+	}
 }
 
 // OnExit is called when exiting a call frame
@@ -374,21 +386,6 @@ func (t *callTracer) setStorageChange(cf *callFrame) {
 	}
 	if subCallStorageChange {
 		cf.StorageChange = true
-	}
-}
-
-func (t *callTracer) CaptureTxEnd(restGas uint64) {
-	setParentFailed(&t.callstack[0], false)
-	t.setStorageChange(&t.callstack[0])
-	if len(t.callstack) == 1 {
-		topCall := &t.callstack[0]
-		topCall.TraceID = util.ToHash([]string{t.txID, "", "0"})
-		if topCall.failed() {
-			t.BlockFile.ErrorTraces = append(t.BlockFile.ErrorTraces, t.ToTrace(topCall, []int64{}))
-		} else {
-			t.BlockFile.Traces = append(t.BlockFile.Traces, t.ToTrace(topCall, []int64{}))
-		}
-		t.addTraceAndLog(topCall, []int64{})
 	}
 }
 
