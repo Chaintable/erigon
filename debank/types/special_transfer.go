@@ -3,7 +3,7 @@ package types
 import (
 	"math/big"
 
-	"github.com/erigontech/erigon-lib/common/hexutil"
+	"github.com/erigontech/erigon/common/hexutil"
 )
 
 // id = to_hash(transfer['block_id'], transfer['to_addr'], transfer['pos'])

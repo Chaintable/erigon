@@ -19,16 +19,15 @@ package handler
 import (
 	"net/http"
 
-	"github.com/erigontech/erigon-lib/common"
-	libcommon "github.com/erigontech/erigon-lib/common"
 	"github.com/erigontech/erigon/cl/beacon/beaconhttp"
 	"github.com/erigontech/erigon/cl/utils"
+	"github.com/erigontech/erigon/common"
 )
 
 type genesisResponse struct {
-	GenesisTime          uint64           `json:"genesis_time,string"`
-	GenesisValidatorRoot common.Hash      `json:"genesis_validators_root"`
-	GenesisForkVersion   libcommon.Bytes4 `json:"genesis_fork_version"`
+	GenesisTime          uint64        `json:"genesis_time,string"`
+	GenesisValidatorRoot common.Hash   `json:"genesis_validators_root"`
+	GenesisForkVersion   common.Bytes4 `json:"genesis_fork_version"`
 }
 
 func (a *ApiHandler) GetEthV1BeaconGenesis(w http.ResponseWriter, r *http.Request) (*beaconhttp.BeaconResponse, error) {

@@ -22,9 +22,9 @@ import (
 	"io"
 	"net/http"
 
-	"github.com/erigontech/erigon/cl/phase1/core/state"
-
 	"github.com/erigontech/erigon/cl/clparams"
+	"github.com/erigontech/erigon/cl/phase1/core/state"
+	chainspec "github.com/erigontech/erigon/execution/chain/spec"
 )
 
 func downloadGenesisState(url string) ([]byte, error) {
@@ -59,32 +59,23 @@ func GetGenesisState(network clparams.NetworkType) (*state.CachingBeaconState, e
 	returnState := state.New(config)
 
 	switch network {
-	case clparams.MainnetNetwork:
+	case chainspec.MainnetChainID:
 		if err := returnState.DecodeSSZ(mainnetStateSSZ, int(clparams.Phase0Version)); err != nil {
 			return nil, err
 		}
-	case clparams.SepoliaNetwork:
+	case chainspec.SepoliaChainID:
 		if err := returnState.DecodeSSZ(sepoliaStateSSZ, int(clparams.Phase0Version)); err != nil {
 			return nil, err
 		}
-	case clparams.GnosisNetwork:
+	case chainspec.GnosisChainID:
 		if err := returnState.DecodeSSZ(gnosisStateSSZ, int(clparams.Phase0Version)); err != nil {
 			return nil, err
 		}
-	case clparams.ChiadoNetwork:
+	case chainspec.ChiadoChainID:
 		if err := returnState.DecodeSSZ(chiadoStateSSZ, int(clparams.Phase0Version)); err != nil {
 			return nil, err
 		}
-	case clparams.HoleskyNetwork:
-		// Download genesis state by wget the url
-		encodedState, err := downloadGenesisState("https://github.com/eth-clients/holesky/raw/main/metadata/genesis.ssz")
-		if err != nil {
-			return nil, err
-		}
-		if err := returnState.DecodeSSZ(encodedState, int(clparams.BellatrixVersion)); err != nil {
-			return nil, err
-		}
-	case clparams.HoodiNetwork:
+	case chainspec.HoodiChainID:
 		// Download genesis state by wget the url
 		encodedState, err := downloadGenesisState("https://github.com/eth-clients/hoodi/raw/main/metadata/genesis.ssz")
 		if err != nil {
@@ -100,5 +91,9 @@ func GetGenesisState(network clparams.NetworkType) (*state.CachingBeaconState, e
 }
 
 func IsGenesisStateSupported(network clparams.NetworkType) bool {
-	return network == clparams.MainnetNetwork || network == clparams.SepoliaNetwork || network == clparams.GnosisNetwork || network == clparams.ChiadoNetwork || network == clparams.HoleskyNetwork || network == clparams.HoodiNetwork
+	return network == chainspec.MainnetChainID ||
+		network == chainspec.SepoliaChainID ||
+		network == chainspec.GnosisChainID ||
+		network == chainspec.ChiadoChainID ||
+		network == chainspec.HoodiChainID
 }

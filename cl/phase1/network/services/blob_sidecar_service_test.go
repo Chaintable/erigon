@@ -24,8 +24,6 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.uber.org/mock/gomock"
 
-	"github.com/erigontech/erigon-lib/common"
-	libcommon "github.com/erigontech/erigon-lib/common"
 	"github.com/erigontech/erigon/cl/beacon/beaconevents"
 	"github.com/erigontech/erigon/cl/beacon/synced_data"
 	"github.com/erigontech/erigon/cl/clparams"
@@ -35,6 +33,7 @@ import (
 	"github.com/erigontech/erigon/cl/phase1/forkchoice/mock_services"
 	"github.com/erigontech/erigon/cl/utils"
 	"github.com/erigontech/erigon/cl/utils/eth_clock"
+	"github.com/erigontech/erigon/common"
 )
 
 //go:embed test_data/blob_sidecar_service_blob.ssz_snappy
@@ -53,7 +52,7 @@ func getObjectsForBlobSidecarServiceTests(t *testing.T) (*state.CachingBeaconSta
 	require.NoError(t, utils.DecodeSSZSnappy(stateObj, blobSidecarServiceState, int(clparams.DenebVersion)))
 	require.NoError(t, utils.DecodeSSZSnappy(block, blobSidecarServiceBlock, int(clparams.DenebVersion)))
 	require.NoError(t, utils.DecodeSSZSnappy(&blob, blobSidecarServiceBlob, int(clparams.DenebVersion)))
-	var proof libcommon.Bytes48
+	var proof common.Bytes48
 	proofStr := "0xb5a64254a75a8dd4e5fde529e2f657de268fcb9eedff43363c946f40bbf36ef16ee13a890504a7a8c4f689085146ad51"
 	proofBytes := common.Hex2Bytes(proofStr[2:])
 	copy(proof[:], proofBytes)
@@ -87,8 +86,7 @@ func TestBlobServiceUnsynced(t *testing.T) {
 
 	blobService, _, _, _ := setupBlobSidecarService(t, ctrl, true)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 	require.Error(t, blobService.ProcessMessage(ctx, nil, &cltypes.BlobSidecar{}))
 }
 
@@ -100,8 +98,7 @@ func TestBlobServiceInvalidIndex(t *testing.T) {
 	stateObj, _, _ := getObjectsForBlobSidecarServiceTests(t)
 	syncedData.OnHeadState(stateObj)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 	require.Error(t, blobService.ProcessMessage(ctx, nil, &cltypes.BlobSidecar{
 		Index: 99999,
 	}))
@@ -116,8 +113,7 @@ func TestBlobServiceInvalidSubnet(t *testing.T) {
 	syncedData.OnHeadState(stateObj)
 	sn := uint64(99999)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 	require.Error(t, blobService.ProcessMessage(ctx, &sn, &cltypes.BlobSidecar{
 		Index: 0,
 	}))
@@ -135,8 +131,7 @@ func TestBlobServiceBadTimings(t *testing.T) {
 	ethClock.EXPECT().GetCurrentSlot().Return(uint64(0)).AnyTimes()
 	ethClock.EXPECT().IsSlotCurrentSlotWithMaximumClockDisparity(gomock.Any()).Return(false).AnyTimes()
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 	require.Error(t, blobService.ProcessMessage(ctx, &sn, blobSidecar))
 }
 
@@ -156,8 +151,7 @@ func TestBlobServiceAlreadyHave(t *testing.T) {
 	ethClock.EXPECT().GetCurrentSlot().Return(uint64(0)).AnyTimes()
 	ethClock.EXPECT().IsSlotCurrentSlotWithMaximumClockDisparity(gomock.Any()).Return(true).AnyTimes()
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 	require.Error(t, blobService.ProcessMessage(ctx, &sn, blobSidecar))
 }
 
@@ -175,8 +169,7 @@ func TestBlobServiceDontHaveParentRoot(t *testing.T) {
 	ethClock.EXPECT().GetCurrentSlot().Return(uint64(0)).AnyTimes()
 	ethClock.EXPECT().IsSlotCurrentSlotWithMaximumClockDisparity(gomock.Any()).Return(true).AnyTimes()
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 	require.Error(t, blobService.ProcessMessage(ctx, &sn, blobSidecar))
 }
 
@@ -194,8 +187,7 @@ func TestBlobServiceInvalidSidecarSlot(t *testing.T) {
 	ethClock.EXPECT().GetCurrentSlot().Return(uint64(0)).AnyTimes()
 	ethClock.EXPECT().IsSlotCurrentSlotWithMaximumClockDisparity(gomock.Any()).Return(true).AnyTimes()
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 	require.Error(t, blobService.ProcessMessage(ctx, &sn, blobSidecar))
 }
 

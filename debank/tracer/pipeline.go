@@ -6,13 +6,12 @@ import (
 	"strings"
 	"time"
 
-	"github.com/erigontech/erigon-lib/chain"
-	"github.com/erigontech/erigon-lib/common"
-	"github.com/erigontech/erigon-lib/common/hexutil"
-	"github.com/erigontech/erigon-lib/common/hexutility"
-	"github.com/erigontech/erigon/core/types"
+	"github.com/erigontech/erigon/common"
+	"github.com/erigontech/erigon/common/hexutil"
 	dtypes "github.com/erigontech/erigon/debank/types"
 	"github.com/erigontech/erigon/debank/util"
+	"github.com/erigontech/erigon/execution/chain"
+	"github.com/erigontech/erigon/execution/types"
 	"github.com/holiman/uint256"
 )
 
@@ -63,7 +62,7 @@ func BuildPilelineBlockHeader(block *types.Block) *dtypes.Header {
 		StateRoot:        block.Root(),
 		Miner:            block.Coinbase(),
 		Difficulty:       (*hexutil.Big)(block.Difficulty()),
-		ExtraData:        hexutility.Bytes(block.Extra()),
+		ExtraData:        hexutil.Bytes(block.Extra()),
 		GasLimit:         hexutil.Uint64(block.GasLimit()),
 		GasUsed:          hexutil.Uint64(block.GasUsed()),
 		Timestamp:        hexutil.Uint64(block.Time()),
@@ -98,19 +97,19 @@ func BuildPipelineTransaction(tx types.Transaction, receipt *types.Receipt, from
 	}
 	gasPrice := big.NewInt(0)
 	if !chainConfig.IsLondon(header.Number.Uint64()) {
-		gasPrice = tx.GetPrice().ToBig()
+		gasPrice = tx.GetFeeCap().ToBig()
 	} else {
 		baseFee, _ := uint256.FromBig(header.BaseFee)
 		gasPrice = new(big.Int).Add(header.BaseFee, tx.GetEffectiveGasTip(baseFee).ToBig())
 	}
 	if gasPrice.Cmp(big.NewInt(0)) == 0 {
-		gasPrice = tx.GetPrice().ToBig()
+		gasPrice = tx.GetFeeCap().ToBig()
 	}
 	transaction := dtypes.Transaction{
 		ID:               tx.Hash().Hex(),
 		From:             strings.ToLower(from.Hex()),
 		To:               strings.ToLower(to.Hex()),
-		Gas:              big.NewInt(int64(tx.GetGas())),
+		Gas:              big.NewInt(int64(tx.GetGasLimit())),
 		GasPrice:         gasPrice,
 		GasUsed:          big.NewInt(int64(receipt.GasUsed)),
 		Status:           receipt.Status == types.ReceiptStatusSuccessful,
@@ -124,7 +123,7 @@ func BuildPipelineTransaction(tx types.Transaction, receipt *types.Receipt, from
 	switch tx.Type() {
 	case types.DynamicFeeTxType, types.BlobTxType, types.SetCodeTxType:
 		transaction.GasFeeCap = tx.GetFeeCap().ToBig()
-		transaction.GasTipCap = tx.GetTip().ToBig()
+		transaction.GasTipCap = tx.GetTipCap().ToBig()
 	}
 	return transaction
 }
@@ -139,7 +138,7 @@ func BuildBorPipelineTransaction(tx types.Transaction, receipt *types.Receipt, t
 		ID:               txHash.Hex(),
 		From:             strings.ToLower(common.Address{}.Hex()),
 		To:               strings.ToLower(to.Hex()),
-		Gas:              big.NewInt(int64(tx.GetGas())),
+		Gas:              big.NewInt(int64(tx.GetGasLimit())),
 		GasPrice:         txn.GasPrice.ToBig(),
 		GasUsed:          big.NewInt(int64(receipt.GasUsed)),
 		Status:           receipt.Status == types.ReceiptStatusSuccessful,

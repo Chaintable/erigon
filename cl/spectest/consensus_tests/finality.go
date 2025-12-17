@@ -21,11 +21,11 @@ import (
 	"io/fs"
 	"testing"
 
-	"github.com/erigontech/erigon/cl/transition/machine"
-	"github.com/erigontech/erigon/spectest"
-
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/erigontech/erigon/cl/spectest/spectest"
+	"github.com/erigontech/erigon/cl/transition/machine"
 )
 
 var FinalityFinality = spectest.HandlerFunc(func(t *testing.T, root fs.FS, c spectest.TestCase) (err error) {
@@ -47,12 +47,12 @@ var FinalityFinality = spectest.HandlerFunc(func(t *testing.T, root fs.FS, c spe
 		}
 	}
 	expectedRoot, err := testState.HashSSZ()
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	haveRoot, err := expectedState.HashSSZ()
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
-	assert.EqualValues(t, haveRoot, expectedRoot, "state root")
+	assert.EqualValues(t, expectedRoot, haveRoot, "state root")
 
 	return nil
 })

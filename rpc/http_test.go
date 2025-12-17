@@ -25,7 +25,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/erigontech/erigon-lib/log/v3"
+	"github.com/erigontech/erigon/common/log/v3"
 )
 
 func confirmStatusCode(t *testing.T, got, want int) {
@@ -107,6 +107,10 @@ func TestHTTPResponseWithEmptyGet(t *testing.T) {
 
 // This checks that maxRequestContentLength is not applied to the response of a request.
 func TestHTTPRespBodyUnlimited(t *testing.T) {
+	if testing.Short() {
+		t.Skip()
+	}
+
 	logger := log.New()
 	const respLength = maxRequestContentLength * 3
 

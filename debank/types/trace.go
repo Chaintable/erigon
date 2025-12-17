@@ -3,20 +3,19 @@ package types
 import (
 	"math/big"
 
-	"github.com/erigontech/erigon-lib/common/hexutil"
-	"github.com/erigontech/erigon-lib/common/hexutility"
+	"github.com/erigontech/erigon/common/hexutil"
 )
 
 // id = to_hash(trace['tx_id'], trace['parent_trace_id'], trace['pos_in_parent_trace'])
 type Trace struct {
-	ID                string           `json:"id"`
-	From              string           `json:"from_addr"`
-	Gas               *big.Int         `json:"gas_limit"`
-	Input             hexutility.Bytes `json:"input"`
-	To                string           `json:"to_addr"`
-	Value             *hexutil.Big     `json:"value"`
-	GasUsed           *big.Int         `json:"gas_used"`
-	Output            hexutility.Bytes `json:"output"`
+	ID                string        `json:"id"`
+	From              string        `json:"from_addr"`
+	Gas               *big.Int      `json:"gas_limit"`
+	Input             hexutil.Bytes `json:"input"`
+	To                string        `json:"to_addr"`
+	Value             *hexutil.Big  `json:"value"`
+	GasUsed           *big.Int      `json:"gas_used"`
+	Output            hexutil.Bytes `json:"output"`
 	CallCreateType    string           `json:"type"` // ['create', 'suicide', 'call', 'empty']
 	CallType          string           `json:"call_type"`
 	TxID              string           `json:"tx_id"`

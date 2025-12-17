@@ -20,18 +20,20 @@ import (
 	"context"
 	"testing"
 
-	libcommon "github.com/erigontech/erigon-lib/common"
-	"github.com/erigontech/erigon-lib/kv"
-	"github.com/erigontech/erigon-lib/kv/memdb"
+	"github.com/spf13/afero"
+	"github.com/stretchr/testify/require"
+
 	"github.com/erigontech/erigon/cl/clparams"
 	"github.com/erigontech/erigon/cl/cltypes"
 	"github.com/erigontech/erigon/cl/cltypes/solid"
-	"github.com/spf13/afero"
-	"github.com/stretchr/testify/require"
+	"github.com/erigontech/erigon/common"
+	"github.com/erigontech/erigon/db/kv"
+	"github.com/erigontech/erigon/db/kv/dbcfg"
+	"github.com/erigontech/erigon/db/kv/memdb"
 )
 
 func setupTestDB(t *testing.T) kv.RwDB {
-	db := memdb.NewTestDB(t, kv.ChainDB)
+	db := memdb.NewTestDB(t, dbcfg.ChainDB)
 	return db
 }
 
@@ -39,12 +41,12 @@ func TestBlobDB(t *testing.T) {
 	db := setupTestDB(t)
 	defer db.Close()
 
-	s1 := cltypes.NewBlobSidecar(0, &cltypes.Blob{1}, libcommon.Bytes48{2}, libcommon.Bytes48{3}, &cltypes.SignedBeaconBlockHeader{Header: &cltypes.BeaconBlockHeader{Slot: 1}}, solid.NewHashVector(cltypes.CommitmentBranchSize))
-	s2 := cltypes.NewBlobSidecar(1, &cltypes.Blob{3}, libcommon.Bytes48{5}, libcommon.Bytes48{9}, &cltypes.SignedBeaconBlockHeader{Header: &cltypes.BeaconBlockHeader{Slot: 1}}, solid.NewHashVector(cltypes.CommitmentBranchSize))
+	s1 := cltypes.NewBlobSidecar(0, &cltypes.Blob{1}, common.Bytes48{2}, common.Bytes48{3}, &cltypes.SignedBeaconBlockHeader{Header: &cltypes.BeaconBlockHeader{Slot: 1}}, solid.NewHashVector(cltypes.CommitmentBranchSize))
+	s2 := cltypes.NewBlobSidecar(1, &cltypes.Blob{3}, common.Bytes48{5}, common.Bytes48{9}, &cltypes.SignedBeaconBlockHeader{Header: &cltypes.BeaconBlockHeader{Slot: 1}}, solid.NewHashVector(cltypes.CommitmentBranchSize))
 
 	//
 	bs := NewBlobStore(db, afero.NewMemMapFs(), 12, &clparams.MainnetBeaconConfig, nil)
-	blockRoot := libcommon.Hash{1}
+	blockRoot := common.Hash{1}
 	err := bs.WriteBlobSidecars(context.Background(), blockRoot, []*cltypes.BlobSidecar{s1, s2})
 	require.NoError(t, err)
 

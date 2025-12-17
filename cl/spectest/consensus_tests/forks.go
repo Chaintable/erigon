@@ -22,11 +22,11 @@ import (
 	"os"
 	"testing"
 
-	"github.com/erigontech/erigon/spectest"
-
-	"github.com/erigontech/erigon/cl/clparams"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/erigontech/erigon/cl/clparams"
+	"github.com/erigontech/erigon/cl/spectest/spectest"
 )
 
 var ForksFork = spectest.HandlerFunc(func(t *testing.T, root fs.FS, c spectest.TestCase) (err error) {
@@ -50,6 +50,8 @@ var ForksFork = spectest.HandlerFunc(func(t *testing.T, root fs.FS, c spectest.T
 		err = preState.UpgradeToDeneb()
 	case clparams.DenebVersion:
 		err = preState.UpgradeToElectra()
+	case clparams.ElectraVersion:
+		err = preState.UpgradeToFulu()
 	default:
 		err = spectest.ErrHandlerNotImplemented(fmt.Sprintf("block state %v", preState.Version()))
 	}
@@ -58,11 +60,11 @@ var ForksFork = spectest.HandlerFunc(func(t *testing.T, root fs.FS, c spectest.T
 	}
 
 	haveRoot, err := preState.HashSSZ()
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	expectedRoot, err := postState.HashSSZ()
-	assert.NoError(t, err)
-	assert.EqualValues(t, haveRoot, expectedRoot, "state root")
+	require.NoError(t, err)
+	assert.EqualValues(t, expectedRoot, haveRoot, "state root")
 
 	return nil
 })

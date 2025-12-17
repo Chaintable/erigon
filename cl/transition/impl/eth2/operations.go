@@ -28,13 +28,13 @@ import (
 
 	"github.com/erigontech/erigon/cl/transition/impl/eth2/statechange"
 
-	"github.com/erigontech/erigon-lib/common"
 	"github.com/erigontech/erigon/cl/cltypes/solid"
 	"github.com/erigontech/erigon/cl/phase1/core/state"
+	"github.com/erigontech/erigon/common"
 
-	"github.com/Giulio2002/bls"
+	"github.com/erigontech/erigon/cl/utils/bls"
 
-	"github.com/erigontech/erigon-lib/log/v3"
+	"github.com/erigontech/erigon/common/log/v3"
 
 	"github.com/erigontech/erigon/cl/clparams"
 	"github.com/erigontech/erigon/cl/cltypes"
@@ -234,7 +234,7 @@ func getPendingBalanceToWithdraw(s abstract.BeaconState, validatorIndex uint64) 
 	ws := s.GetPendingPartialWithdrawals()
 	balance := uint64(0)
 	ws.Range(func(index int, withdrawal *solid.PendingPartialWithdrawal, length int) bool {
-		if withdrawal.Index == validatorIndex {
+		if withdrawal.ValidatorIndex == validatorIndex {
 			balance += withdrawal.Amount
 		}
 		return true
@@ -389,9 +389,17 @@ func (I *impl) ProcessExecutionPayload(s abstract.BeaconState, body cltypes.Gene
 	}
 
 	// Verify commitments are under limit
-	// assert len(body.blob_kzg_commitments) <= MAX_BLOBS_PER_BLOCK
-	if body.GetBlobKzgCommitments().Len() > int(s.BeaconConfig().MaxBlobsPerBlockByVersion(s.Version())) {
-		return errors.New("ProcessExecutionPayload: too many blob commitments")
+	if s.Version() >= clparams.FuluVersion {
+		// Fulu:EIP7892
+		blobParameters := s.BeaconConfig().GetBlobParameters(state.Epoch(s))
+		if body.GetBlobKzgCommitments().Len() > int(blobParameters.MaxBlobsPerBlock) {
+			return errors.New("ProcessExecutionPayload: too many blob commitments")
+		}
+	} else {
+		// assert len(body.blob_kzg_commitments) <= MAX_BLOBS_PER_BLOCK
+		if body.GetBlobKzgCommitments().Len() > int(s.BeaconConfig().MaxBlobsPerBlockByVersion(s.Version())) {
+			return errors.New("ProcessExecutionPayload: too many blob commitments")
+		}
 	}
 
 	s.SetLatestExecutionPayloadHeader(payloadHeader)
@@ -1044,6 +1052,12 @@ func (I *impl) ProcessSlots(s abstract.BeaconState, slot uint64) error {
 				return err
 			}
 		}
+
+		if state.Epoch(s) == beaconConfig.FuluForkEpoch {
+			if err := s.UpgradeToFulu(); err != nil {
+				return err
+			}
+		}
 	}
 	return nil
 }
@@ -1127,7 +1141,7 @@ func (I *impl) ProcessWithdrawalRequest(s abstract.BeaconState, req *solid.Withd
 		exitQueueEpoch := s.ComputeExitEpochAndUpdateChurn(toWithdraw)
 		withdrawableEpoch := exitQueueEpoch + s.BeaconConfig().MinValidatorWithdrawabilityDelay
 		s.AppendPendingPartialWithdrawal(&solid.PendingPartialWithdrawal{
-			Index:             vindex,
+			ValidatorIndex:    vindex,
 			Amount:            toWithdraw,
 			WithdrawableEpoch: withdrawableEpoch,
 		})
@@ -1140,7 +1154,7 @@ func (I *impl) ProcessConsolidationRequest(s abstract.BeaconState, consolidation
 		// source index
 		sourceIndex, exist := s.ValidatorIndexByPubkey(consolidationRequest.SourcePubKey)
 		if !exist {
-			log.Warn("Validator index not found for source pubkey", "pubkey", consolidationRequest.SourcePubKey)
+			log.Debug("Validator index not found for source pubkey", "pubkey", consolidationRequest.SourcePubKey)
 			return nil
 		}
 		if err := switchToCompoundingValidator(s, sourceIndex); err != nil {
@@ -1163,12 +1177,12 @@ func (I *impl) ProcessConsolidationRequest(s abstract.BeaconState, consolidation
 	// source/target index and validator
 	sourceIndex, exist := s.ValidatorIndexByPubkey(consolidationRequest.SourcePubKey)
 	if !exist {
-		log.Warn("Validator index not found for source pubkey", "pubkey", consolidationRequest.SourcePubKey)
+		log.Debug("Validator index not found for source pubkey", "pubkey", consolidationRequest.SourcePubKey)
 		return nil
 	}
 	targetIndex, exist := s.ValidatorIndexByPubkey(consolidationRequest.TargetPubKey)
 	if !exist {
-		log.Warn("Validator index not found for target pubkey", "pubkey", consolidationRequest.TargetPubKey)
+		log.Debug("Validator index not found for target pubkey", "pubkey", consolidationRequest.TargetPubKey)
 		return nil
 	}
 	sourceValidator, err := s.ValidatorForValidatorIndex(int(sourceIndex))

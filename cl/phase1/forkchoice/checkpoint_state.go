@@ -26,8 +26,7 @@ import (
 	"github.com/erigontech/erigon/cl/monitor/shuffling_metrics"
 	"github.com/erigontech/erigon/cl/phase1/core/state/shuffling"
 	"github.com/erigontech/erigon/cl/phase1/forkchoice/public_keys_registry"
-
-	libcommon "github.com/erigontech/erigon-lib/common"
+	"github.com/erigontech/erigon/common"
 
 	"github.com/erigontech/erigon/cl/clparams"
 	"github.com/erigontech/erigon/cl/cltypes"
@@ -51,7 +50,7 @@ type checkpointState struct {
 
 	validatorSetSize int
 	// fork data
-	genesisValidatorsRoot libcommon.Hash
+	genesisValidatorsRoot common.Hash
 	fork                  *cltypes.Fork
 	activeBalance, epoch  uint64 // current active balance and epoch
 	checkpoint            solid.Checkpoint
@@ -74,7 +73,7 @@ func readFromBitset(bitset []byte, i int) bool {
 }
 
 func newCheckpointState(beaconConfig *clparams.BeaconChainConfig, publicKeysRegistry public_keys_registry.PublicKeyRegistry, validatorSet []solid.Validator, randaoMixes solid.HashVectorSSZ,
-	genesisValidatorsRoot libcommon.Hash, fork *cltypes.Fork, activeBalance, epoch uint64, checkpoint solid.Checkpoint) *checkpointState {
+	genesisValidatorsRoot common.Hash, fork *cltypes.Fork, activeBalance, epoch uint64, checkpoint solid.Checkpoint) *checkpointState {
 	balances := make([]uint64, len(validatorSet))
 
 	bitsetSize := (len(validatorSet) + 7) / 8
@@ -166,10 +165,7 @@ func (c *checkpointState) getActiveIndicies(epoch uint64) (activeIndicies []uint
 
 // committeeCount retrieves size of sync committee
 func (c *checkpointState) committeeCount(epoch, lenIndicies uint64) uint64 {
-	committeCount := lenIndicies / c.beaconConfig.SlotsPerEpoch / c.beaconConfig.TargetCommitteeSize
-	if c.beaconConfig.MaxCommitteesPerSlot < committeCount {
-		committeCount = c.beaconConfig.MaxCommitteesPerSlot
-	}
+	committeCount := min(c.beaconConfig.MaxCommitteesPerSlot, lenIndicies/c.beaconConfig.SlotsPerEpoch/c.beaconConfig.TargetCommitteeSize)
 	if committeCount < 1 {
 		committeCount = 1
 	}

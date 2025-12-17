@@ -25,7 +25,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"sort"
+	"slices"
 	"strings"
 	"sync"
 )
@@ -291,10 +291,7 @@ func (s *DistinctNetSet) key(ip net.IP) net.IP {
 	if ip4 := ip.To4(); ip4 != nil {
 		typ, ip = '4', ip4
 	}
-	bits := s.Subnet
-	if bits > uint(len(ip)*8) {
-		bits = uint(len(ip) * 8)
-	}
+	bits := min(s.Subnet, uint(len(ip)*8))
 	// Encode the prefix into s.buf.
 	nb := int(bits / 8)
 	mask := ^byte(0xFF >> (bits % 8))
@@ -318,7 +315,7 @@ func (s DistinctNetSet) String() string {
 		keys = append(keys, k.(string))
 		return true
 	})
-	sort.Strings(keys)
+	slices.Sort(keys)
 	for i, k := range keys {
 		var ip net.IP
 		if k[0] == '4' {

@@ -8,7 +8,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
-	"github.com/erigontech/erigon-lib/log/v3"
+	"github.com/erigontech/erigon/common/log/v3"
 	dtypes "github.com/erigontech/erigon/debank/types"
 	"github.com/segmentio/kafka-go"
 )
@@ -40,6 +40,7 @@ type Uploader struct {
 	nodexBucket     string
 	outerBucket     string
 	chainID         string
+	version         string
 }
 
 func GetLastBlockNotice(reader *kafka.Reader) (*dtypes.BlockChangeNotification, error) {
@@ -75,7 +76,7 @@ func GetLastBlockNotice(reader *kafka.Reader) (*dtypes.BlockChangeNotification, 
 	return blockNotice, nil
 }
 
-func NewUploader(region string, nodeXBucket, chainTableBucket string, broker string, topic string, chainID string) (*Uploader, error) {
+func NewUploader(region string, nodeXBucket, chainTableBucket string, broker string, topic string, chainID string, version string) (*Uploader, error) {
 	client, err := NewS3Client(region)
 	if err != nil {
 		return nil, err
@@ -105,6 +106,7 @@ func NewUploader(region string, nodeXBucket, chainTableBucket string, broker str
 		KafkaWriter:     writer,
 		LastBlockNotice: LastBlockNotice,
 		chainID:         chainID,
+		version:         version,
 	}
 	return uploader, nil
 }
@@ -237,14 +239,22 @@ func (u *Uploader) PushDebankOutPut(ctx context.Context, out *dtypes.DebankOutPu
 
 }
 
-// s3key: chain_id/block_id
+// s3key: chain_id/block_id (version为空时)
+//
+//	chain_id/version/block_id (version不为空时)
+//
 // 外部s3
 func (u *Uploader) uploadBlockFile(blockFile *dtypes.BlockFile) error {
 	data, err := EncodeToJsonGzip(blockFile)
 	if err != nil {
 		return err
 	}
-	key := fmt.Sprintf("%s/%s", u.chainID, blockFile.Block.ID)
+	var key string
+	if u.version == "" {
+		key = fmt.Sprintf("%s/%s", u.chainID, blockFile.Block.ID)
+	} else {
+		key = fmt.Sprintf("%s/%s/%s", u.chainID, u.version, blockFile.Block.ID)
+	}
 	_, err = u.client.PutObject(context.TODO(), &s3.PutObjectInput{
 		Bucket: &u.outerBucket,
 		Key:    &key,
@@ -253,14 +263,22 @@ func (u *Uploader) uploadBlockFile(blockFile *dtypes.BlockFile) error {
 	return err
 }
 
-// s3key: chain_id/block_height/block_id
+// s3key: chain_id/block_height/block_id (version为空时)
+//
+//	chain_id/version/block_height/block_id (version不为空时)
+//
 // 外部s3,empty object,只用key
 func (u *Uploader) uploadFileValidation(chainID string, blockFile *dtypes.BlockFile) error {
 	data, err := EncodeToJsonGzip(blockFile.Validation())
 	if err != nil {
 		return err
 	}
-	key := fmt.Sprintf("%s/%d/%s", chainID, blockFile.Block.Height, blockFile.Block.ID)
+	var key string
+	if u.version == "" {
+		key = fmt.Sprintf("%s/%d/%s", chainID, blockFile.Block.Height, blockFile.Block.ID)
+	} else {
+		key = fmt.Sprintf("%s/%s/%d/%s", chainID, u.version, blockFile.Block.Height, blockFile.Block.ID)
+	}
 	_, err = u.client.PutObject(context.TODO(), &s3.PutObjectInput{
 		Bucket: &u.outerBucket,
 		Key:    &key,
@@ -269,14 +287,22 @@ func (u *Uploader) uploadFileValidation(chainID string, blockFile *dtypes.BlockF
 	return err
 }
 
-// s3Key: <chainID>/<blockHash>/header
+// s3Key: <chainID>/<blockHash>/block (version为空时)
+//
+//	<chainID>/<version>/<blockHash>/block (version不为空时)
+//
 // 内部s3
 func (u *Uploader) uploadHeader(chainID string, header *dtypes.Header) error {
 	data, err := EncodeToJsonGzip(header)
 	if err != nil {
 		return err
 	}
-	key := fmt.Sprintf("%s/%s/block", chainID, header.Hash.String())
+	var key string
+	if u.version == "" {
+		key = fmt.Sprintf("%s/%s/block", chainID, header.Hash.String())
+	} else {
+		key = fmt.Sprintf("%s/%s/%s/block", chainID, u.version, header.Hash.String())
+	}
 	_, err = u.client.PutObject(context.TODO(), &s3.PutObjectInput{
 		Bucket: &u.nodexBucket,
 		Key:    &key,
@@ -285,14 +311,22 @@ func (u *Uploader) uploadHeader(chainID string, header *dtypes.Header) error {
 	return err
 }
 
-// s3Key: <chainID>/<blockHash>/stateDiff
+// s3Key: <chainID>/<blockRoot>/stateDiff (version为空时)
+//
+//	<chainID>/<version>/<blockRoot>/stateDiff (version不为空时)
+//
 // 内部s3
 func (u *Uploader) uploadStateDiff(chainID string, stateDiff *dtypes.BlockStorageDiff) error {
 	data, err := EncodeToRlp(stateDiff)
 	if err != nil {
 		return err
 	}
-	key := fmt.Sprintf("%s/%s/stateDiff", chainID, stateDiff.Hash.Hex())
+	var key string
+	if u.version == "" {
+		key = fmt.Sprintf("%s/%s/stateDiff", chainID, stateDiff.Hash.Hex())
+	} else {
+		key = fmt.Sprintf("%s/%s/%s/stateDiff", chainID, u.version, stateDiff.Hash.Hex())
+	}
 	_, err = u.client.PutObject(context.TODO(), &s3.PutObjectInput{
 		Bucket: &u.nodexBucket,
 		Key:    &key,

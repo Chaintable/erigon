@@ -28,9 +28,9 @@ import (
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
 	"github.com/libp2p/go-libp2p/core/peer"
 
-	"github.com/erigontech/erigon-lib/common"
-	"github.com/erigontech/erigon-lib/log/v3"
 	"github.com/erigontech/erigon/cl/gossip"
+	"github.com/erigontech/erigon/common"
+	"github.com/erigontech/erigon/common/log/v3"
 )
 
 const (
@@ -573,7 +573,7 @@ func (sub *GossipSubscription) checkIfTopicNeedsToEnabledOrDisabled() {
 		go sub.run(sctx, sub.sub, sub.sub.Topic())
 		sub.subscribed.Store(true)
 		sub.s.updateENROnSubscription(sub.sub.Topic(), true)
-		log.Info("[Gossip] Subscribed to topic", "topic", sub.sub.Topic())
+		log.Debug("[Gossip] Subscribed to topic", "topic", sub.sub.Topic())
 	}
 
 }

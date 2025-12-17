@@ -17,20 +17,20 @@
 package statefull
 
 import (
-	libcommon "github.com/erigontech/erigon-lib/common"
-	"github.com/erigontech/erigon/consensus"
-	"github.com/erigontech/erigon/core/types"
+	"github.com/erigontech/erigon/common"
+	"github.com/erigontech/erigon/execution/protocol/rules"
+	"github.com/erigontech/erigon/execution/types"
 )
 
 type ChainContext struct {
-	Chain consensus.ChainReader
-	Bor   consensus.Engine
+	Chain rules.ChainReader
+	Bor   rules.Engine
 }
 
-func (c ChainContext) Engine() consensus.Engine {
+func (c ChainContext) Engine() rules.Engine {
 	return c.Bor
 }
 
-func (c ChainContext) GetHeader(hash libcommon.Hash, number uint64) *types.Header {
+func (c ChainContext) GetHeader(hash common.Hash, number uint64) *types.Header {
 	return c.Chain.GetHeader(hash, number)
 }

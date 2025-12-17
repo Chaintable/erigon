@@ -24,17 +24,12 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Giulio2002/bls"
-
-	sentinel "github.com/erigontech/erigon-lib/gointerfaces/sentinelproto"
-	"github.com/erigontech/erigon-lib/log/v3"
-
-	libcommon "github.com/erigontech/erigon-lib/common"
 	"github.com/erigontech/erigon/cl/beacon/synced_data"
 	"github.com/erigontech/erigon/cl/clparams"
 	"github.com/erigontech/erigon/cl/cltypes"
 	"github.com/erigontech/erigon/cl/cltypes/solid"
 	"github.com/erigontech/erigon/cl/fork"
+	"github.com/erigontech/erigon/cl/gossip"
 	"github.com/erigontech/erigon/cl/merkle_tree"
 	"github.com/erigontech/erigon/cl/monitor"
 	"github.com/erigontech/erigon/cl/phase1/core/state"
@@ -42,16 +37,20 @@ import (
 	"github.com/erigontech/erigon/cl/phase1/forkchoice"
 	"github.com/erigontech/erigon/cl/pool"
 	"github.com/erigontech/erigon/cl/utils"
+	"github.com/erigontech/erigon/cl/utils/bls"
+	"github.com/erigontech/erigon/common"
+	"github.com/erigontech/erigon/common/log/v3"
+	"github.com/erigontech/erigon/node/gointerfaces/sentinelproto"
 )
 
 // SignedAggregateAndProofData is passed to SignedAggregateAndProof service. The service does the signature verification
 // asynchronously. That's why we cannot wait for its ProcessMessage call to finish to check error. The service
 // will do re-publishing of the gossip or banning the peer in case of invalid signature by itself.
-// that's why we are passing sentinel.SentinelClient and *sentinel.GossipData to enable the service
+// that's why we are passing sentinelproto.SentinelClient and *sentinelproto.GossipData to enable the service
 // to do all of that by itself.
 type SignedAggregateAndProofForGossip struct {
 	SignedAggregateAndProof *cltypes.SignedAggregateAndProof
-	Receiver                *sentinel.Peer
+	Receiver                *sentinelproto.Peer
 	ImmediateProcess        bool
 }
 
@@ -104,6 +103,21 @@ func NewAggregateAndProofService(
 	}
 	go a.loop(ctx)
 	return a
+}
+
+func (a *aggregateAndProofServiceImpl) IsMyGossipMessage(name string) bool {
+	return name == gossip.TopicNameBeaconAggregateAndProof
+}
+
+func (a *aggregateAndProofServiceImpl) DecodeGossipMessage(data *sentinelproto.GossipData, version clparams.StateVersion) (*SignedAggregateAndProofForGossip, error) {
+	obj := &SignedAggregateAndProofForGossip{
+		Receiver:                copyOfPeerData(data),
+		SignedAggregateAndProof: &cltypes.SignedAggregateAndProof{},
+	}
+	if err := obj.SignedAggregateAndProof.DecodeSSZ(data.Data, int(version)); err != nil {
+		return nil, err
+	}
+	return obj, nil
 }
 
 func (a *aggregateAndProofServiceImpl) ProcessMessage(
@@ -349,7 +363,7 @@ func AggregateMessageSignature(
 			return err
 		}
 		pk := val.PublicKeyBytes()
-		pks = append(pks, libcommon.CopyBytes(pk))
+		pks = append(pks, common.CopyBytes(pk))
 		return nil
 	}); err != nil {
 		return nil, nil, nil, err

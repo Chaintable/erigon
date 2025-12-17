@@ -20,20 +20,21 @@ import (
 	"context"
 	"testing"
 
-	"github.com/erigontech/erigon-lib/common"
-	libcommon "github.com/erigontech/erigon-lib/common"
-	"github.com/erigontech/erigon-lib/kv"
-	"github.com/erigontech/erigon-lib/kv/memdb"
+	"github.com/stretchr/testify/require"
+
 	"github.com/erigontech/erigon/cl/antiquary/tests"
 	"github.com/erigontech/erigon/cl/clparams"
 	"github.com/erigontech/erigon/cl/cltypes"
 	"github.com/erigontech/erigon/cl/persistence/beacon_indicies"
-	"github.com/erigontech/erigon/turbo/snapshotsync/freezeblocks"
-	"github.com/stretchr/testify/require"
+	"github.com/erigontech/erigon/common"
+	"github.com/erigontech/erigon/db/kv"
+	"github.com/erigontech/erigon/db/kv/dbcfg"
+	"github.com/erigontech/erigon/db/kv/memdb"
+	"github.com/erigontech/erigon/db/snapshotsync/freezeblocks"
 )
 
 func setupStore(t *testing.T) (freezeblocks.BeaconSnapshotReader, kv.RwDB) {
-	db := memdb.NewTestDB(t, kv.ChainDB)
+	db := memdb.NewTestDB(t, dbcfg.ChainDB)
 	return tests.NewMockBlockReader(), db
 }
 
@@ -44,7 +45,7 @@ func populateDatabaseWithBlocks(t *testing.T, store *tests.MockBlockReader, tx k
 		slot := startSlot + i
 		block := cltypes.NewSignedBeaconBlock(&clparams.MainnetBeaconConfig, clparams.Phase0Version)
 		block.Block.Slot = slot
-		block.Block.StateRoot = libcommon.Hash{byte(i)}
+		block.Block.StateRoot = common.Hash{byte(i)}
 		block.Block.ParentRoot = mockParentRoot
 		block.EncodingSizeSSZ()
 		bodyRoot, _ := block.Block.Body.HashSSZ()

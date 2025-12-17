@@ -27,17 +27,18 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"os"
 	"sync"
 	"time"
 
 	"github.com/c2h5oh/datasize"
 	mdbx1 "github.com/erigontech/mdbx-go/mdbx"
 
-	"github.com/erigontech/erigon-lib/kv"
-	"github.com/erigontech/erigon-lib/kv/mdbx"
-	"github.com/erigontech/erigon-lib/log/v3"
-	"github.com/erigontech/erigon-lib/rlp"
+	"github.com/erigontech/erigon/common/dir"
+	"github.com/erigontech/erigon/common/log/v3"
+	"github.com/erigontech/erigon/db/kv"
+	"github.com/erigontech/erigon/db/kv/dbcfg"
+	"github.com/erigontech/erigon/db/kv/mdbx"
+	"github.com/erigontech/erigon/execution/rlp"
 )
 
 // Keys in the node database.
@@ -60,11 +61,13 @@ const (
 	// Use localItemKey to create those keys.
 	dbLocalSeq = "seq"
 )
-
 const (
 	dbNodeExpiration = 24 * time.Hour // Time after which an unseen node should be dropped.
 	dbCleanupCycle   = time.Hour      // Time period for running the expiration task.
 	dbVersion        = 10
+
+	dbSyncBytesThreshold = 5 * datasize.MB // see BenchmarkNodeDBGeometry
+	dbSyncPeriod         = 2 * time.Second // see BenchmarkNodeDBGeometry
 )
 
 var (
@@ -101,9 +104,10 @@ func bucketsConfig(_ kv.TableCfg) kv.TableCfg {
 
 // newMemoryDB creates a new in-memory node database without a persistent backend.
 func newMemoryDB(ctx context.Context, logger log.Logger, tmpDir string) (*DB, error) {
-	db, err := mdbx.New(kv.SentryDB, logger).
-		InMem(tmpDir).
+	db, err := mdbx.New(dbcfg.SentryDB, logger).
+		InMem(nil, tmpDir).
 		WithTableCfg(bucketsConfig).
+		PageSize(4 * datasize.KB).
 		MapSize(1 * datasize.GB).
 		Open(ctx)
 	if err != nil {
@@ -119,14 +123,18 @@ func newMemoryDB(ctx context.Context, logger log.Logger, tmpDir string) (*DB, er
 // newPersistentDB creates/opens a persistent node database,
 // also flushing its contents in case of a version mismatch.
 func newPersistentDB(ctx context.Context, logger log.Logger, path string) (*DB, error) {
-	db, err := mdbx.New(kv.SentryDB, logger).
+	// see `BenchmarkNodeDBGeometry`
+	db, err := mdbx.New(dbcfg.SentryDB, logger).
 		Path(path).
 		WithTableCfg(bucketsConfig).
+		PageSize(4 * datasize.KB).
 		MapSize(8 * datasize.GB).
-		GrowthStep(16 * datasize.MB).
-		Flags(func(f uint) uint { return f ^ mdbx1.Durable | mdbx1.SafeNoSync }).
-		SyncPeriod(2 * time.Second).
-		DirtySpace(uint64(64 * datasize.MB)).
+		GrowthStep(2 * datasize.MB).
+		Flags(func(f uint) uint { return f&^mdbx1.Durable | mdbx1.SafeNoSync | mdbx1.WriteMap }).
+		SyncBytes(dbSyncBytesThreshold).
+		SyncPeriod(dbSyncPeriod).
+		DirtySpace(uint64(32 * datasize.MB)).
+		// WithMetrics().
 		Open(ctx)
 	if err != nil {
 		return nil, err
@@ -161,7 +169,7 @@ func newPersistentDB(ctx context.Context, logger log.Logger, path string) (*DB, 
 
 	if blob != nil && !bytes.Equal(blob, currentVer) {
 		db.Close()
-		if err := os.RemoveAll(path); err != nil {
+		if err := dir.RemoveAll(path); err != nil {
 			return nil, err
 		}
 		return newPersistentDB(ctx, logger, path)
@@ -262,7 +270,7 @@ func (db *DB) fetchInt64(key []byte) int64 {
 func (db *DB) storeInt64(key []byte, n int64) error {
 	blob := make([]byte, binary.MaxVarintLen64)
 	blob = blob[:binary.PutVarint(blob, n)]
-	return db.kv.Batch(func(tx kv.RwTx) error {
+	return db.kv.Update(db.ctx, func(tx kv.RwTx) error {
 		return tx.Put(kv.Inodes, key, blob)
 	})
 }
@@ -287,7 +295,7 @@ func (db *DB) fetchUint64(key []byte) uint64 {
 
 // storeUint64 stores an integer in the given key.
 func (db *DB) storeUint64(key []byte, n uint64) error {
-	return db.kv.Batch(func(tx kv.RwTx) error {
+	return db.kv.Update(db.ctx, func(tx kv.RwTx) error {
 		return db._storeUint64(tx, key, n)
 	})
 }
@@ -338,7 +346,7 @@ func (db *DB) UpdateNode(node *Node) error {
 	if err != nil {
 		return err
 	}
-	return db.kv.Batch(func(tx kv.RwTx) error {
+	return db.kv.Update(db.ctx, func(tx kv.RwTx) error {
 		err = tx.Put(kv.NodeRecords, nodeKey(node.ID()), blob)
 		if err != nil {
 			return err
@@ -367,7 +375,7 @@ func (db *DB) DeleteNode(id ID) {
 }
 
 func (db *DB) deleteRange(prefix []byte) {
-	if err := db.kv.Batch(func(tx kv.RwTx) error {
+	if err := db.kv.Update(db.ctx, func(tx kv.RwTx) error {
 		for bucket := range bucketsConfig(nil) {
 			if err := deleteRangeInBucket(tx, prefix, bucket); err != nil {
 				return err
@@ -615,7 +623,7 @@ func (db *DB) QuerySeeds(n int, maxAge time.Duration) []*Node {
 			nodes = append(nodes, n)
 		}
 		return nil
-	}); err != nil {
+	}); err != nil && !errors.Is(err, context.Canceled) {
 		log.Warn("nodeDB.QuerySeeds failed", "err", err)
 	}
 	return nodes

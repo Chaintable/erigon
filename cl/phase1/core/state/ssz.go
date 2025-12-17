@@ -17,8 +17,8 @@
 package state
 
 import (
-	"github.com/erigontech/erigon-lib/metrics"
-	"github.com/erigontech/erigon-lib/types/clonable"
+	"github.com/erigontech/erigon/common/clonable"
+	"github.com/erigontech/erigon/diagnostics/metrics"
 )
 
 func (b *CachingBeaconState) EncodeSSZ(buf []byte) ([]byte, error) {
@@ -28,7 +28,7 @@ func (b *CachingBeaconState) EncodeSSZ(buf []byte) ([]byte, error) {
 	}
 	sz := metrics.NewHistTimer("encode_ssz_beacon_state_size")
 	sz.Observe(float64(len(bts)))
-	return bts, err
+	return bts, nil
 }
 
 func (b *CachingBeaconState) DecodeSSZ(buf []byte, version int) error {

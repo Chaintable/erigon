@@ -25,20 +25,20 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/erigontech/erigon-lib/log/v3"
-
-	"github.com/erigontech/erigon-lib/common/debug"
-	"github.com/erigontech/erigon-lib/common/mclock"
-	"github.com/erigontech/erigon-lib/metrics"
-	"github.com/erigontech/erigon-lib/rlp"
-	"github.com/erigontech/erigon/event"
+	"github.com/erigontech/erigon/common/dbg"
+	"github.com/erigontech/erigon/common/log/v3"
+	"github.com/erigontech/erigon/common/mclock"
+	"github.com/erigontech/erigon/diagnostics/metrics"
+	"github.com/erigontech/erigon/execution/rlp"
 	"github.com/erigontech/erigon/p2p/enode"
 	"github.com/erigontech/erigon/p2p/enr"
+	"github.com/erigontech/erigon/p2p/event"
 )
 
 var (
@@ -172,15 +172,20 @@ func (p *Peer) Caps() []Cap {
 	return p.rw.caps
 }
 
+// RunningProtocol returns true if the peer is actively connected using the
+// specified protocol, regardless of version.
+func (p *Peer) RunningProtocol(protocol string) bool {
+	_, ok := p.running[protocol]
+	return ok
+}
+
 // RunningCap returns true if the peer is actively connected using any of the
 // enumerated versions of a specific protocol, meaning that at least one of the
 // versions is supported by both this node and the peer p.
 func (p *Peer) RunningCap(protocol string, versions []uint) bool {
 	if proto, ok := p.running[protocol]; ok {
-		for _, ver := range versions {
-			if proto.Version == ver {
-				return true
-			}
+		if slices.Contains(versions, proto.Version) {
+			return true
 		}
 	}
 	return false
@@ -253,15 +258,15 @@ func convertToCamelCase(input string) string {
 		return input
 	}
 
-	var result string
+	var result strings.Builder
 
 	for _, part := range parts {
 		if len(part) > 0 && part != parts[len(parts)-1] {
-			result += makeFirstCharCap(part)
+			result.WriteString(makeFirstCharCap(part))
 		}
 	}
 
-	return result
+	return result.String()
 }
 
 func (p *Peer) run() (peerErr *PeerError) {
@@ -309,7 +314,7 @@ func (p *Peer) run() (peerErr *PeerError) {
 }
 
 func (p *Peer) pingLoop() {
-	defer debug.LogPanic()
+	defer dbg.LogPanic()
 	ping := time.NewTimer(pingInterval)
 	defer p.wg.Done()
 	defer ping.Stop()
@@ -333,7 +338,7 @@ func (p *Peer) pingLoop() {
 }
 
 func (p *Peer) readLoop(errc chan<- error) {
-	defer debug.LogPanic()
+	defer dbg.LogPanic()
 	defer p.wg.Done()
 	for {
 		msg, err := p.rw.ReadMsg()
@@ -431,17 +436,16 @@ outer:
 func (p *Peer) startProtocols(writeStart <-chan struct{}, writeErr chan<- error) {
 	p.wg.Add(len(p.running))
 	for _, proto := range p.running {
-		proto := proto
 		proto.closed = p.closed
 		proto.wstart = writeStart
 		proto.werr = writeErr
 		var rw MsgReadWriter = proto
 		if p.events != nil {
-			rw = newMsgEventer(rw, p.events, p.ID(), proto.Name, p.Info().Network.RemoteAddress, p.Info().Network.LocalAddress)
+			rw = newMsgEventer(rw, p.events, p.ID(), proto.Name, p.RemoteAddr().String(), p.LocalAddr().String())
 		}
 		p.log.Trace(fmt.Sprintf("Starting protocol %s/%d", proto.Name, proto.Version))
 		go func() {
-			defer debug.LogPanic()
+			defer dbg.LogPanic()
 			defer p.wg.Done()
 			err := proto.Run(p, rw)
 			// only unit test protocols can return nil

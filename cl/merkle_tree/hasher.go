@@ -19,8 +19,8 @@ package merkle_tree
 import (
 	"sync"
 
-	libcommon "github.com/erigontech/erigon-lib/common"
 	"github.com/erigontech/erigon/cl/utils"
+	"github.com/erigontech/erigon/common"
 	"github.com/prysmaticlabs/gohashtree"
 )
 
@@ -110,7 +110,7 @@ func (m *merkleHasher) transactionsListRoot(transactions [][]byte) ([32]byte, er
 	}
 	transactionsBaseRoot, err := MerkleizeVector(leaves, 1048576)
 	if err != nil {
-		return libcommon.Hash{}, err
+		return common.Hash{}, err
 	}
 
 	countRoot := Uint64Root(txCount)

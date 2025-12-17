@@ -17,8 +17,6 @@
 // You should have received a copy of the GNU Lesser General Public License
 // along with Erigon. If not, see <http://www.gnu.org/licenses/>.
 
-//go:build integration_skip
-
 package discover
 
 import (
@@ -30,8 +28,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/erigontech/erigon-lib/crypto"
-	"github.com/erigontech/erigon-lib/log/v3"
+	"github.com/erigontech/erigon/common/crypto"
+	"github.com/erigontech/erigon/common/log/v3"
 	"github.com/erigontech/erigon/p2p/enode"
 	"github.com/erigontech/erigon/p2p/enr"
 	"github.com/erigontech/erigon/p2p/netutil"
@@ -286,6 +284,10 @@ func testTableFindNodeByIDRun(t *testing.T, nodesCountGen uint16, resultsCountGe
 }
 
 func TestTable_findNodeByID_examples(t *testing.T) {
+	if testing.Short() {
+		t.Skip()
+	}
+
 	t.Parallel()
 
 	randGen := rand.New(rand.NewSource(time.Now().Unix()))

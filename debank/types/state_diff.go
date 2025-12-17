@@ -1,10 +1,9 @@
 package types
 
 import (
-	"github.com/erigontech/erigon-lib/common"
-	"github.com/erigontech/erigon-lib/common/hexutil"
-	"github.com/erigontech/erigon-lib/common/hexutility"
-	"github.com/erigontech/erigon/core/types"
+	"github.com/erigontech/erigon/common"
+	"github.com/erigontech/erigon/common/hexutil"
+	"github.com/erigontech/erigon/execution/types"
 	"github.com/holiman/uint256"
 )
 
@@ -50,7 +49,7 @@ type Header struct {
 	StateRoot             common.Hash      `json:"stateRoot"`
 	Miner                 common.Address   `json:"miner"`
 	Difficulty            *hexutil.Big     `json:"difficulty"`
-	ExtraData             hexutility.Bytes `json:"extraData"`
+	ExtraData             hexutil.Bytes    `json:"extraData"`
 	GasLimit              hexutil.Uint64   `json:"gasLimit"`
 	GasUsed               hexutil.Uint64   `json:"gasUsed"`
 	Timestamp             hexutil.Uint64   `json:"timestamp"`

@@ -19,10 +19,10 @@ package solid
 import (
 	"bytes"
 
-	libcommon "github.com/erigontech/erigon-lib/common"
-	"github.com/erigontech/erigon-lib/types/clonable"
 	"github.com/erigontech/erigon/cl/merkle_tree"
 	ssz2 "github.com/erigontech/erigon/cl/ssz"
+	"github.com/erigontech/erigon/common"
+	"github.com/erigontech/erigon/common/clonable"
 )
 
 const AttestationDataSize = 128
@@ -32,7 +32,7 @@ type AttestationData struct {
 	Slot           uint64 `json:"slot,string"`
 	CommitteeIndex uint64 `json:"index,string"` // CommitteeIndex will be deprecated and always equal to 0 after Electra
 	// LMD GHOST vote
-	BeaconBlockRoot libcommon.Hash `json:"beacon_block_root"`
+	BeaconBlockRoot common.Hash `json:"beacon_block_root"`
 	// FFG vote
 	Source Checkpoint `json:"source"`
 	Target Checkpoint `json:"target"`

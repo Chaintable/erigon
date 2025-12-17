@@ -1,6 +1,6 @@
 package types
 
-import "github.com/erigontech/erigon-lib/common"
+import "github.com/erigontech/erigon/common"
 
 type BlockLoad struct {
 	Hash         common.Hash

@@ -21,10 +21,10 @@ import (
 	"errors"
 	"math/bits"
 
-	"github.com/erigontech/erigon-lib/common/hexutility"
-	"github.com/erigontech/erigon-lib/log/v3"
-	"github.com/erigontech/erigon-lib/types/clonable"
 	"github.com/erigontech/erigon/cl/merkle_tree"
+	"github.com/erigontech/erigon/common/clonable"
+	"github.com/erigontech/erigon/common/hexutil"
+	"github.com/erigontech/erigon/common/log/v3"
 )
 
 // BitList is like a dynamic binary string. It's like a flipbook of 1s and 0s!
@@ -241,11 +241,11 @@ func (u *BitList) MarshalJSON() ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	return json.Marshal(hexutility.Bytes(enc))
+	return json.Marshal(hexutil.Bytes(enc))
 }
 
 func (u *BitList) UnmarshalJSON(input []byte) error {
-	var hex hexutility.Bytes
+	var hex hexutil.Bytes
 	if err := json.Unmarshal(input, &hex); err != nil {
 		return err
 	}

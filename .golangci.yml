@@ -1,9 +1,7 @@
 version: "2"
 run:
   build-tags:
-    - nosqlite
-    - noboltdb
-    - nosilkworm
+    - goexperiment.synctest
 linters:
   enable:
     - asasalint
@@ -11,43 +9,40 @@ linters:
     - bidichk
     - bodyclose
     - durationcheck
-    # - errchkjson
-    # - errorlint
     - fatcontext
-    - gocheckcompilerdirectives
     - gochecksumtype
-    # - gocritic
+    - gocritic
     - gosmopolitan
-    - loggercheck
-    # - nilerr
-    # - nilnesserr
-    # - noctx
+    - nilnesserr
     - prealloc
-    # - predeclared
     - reassign
-    - spancheck
-    # - thelper
-    - unconvert
-    - wastedassign
     - govet
   disable:
-    - unused #TODO: enable me
     - testifylint
     - staticcheck #TODO: enable me
-    - perfsprint #TODO: enable me
-    - recvcheck  #TODO: enable me
+    - errchkjson #TODO: enable me
+    - makezero #TODO: enable me
+    - noctx #TODO: enable me
+    - errorlint #TODO: enable me
+    - unused #TODO: enable me
     - contextcheck
     - err113
     - exhaustive
+    - gocheckcompilerdirectives
     - gosec
-    - makezero
     - musttag
+    - nilerr
     - protogetter
+    - recvcheck
     - unparam
     - wrapcheck
-    - rowserrcheck
-    - sqlclosecheck
-    - zerologlint
+    - sqlclosecheck # we don't use SQL
+    - rowserrcheck # we don't use SQL
+    - zerologlint # not don't use Zerolog
+    - wastedassign # `ineffassign` linter is enabled by default
+    - spancheck # we don't use OpenTelemetry
+    - loggercheck # we don't use Zap
+    - unconvert # not enough profit from always enabling
   settings:
     goconst:
       min-len: 2
@@ -56,29 +51,32 @@ linters:
       enabled-checks:
         - ruleguard
       disabled-checks:
+        - unnecessaryDefer
+        - appendAssign
+        - regexpMust
         - rangeValCopy
         - exitAfterDefer
         - elseif
         - dupBranchBody
         - assignOp
         - singleCaseSwitch
+        - unlambda
         - captLocal
         - commentFormatting
         - ifElseChain
-        - appendAssign
-        - preferFprint
         - sloppyReassign
         - sprintfQuotedString
         - deferInLoop
         - nilValReturn
         - evalOrder
-        - commentedOutCode
         - returnAfterHttpError
         - weakCond
         - builtinShadowDecl
-        - unnecessaryDefer
         - uncheckedInlineErr
         - preferStringWriter
+        - commentedOutCode
+        - preferFprint
+        - deprecatedComment
       enabled-tags:
         - performance
         - diagnostic
@@ -92,12 +90,12 @@ linters:
           rules: rules.go
         underef:
           skipRecvDeref: true
-    gosec:
-      excludes:
-        - G115
     govet:
+      enable:
+        - nilness
       disable:
         - deepequalerrors
+        - fieldalignment
         - shadow
         - unsafeptr
   exclusions:
@@ -109,17 +107,6 @@ linters:
       - std-error-handling
     rules:
       - linters:
-          - all
-          - predeclared
-          - thelper
-        path: rlp/.*\.go
-      - linters:
-          - golint
-        text: should be
-      - linters:
-          - recvcheck
-        text: the methods of
-      - linters:
           - errcheck
         text: not checked
       - linters:
@@ -129,7 +116,7 @@ linters:
           - gocritic
           - gosec
           - perfsprint
-          # - unused
+          - unused
         path: test\.go
       - linters:
           - gocritic
@@ -139,7 +126,7 @@ linters:
       - linters:
           - gocritic
           - gosec
-          # - unused
+          - unused
         path: cmd/devp2p
       - linters:
           - gocritic
@@ -148,13 +135,15 @@ linters:
       - linters:
           - gocritic
           - gosec
-        path: p2p/simulations
+        path: p2p/dnsdisc
     paths:
+      - build/
+      - vendor/
       - third_party$
       - builtin$
       - examples$
-      - testdata$
-      - execution-spec-tests$
+      - testdata
+      - execution-spec-tests
 formatters:
   enable:
     - gofmt
@@ -164,8 +153,10 @@ formatters:
   exclusions:
     generated: lax
     paths:
+      - build/
+      - vendor/
       - third_party$
       - builtin$
       - examples$
-      - testdata$
-      - execution-spec-tests$
+      - testdata
+      - execution-spec-tests

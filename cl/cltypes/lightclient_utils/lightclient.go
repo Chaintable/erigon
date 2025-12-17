@@ -19,11 +19,11 @@ package lightclient_utils
 import (
 	"fmt"
 
-	libcommon "github.com/erigontech/erigon-lib/common"
 	"github.com/erigontech/erigon/cl/clparams"
 	"github.com/erigontech/erigon/cl/cltypes"
 	"github.com/erigontech/erigon/cl/cltypes/solid"
 	"github.com/erigontech/erigon/cl/phase1/core/state"
+	"github.com/erigontech/erigon/common"
 )
 
 // def create_light_client_update(state: BeaconState,
@@ -108,7 +108,7 @@ func CreateLightClientUpdate(cfg *clparams.BeaconChainConfig, block *cltypes.Sig
 			if finalizedBeaconRoot != attestedFinalizedCheckpoint.Root {
 				return nil, fmt.Errorf("finalized beacon root %x is not equal to attested finalized checkpoint root %x", finalizedBeaconRoot, attestedFinalizedCheckpoint.Root)
 			}
-		} else if attestedFinalizedCheckpoint.Root != (libcommon.Hash{}) {
+		} else if attestedFinalizedCheckpoint.Root != (common.Hash{}) {
 			return nil, fmt.Errorf("attested finalized checkpoint root %x is not equal to zero hash", attestedFinalizedCheckpoint.Root)
 		}
 		update.FinalityBranch = attestedFinalityBranch

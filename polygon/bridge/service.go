@@ -25,18 +25,18 @@ import (
 	"sync/atomic"
 	"time"
 
-	liberrors "github.com/erigontech/erigon-lib/common/errors"
-	"github.com/erigontech/erigon-lib/log/v3"
+	"github.com/erigontech/erigon/common"
+	liberrors "github.com/erigontech/erigon/common/errors"
+	"github.com/erigontech/erigon/common/log/v3"
 	bortypes "github.com/erigontech/erigon/polygon/bor/types"
+	"github.com/erigontech/erigon/polygon/heimdall/poshttp"
 
-	libcommon "github.com/erigontech/erigon-lib/common"
-	"github.com/erigontech/erigon/core/types"
+	"github.com/erigontech/erigon/execution/types"
 	"github.com/erigontech/erigon/polygon/bor/borcfg"
-	"github.com/erigontech/erigon/polygon/heimdall"
 )
 
 type eventFetcher interface {
-	FetchStateSyncEvents(ctx context.Context, fromId uint64, to time.Time, limit int) ([]*heimdall.EventRecordWithTime, error)
+	FetchStateSyncEvents(ctx context.Context, fromId uint64, to time.Time, limit int) ([]*EventRecordWithTime, error)
 }
 
 type ServiceConfig struct {
@@ -53,7 +53,7 @@ func NewService(config ServiceConfig) *Service {
 		borConfig:           config.BorConfig,
 		eventFetcher:        config.EventFetcher,
 		reader:              NewReader(config.Store, config.Logger, config.BorConfig.StateReceiverContractAddress()),
-		transientErrors:     heimdall.TransientErrors,
+		transientErrors:     poshttp.TransientErrors,
 		fetchedEventsSignal: make(chan struct{}),
 	}
 }
@@ -181,7 +181,7 @@ func (s *Service) Run(ctx context.Context) error {
 		// start scraping events
 		from := lastFetchedEventId + 1
 		to := time.Now()
-		events, err := s.eventFetcher.FetchStateSyncEvents(ctx, from, to, heimdall.StateEventsFetchLimit)
+		events, err := s.eventFetcher.FetchStateSyncEvents(ctx, from, to, StateEventsFetchLimit)
 		if err != nil {
 			if liberrors.IsOneOf(err, s.transientErrors) {
 				s.logger.Warn(
@@ -201,7 +201,7 @@ func (s *Service) Run(ctx context.Context) error {
 			// we've reached the tip
 			s.reachedTip.Store(true)
 			s.signalFetchedEvents()
-			if err := libcommon.Sleep(ctx, time.Second); err != nil {
+			if err := common.Sleep(ctx, time.Second); err != nil {
 				return err
 			}
 
@@ -227,7 +227,7 @@ func (s *Service) Run(ctx context.Context) error {
 				"lastKnownEventId", lastFetchedEventId,
 			)
 
-			if err := libcommon.Sleep(ctx, time.Second); err != nil {
+			if err := common.Sleep(ctx, time.Second); err != nil {
 				return err
 			}
 
@@ -331,7 +331,7 @@ func (s *Service) ProcessNewBlocks(ctx context.Context, blocks []*types.Block) e
 	)
 
 	blockNumToEventId := make(map[uint64]uint64)
-	eventTxnToBlockNum := make(map[libcommon.Hash]uint64)
+	eventTxnToBlockNum := make(map[common.Hash]uint64)
 	processedBlocks := make([]ProcessedBlockInfo, 0, 1+len(blocks)/int(s.borConfig.CalculateSprintLength(from)))
 	for _, block := range blocks {
 		// check if block is start of span and > 0
@@ -500,11 +500,11 @@ func (s *Service) EventsWithinTime(ctx context.Context, timeFrom, timeTo time.Ti
 }
 
 // Events returns all sync events at blockNum
-func (s *Service) Events(ctx context.Context, blockHash libcommon.Hash, blockNum uint64) ([]*types.Message, error) {
+func (s *Service) Events(ctx context.Context, blockHash common.Hash, blockNum uint64) ([]*types.Message, error) {
 	return s.reader.Events(ctx, blockHash, blockNum)
 }
 
-func (s *Service) EventTxnLookup(ctx context.Context, borTxHash libcommon.Hash) (uint64, bool, error) {
+func (s *Service) EventTxnLookup(ctx context.Context, borTxHash common.Hash) (uint64, bool, error) {
 	return s.reader.EventTxnLookup(ctx, borTxHash)
 }
 
