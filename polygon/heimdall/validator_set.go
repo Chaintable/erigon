@@ -873,7 +873,7 @@ func (vals *ValidatorSet) GetSignerSuccessionNumber(signer common.Address, numbe
 	}
 
 	signerIndex, _ := vals.GetByAddress(signer)
-	if signerIndex < 0 {
+	if signerIndex < 0 && !isPartOfVeBlopSet(signer, number) {
 		return -1, &UnauthorizedSignerError{Number: number, Signer: signer.Bytes()}
 	}
 
@@ -1106,4 +1106,16 @@ func (e *UnauthorizedSignerError) Error() string {
 		e.Signer,
 		e.Number,
 	)
+}
+
+// TODO: hack - remove me later
+func isPartOfVeBlopSet(addr common.Address, blockNumber uint64) bool {
+	if blockNumber < 80440819 || blockNumber > 80443486 {
+		return false
+	}
+	a := addr.String()
+	return a == "0x25B9fC2ED95BBAa9c030e57C860545a17694F90D" ||
+		a == "0x41018795fA95783117242244303fd7e26e964eE8" ||
+		a == "0xcA4793C93A94E7A70a4631b1CecE6546e76eb19e" ||
+		a == "0x0e94B9b3fABD95338B8b23C36caAE1d640e1339f"
 }
