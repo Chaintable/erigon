@@ -24,6 +24,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"slices"
+	"sync"
 	"time"
 
 	"golang.org/x/crypto/sha3"
@@ -47,7 +48,8 @@ import (
 )
 
 var (
-	blockExecutionTimer = metrics.GetOrCreateSummary("chain_execution_seconds")
+	blockExecutionTimer    = metrics.GetOrCreateSummary("chain_execution_seconds")
+	finalizeBlockExecMutex sync.Mutex
 )
 
 type SyncMode string
@@ -364,11 +366,13 @@ func FinalizeBlockExecution(
 		return ret, err
 	}
 
+	finalizeBlockExecMutex.Lock()
 	if isMining {
 		newBlock, retRequests, err = engine.FinalizeAndAssemble(cc, header, ibs, txs, uncles, receipts, withdrawals, chainReader, syscall, nil, logger)
 	} else {
 		retRequests, err = engine.Finalize(cc, header, ibs, txs, uncles, receipts, withdrawals, chainReader, syscall, false, logger)
 	}
+	finalizeBlockExecMutex.Unlock()
 	if err != nil {
 		return nil, nil, err
 	}
