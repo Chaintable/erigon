@@ -410,7 +410,15 @@ func (api *ErigonImpl) GetBlockReceiptsByBlockHash(ctx context.Context, cannonic
 				return nil, err
 			}
 
-			result = append(result, ethutils.MarshalReceipt(borReceipt, bortypes.NewBorTransaction(), chainConfig, block.HeaderNoCopy(), borReceipt.TxHash, false, false))
+			var borTx types.Transaction = bortypes.NewBorTransaction()
+			if chainConfig.Bor.IsMadhugiri(blockNum) {
+				borTx = block.Transactions()[len(block.Transactions())-1]
+				if borTx.Type() != types.StateSyncTxType {
+					return nil, fmt.Errorf("the last transaction is not a state-sync transaction %x", block.Hash())
+				}
+			}
+
+			result = append(result, ethutils.MarshalReceipt(borReceipt, borTx, chainConfig, block.HeaderNoCopy(), borReceipt.TxHash, false, false))
 		}
 	}
 
