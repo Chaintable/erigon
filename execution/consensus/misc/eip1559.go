@@ -34,9 +34,19 @@ import (
 	"github.com/erigontech/erigon/polygon/bor/borcfg"
 )
 
+const (
+	// MaxBaseFeeChangePercent limits the maximum base fee change per block to 5% of parent base fee.
+	// This prevents excessive fee volatility by capping both increases and decreases.
+	// The 5% limit provides protection against aggressive parameter configurations while
+	// accommodating the natural behavior of default post-Dandeli parameters (maximum ~1.7% change).
+	MaxBaseFeeChangePercent = 5
+)
+
 // VerifyEip1559Header verifies some header attributes which were changed in EIP-1559,
 // - gas limit check
-// - basefee check
+// - basefee check:
+//   - Pre-Dandeli: strict validation against calculated base fee
+//   - Post-Dandeli: boundary check ensuring changes stay within MaxBaseFeeChangePercent (5%)
 func VerifyEip1559Header(config *chain.Config, parent, header *types.Header, skipGasLimit bool) error {
 	if !skipGasLimit {
 		// Verify that the gas limit remains within allowed bounds
@@ -52,12 +62,49 @@ func VerifyEip1559Header(config *chain.Config, parent, header *types.Header, ski
 	if header.BaseFee == nil {
 		return errors.New("header is missing baseFee")
 	}
-	// Verify the baseFee is correct based on the parent header.
+
+	// After Dandeli hard fork, base fee validation is replaced by a boundary check to allow
+	// dynamic base fee setting while preventing excessive volatility (max 5% change per block)
+	if borConfig, ok := config.Bor.(*borcfg.BorConfig); ok {
+		if borConfig.IsDandeli(header.Number.Uint64()) {
+			return verifyBaseFeeWithinBoundaries(parent, header)
+		}
+	}
+
+	// Pre-Dandeli: Verify the baseFee is correct based on the parent header
 	expectedBaseFee := CalcBaseFee(config, parent)
 	if header.BaseFee.Cmp(expectedBaseFee) != 0 {
 		return fmt.Errorf("invalid baseFee: have %s, want %s, parentBaseFee %s, parentGasUsed %d",
 			header.BaseFee, expectedBaseFee, parent.BaseFee, parent.GasUsed)
 	}
+
+	return nil
+}
+
+// verifyBaseFeeWithinBoundaries checks that the base fee change is within the allowed boundary.
+// This prevents excessive fee volatility while allowing dynamic fee adjustment post-Dandeli.
+// The boundary limit is defined by MaxBaseFeeChangePercent constant.
+func verifyBaseFeeWithinBoundaries(parent, header *types.Header) error {
+	// Calculate the maximum allowed change (MaxBaseFeeChangePercent of parent base fee)
+	maxAllowedChange := new(big.Int).Mul(parent.BaseFee, big.NewInt(MaxBaseFeeChangePercent))
+	maxAllowedChange.Div(maxAllowedChange, big.NewInt(100))
+
+	// Calculate the actual change in base fee
+	actualChange := new(big.Int)
+	if header.BaseFee.Cmp(parent.BaseFee) >= 0 {
+		// Base fee increased or stayed the same
+		actualChange.Sub(header.BaseFee, parent.BaseFee)
+	} else {
+		// Base fee decreased
+		actualChange.Sub(parent.BaseFee, header.BaseFee)
+	}
+
+	// Verify the change is within the allowed boundary
+	if actualChange.Cmp(maxAllowedChange) > 0 {
+		return fmt.Errorf("baseFee change exceeds %d%% limit: change=%s, maxAllowed=%s, parentBaseFee=%s, headerBaseFee=%s",
+			MaxBaseFeeChangePercent, actualChange, maxAllowedChange, parent.BaseFee, header.BaseFee)
+	}
+
 	return nil
 }
 
