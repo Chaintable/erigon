@@ -51,5 +51,6 @@ func (bc *BlockContext) Rules(c *chain.Config) *chain.Rules {
 		IsMadhugiri:        c.IsMadhugiri(bc.BlockNumber),
 		IsMadhugiriPro:     c.IsMadhugiriPro(bc.BlockNumber),
 		IsLisovo:           c.IsLisovo(bc.BlockNumber),
+		IsLisovoPro:        c.IsLisovoPro(bc.BlockNumber),
 	}
 }

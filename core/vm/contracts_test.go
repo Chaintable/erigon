@@ -33,6 +33,7 @@ import (
 	"github.com/erigontech/erigon-lib/common"
 	"github.com/erigontech/erigon-lib/common/hexutil"
 	"github.com/erigontech/erigon-lib/common/math"
+	"github.com/erigontech/erigon/execution/chain"
 	"github.com/erigontech/erigon/execution/chain/params"
 )
 
@@ -523,5 +524,38 @@ func TestLisovoCLZOpcode(t *testing.T) {
 	}
 	if postLisovo[CLZ].constantGas != GasFastStep {
 		t.Errorf("CLZ gas: got %d, want %d", postLisovo[CLZ].constantGas, GasFastStep)
+	}
+}
+
+// TestPointEvaluationPrecompileRemoval verifies that the pointEvaluation (KZG) precompile
+// is present before LisovoPro and removed starting with LisovoPro.
+func TestPointEvaluationPrecompileRemoval(t *testing.T) {
+	t.Parallel()
+
+	pointEvaluationAddr := common.BytesToAddress([]byte{0x0a})
+
+	// Test Lisovo: should have pointEvaluation
+	lisovoRules := &chain.Rules{
+		IsLisovo:       true,
+		IsMadhugiriPro: true,
+		IsMadhugiri:    true,
+		IsBhilai:       true,
+	}
+	lisovoPrecompiles := Precompiles(lisovoRules)
+	if _, exists := lisovoPrecompiles[pointEvaluationAddr]; !exists {
+		t.Error("pointEvaluation (0x0a) should exist in Lisovo precompiles")
+	}
+
+	// Test LisovoPro: should not have pointEvaluation
+	lisovoProRules := &chain.Rules{
+		IsLisovoPro:    true,
+		IsLisovo:       true,
+		IsMadhugiriPro: true,
+		IsMadhugiri:    true,
+		IsBhilai:       true,
+	}
+	lisovoProPrecompiles := Precompiles(lisovoProRules)
+	if _, exists := lisovoProPrecompiles[pointEvaluationAddr]; exists {
+		t.Error("pointEvaluation (0x0a) should not exist in LisovoPro precompiles")
 	}
 }
