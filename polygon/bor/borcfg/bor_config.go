@@ -50,6 +50,7 @@ type BorConfig struct {
 	MadhugiriProBlock *big.Int `json:"madhugiriProBlock"` // MadhugiriPro switch block (nil = no fork, 0 = already on MadhugiriPro)
 	DandeliBlock      *big.Int `json:"dandeliBlock"`      // Dandeli switch block (nil = no fork, 0 = already on Dandeli)
 	LisovoBlock       *big.Int `json:"lisovoBlock"`       // Lisovo switch block (nil = no fork, 0 = already on Lisovo)
+	LisovoProBlock    *big.Int `json:"lisovoProBlock"`    // LisovoPro switch block (nil = no fork, 0 = already on LisovoPro)
 
 	StateSyncConfirmationDelay map[string]uint64         `json:"stateSyncConfirmationDelay"` // StateSync Confirmation Delay, in seconds, to calculate `to`
 	Coinbase                   map[string]common.Address `json:"coinbase"`                   // coinbase address
@@ -224,6 +225,14 @@ func (c *BorConfig) IsLisovo(number uint64) bool {
 
 func (c *BorConfig) GetLisovoBlock() *big.Int {
 	return c.LisovoBlock
+}
+
+func (c *BorConfig) IsLisovoPro(number uint64) bool {
+	return isForked(c.LisovoProBlock, number)
+}
+
+func (c *BorConfig) GetLisovoProBlock() *big.Int {
+	return c.LisovoProBlock
 }
 
 func (c *BorConfig) CalculateStateSyncDelay(number uint64) uint64 {
