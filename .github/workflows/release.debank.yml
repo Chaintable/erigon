@@ -43,7 +43,7 @@ jobs:
         uses: aws-actions/amazon-ecr-login@v2
         
       - name: Build image and push to ECR
-        uses:  docker/build-push-action@v5
+        uses:  docker/build-push-action@v7
         with:
           file: ${{ env.DOCKERFILE }}
           context: .
