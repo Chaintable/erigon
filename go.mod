@@ -1,6 +1,6 @@
 module github.com/erigontech/erigon
 
-go 1.24
+go 1.24.0
 
 replace (
 	github.com/erigontech/erigon-db => ./erigon-db
@@ -18,10 +18,33 @@ replace (
 )
 
 require (
+	github.com/aws/aws-sdk-go-v2/config v1.31.12
+	github.com/aws/aws-sdk-go-v2/service/s3 v1.88.4
 	github.com/erigontech/erigonwatch v0.0.0-20240718131902-b6576bde1116
 	github.com/erigontech/mdbx-go v0.39.8
 	github.com/erigontech/secp256k1 v1.2.0
 	github.com/erigontech/silkworm-go v0.24.0
+	github.com/segmentio/kafka-go v0.4.49
+)
+
+require (
+	github.com/aws/aws-sdk-go-v2 v1.39.2 // indirect
+	github.com/aws/aws-sdk-go-v2/aws/protocol/eventstream v1.7.1 // indirect
+	github.com/aws/aws-sdk-go-v2/credentials v1.18.16 // indirect
+	github.com/aws/aws-sdk-go-v2/feature/ec2/imds v1.18.9 // indirect
+	github.com/aws/aws-sdk-go-v2/internal/configsources v1.4.9 // indirect
+	github.com/aws/aws-sdk-go-v2/internal/endpoints/v2 v2.7.9 // indirect
+	github.com/aws/aws-sdk-go-v2/internal/ini v1.8.3 // indirect
+	github.com/aws/aws-sdk-go-v2/internal/v4a v1.4.9 // indirect
+	github.com/aws/aws-sdk-go-v2/service/internal/accept-encoding v1.13.1 // indirect
+	github.com/aws/aws-sdk-go-v2/service/internal/checksum v1.9.0 // indirect
+	github.com/aws/aws-sdk-go-v2/service/internal/presigned-url v1.13.9 // indirect
+	github.com/aws/aws-sdk-go-v2/service/internal/s3shared v1.19.9 // indirect
+	github.com/aws/aws-sdk-go-v2/service/sso v1.29.6 // indirect
+	github.com/aws/aws-sdk-go-v2/service/ssooidc v1.35.1 // indirect
+	github.com/aws/aws-sdk-go-v2/service/sts v1.38.6 // indirect
+	github.com/aws/smithy-go v1.23.0 // indirect
+	github.com/pierrec/lz4/v4 v4.1.15 // indirect
 )
 
 require (
@@ -45,18 +68,18 @@ require (
 	github.com/davecgh/go-spew v1.1.1
 	github.com/deckarep/golang-set v1.8.0
 	github.com/deckarep/golang-set/v2 v2.8.0
-	github.com/dop251/goja v0.0.0-20220405120441-9037c2b61cbf
+	github.com/dop251/goja v0.0.0-20230605162241-28ee0ee714f3
 	github.com/edsrzf/mmap-go v1.2.0
 	github.com/emicklei/dot v1.6.2
-	github.com/ethereum/c-kzg-4844/v2 v2.1.1
+	github.com/ethereum/c-kzg-4844/v2 v2.1.3
 	github.com/felixge/fgprof v0.9.3
-	github.com/fjl/gencodec v0.0.0-20220412091415-8bb9e558978c
+	github.com/fjl/gencodec v0.1.0
 	github.com/go-chi/chi/v5 v5.2.2
 	github.com/go-chi/cors v1.2.1
 	github.com/go-echarts/go-echarts/v2 v2.3.3
 	github.com/go-test/deep v1.1.1
 	github.com/go-viper/mapstructure/v2 v2.3.0
-	github.com/goccy/go-json v0.9.11
+	github.com/goccy/go-json v0.10.4
 	github.com/gofrs/flock v0.12.1
 	github.com/golang-jwt/jwt/v4 v4.5.2
 	github.com/golang/snappy v1.0.0
@@ -107,7 +130,7 @@ require (
 	golang.org/x/exp v0.0.0-20250811191247-51f88131bc50
 	golang.org/x/net v0.43.0
 	golang.org/x/sync v0.16.0
-	golang.org/x/sys v0.35.0
+	golang.org/x/sys v0.36.0
 	golang.org/x/time v0.12.0
 	google.golang.org/grpc v1.74.2
 	google.golang.org/grpc/cmd/protoc-gen-go-grpc v1.5.1
@@ -153,10 +176,10 @@ require (
 	github.com/containerd/cgroups/v3 v3.0.3 // indirect
 	github.com/coreos/go-systemd/v22 v22.5.0 // indirect
 	github.com/cpuguy83/go-md2man/v2 v2.0.5 // indirect
-	github.com/crate-crypto/go-eth-kzg v1.3.0 // indirect
+	github.com/crate-crypto/go-eth-kzg v1.4.0 // indirect
 	github.com/davidlazar/go-crypto v0.0.0-20200604182044-b73af7476f6c // indirect
 	github.com/decred/dcrd/dcrec/secp256k1/v4 v4.3.0
-	github.com/dlclark/regexp2 v1.4.1-0.20201116162257-a2a8dda75c91 // indirect
+	github.com/dlclark/regexp2 v1.7.0 // indirect
 	github.com/docker/go-units v0.5.0 // indirect
 	github.com/dustin/go-humanize v1.0.1 // indirect
 	github.com/elastic/go-freelru v0.16.0 // indirect
@@ -172,7 +195,7 @@ require (
 	github.com/go-llsqlite/crawshaw v0.6.0 // indirect
 	github.com/go-logr/logr v1.4.3 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
-	github.com/go-ole/go-ole v1.2.6 // indirect
+	github.com/go-ole/go-ole v1.3.0 // indirect
 	github.com/go-sourcemap/sourcemap v2.1.3+incompatible // indirect
 	github.com/go-stack/stack v1.8.1
 	github.com/go-task/slim-sprig/v3 v3.0.0 // indirect
@@ -282,7 +305,7 @@ require (
 	github.com/spaolacci/murmur3 v1.1.0 // indirect
 	github.com/spf13/cast v1.5.0 // indirect
 	github.com/stoewer/go-strcase v1.2.0 // indirect
-	github.com/supranational/blst v0.3.14
+	github.com/supranational/blst v0.3.16-0.20250831170142-f48500c1fdbe
 	github.com/tklauser/go-sysconf v0.3.14 // indirect
 	github.com/tklauser/numcpus v0.8.0 // indirect
 	github.com/ugorji/go/codec v1.2.13 // indirect
