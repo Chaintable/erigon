@@ -324,56 +324,6 @@ func (api *TraceAPIImpl) DebankBlock(ctx context.Context, blockNrOrHash rpc.Bloc
 	}, nil
 }
 
-func (api *TraceAPIImpl) DebankBGTraceStart(ctx context.Context, region string, nodeXBucket string, chainTableBucket string, broker string, topic string, chainID string, startBlock, endBlock, maxTask uint64) (*BGTraceStatus, error) {
-	if region == "" || nodeXBucket == "" || chainTableBucket == "" || broker == "" || topic == "" || chainID == "" || endBlock == 0 || startBlock > endBlock || maxTask == 0 {
-		return nil, errors.New("missing required parameters")
-	}
-
-	err := dtracer.DebankTraceBackGroundMangeInstance.Start(api, region, nodeXBucket, chainTableBucket, broker, topic, chainID, startBlock, endBlock, maxTask)
-	if err != nil {
-		return nil, err
-	}
-	stat, err := api.DebankBGTraceStatus(ctx)
-	if err != nil {
-		return nil, err
-	}
-
-	return stat, nil
-}
-
-func (api *TraceAPIImpl) DebankBGTraceStop(ctx context.Context) (*BGTraceStatus, error) {
-	stat, err := api.DebankBGTraceStatus(ctx)
-	if err != nil {
-		return nil, err
-	}
-	dtracer.DebankTraceBackGroundMangeInstance.Stop()
-	return stat, nil
-}
-
-type BGTraceStatus struct {
-	Start     uint64  `json:"start"`
-	End       uint64  `json:"end"`
-	Latest    uint64  `json:"latest"`
-	Blocks    uint64  `json:"blocks"`
-	StartTime uint64  `json:"start_time"`
-	Duration  uint64  `json:"duration"`
-	Rate      float64 `json:"rate"`
-}
-
-func (api *TraceAPIImpl) DebankBGTraceStatus(ctx context.Context) (*BGTraceStatus, error) {
-	start, end, latest, startTime := dtracer.DebankTraceBackGroundMangeInstance.Status()
-	return &BGTraceStatus{
-		Start:     start,
-		End:       end,
-		Latest:    latest,
-		Blocks:    latest - start + 1,
-		StartTime: uint64(startTime.Unix()),
-		Duration:  uint64(time.Now().Unix() - startTime.Unix()),
-		Rate:      float64(latest-start+1) / float64(time.Now().Unix()-startTime.Unix()),
-	}, nil
-
-}
-
 func CreateHistoryStateReader2(tx kv.TemporalTx, txNumsReader rawdbv3.TxNumsReader, blockNumber uint64, txnIndex int, chainName string) (state.StateReader, error) {
 	r := state.NewHistoryReaderV3()
 	r.SetTx(tx)
