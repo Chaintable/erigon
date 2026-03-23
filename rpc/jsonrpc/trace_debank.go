@@ -196,9 +196,15 @@ func (api *TraceAPIImpl) DebankBlockRaw(ctx context.Context, blockNrOrHash rpc.B
 			blockCtx := transactions.NewEVMBlockContext(engine, header, true, dbtx, api._blockReader, chainConfig)
 			evm := vm.NewEVM(blockCtx, txCtx, ibs, chainConfig, vmConfig)
 			rules := chainConfig.Rules(blockNumber, block.Time())
+
+			// OnTxStart initializes the callTracer's callstack and txID.
+			if vmConfig.Tracer != nil && vmConfig.Tracer.OnTxStart != nil {
+				vmConfig.Tracer.OnTxStart(evm.GetVMContext(), bortypes.NewBorTransaction(), common.Address{})
+			}
+
 			for _, msg := range stateSyncEvents {
 				gp := new(core.GasPool).AddGas(msg.Gas()).AddBlobGas(msg.BlobGas())
-				_, err := core.ApplyMessage(evm, msg, gp, true, false /* gasBailout */, api.engine())
+				_, err = core.ApplyMessage(evm, msg, gp, true, false /* gasBailout */, api.engine())
 				if err != nil {
 					return nil, err
 				}
@@ -211,7 +217,7 @@ func (api *TraceAPIImpl) DebankBlockRaw(ctx context.Context, blockNrOrHash rpc.B
 				evm.Reset(txCtx, ibs)
 			}
 
-			receipt := types.Receipt{
+			receipt := &types.Receipt{
 				Type:             0,
 				TxHash:           bortypes.ComputeBorTxHash(block.NumberU64(), block.Hash()),
 				GasUsed:          0,
@@ -221,7 +227,11 @@ func (api *TraceAPIImpl) DebankBlockRaw(ctx context.Context, blockNrOrHash rpc.B
 				Status:           types.ReceiptStatusSuccessful,
 			}
 
-			tx := dtracer.BuildBorPipelineTransaction(borTx, &receipt, borTxHash)
+			if vmConfig.Tracer != nil && vmConfig.Tracer.OnTxEnd != nil {
+				vmConfig.Tracer.OnTxEnd(receipt, nil)
+			}
+
+			tx := dtracer.BuildBorPipelineTransaction(borTx, receipt, borTxHash)
 			blockFile.Txs = append(blockFile.Txs, tx)
 		}
 

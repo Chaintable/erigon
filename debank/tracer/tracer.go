@@ -473,15 +473,16 @@ func GenesisAllocToStateDiff(genesisAlloc types.GenesisAlloc) *dtypes.BlockStora
 	diff.StorageDiff = make([]dtypes.AccountStorageDiff, 0)
 	diff.DeletedAccounts = make([]common.Hash, 0)
 	for addr, acc := range genesisAlloc {
+		codeHash := crypto.Keccak256Hash(acc.Code)
 		diff.NewAccounts = append(diff.NewAccounts, dtypes.NewAccount{
 			Address:  crypto.Keccak256Hash(addr[:]),
 			Balance:  uint256.MustFromBig(acc.Balance),
 			Nonce:    acc.Nonce,
-			CodeHash: common.BytesToHash(acc.Code),
+			CodeHash: codeHash,
 		})
 		if len(acc.Code) > 0 {
 			diff.NewCodes = append(diff.NewCodes, dtypes.NewCode{
-				CodeHash: common.BytesToHash(acc.Code),
+				CodeHash: codeHash,
 				Code:     acc.Code,
 			})
 		}
