@@ -176,7 +176,7 @@ func (api *TraceAPIImpl) DebankBlockRaw(ctx context.Context, blockNrOrHash rpc.B
 			}
 			stateReceiverContract := chainConfig.Bor.(*borcfg.BorConfig).StateReceiverContractAddress()
 			txCtx := evmtypes.TxContext{
-				TxHash:   bortypes.ComputeBorTxHash(blockNumber, blockHash),
+				TxHash:   borTxHash,
 				Origin:   common.Address{},
 				GasPrice: uint256.NewInt(0),
 			}
@@ -219,7 +219,7 @@ func (api *TraceAPIImpl) DebankBlockRaw(ctx context.Context, blockNrOrHash rpc.B
 
 			receipt := &types.Receipt{
 				Type:             0,
-				TxHash:           bortypes.ComputeBorTxHash(block.NumberU64(), block.Hash()),
+				TxHash:           borTxHash,
 				GasUsed:          0,
 				BlockHash:        block.Hash(),
 				BlockNumber:      block.Number(),
@@ -237,15 +237,9 @@ func (api *TraceAPIImpl) DebankBlockRaw(ctx context.Context, blockNrOrHash rpc.B
 
 	}
 
-	chainReader := consensuschain.NewReader(chainConfig, dbtx, api._blockReader, logger)
-
-	newBlock, _, err := core.FinalizeBlockExecution(engine, stateReader, block.Header(), block.Transactions(), block.Uncles(), writer, chainConfig, ibs, receipts, block.Withdrawals(), chainReader, true, logger, vmConfig.Tracer)
-	if err != nil {
-		return nil, err
-	}
-
-	if newBlock.Root() != block.Root() {
-		return nil, fmt.Errorf("state root mismatch")
+	blockCtx := core.NewEVMBlockContext(header, core.GetHashFn(header, nil), engine, nil, chainConfig)
+	if err := ibs.CommitBlock(blockCtx.Rules(chainConfig), writer); err != nil {
+		return nil, fmt.Errorf("committing block %d failed: %w", header.Number.Uint64(), err)
 	}
 
 	receiptSha := types.DeriveSha(receipts)
@@ -281,7 +275,7 @@ func (api *TraceAPIImpl) DebankBlockRaw(ctx context.Context, blockNrOrHash rpc.B
 		return nil, fmt.Errorf("bloom mismatch")
 	}
 
-	stateDiff := writer.ToStateDiff(parentHeader.Root, newBlock.Root())
+	stateDiff := writer.ToStateDiff(parentHeader.Root, block.Root())
 
 	for addr := range writer.StorageChanges {
 		blockFile.StorageContracts = append(blockFile.StorageContracts, strings.ToLower(addr.Hex()))

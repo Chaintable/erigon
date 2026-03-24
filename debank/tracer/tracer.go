@@ -334,7 +334,6 @@ func (t *callTracer) captureEnd(output []byte, gasUsed uint64, err error, revert
 
 func (t *callTracer) OnTxStart(env *tracing.VMContext, tx types.Transaction, from common.Address) {
 	t.gasLimit = tx.GetGasLimit()
-	t.txID = tx.Hash().Hex()
 }
 
 func (t *callTracer) OnTxEnd(receipt *types.Receipt, err error) {
