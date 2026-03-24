@@ -7,18 +7,18 @@ import (
 	"math/big"
 	"strings"
 
-	"github.com/erigontech/erigon-lib/abi"
 	"github.com/erigontech/erigon-lib/common"
 	"github.com/erigontech/erigon-lib/common/empty"
 	"github.com/erigontech/erigon-lib/common/hexutil"
 	"github.com/erigontech/erigon-lib/crypto"
-	"github.com/erigontech/erigon-lib/types"
-	"github.com/erigontech/erigon-lib/types/accounts"
 	"github.com/erigontech/erigon/core/state"
 	"github.com/erigontech/erigon/core/tracing"
 	"github.com/erigontech/erigon/core/vm"
 	dtypes "github.com/erigontech/erigon/debank/types"
 	"github.com/erigontech/erigon/debank/util"
+	"github.com/erigontech/erigon/execution/abi"
+	"github.com/erigontech/erigon/execution/types"
+	"github.com/erigontech/erigon/execution/types/accounts"
 	"github.com/holiman/uint256"
 )
 
