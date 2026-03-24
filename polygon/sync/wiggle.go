@@ -21,7 +21,7 @@ import (
 	"time"
 
 	"github.com/erigontech/erigon-lib/common"
-	"github.com/erigontech/erigon-lib/types"
+	"github.com/erigontech/erigon/execution/types"
 	"github.com/erigontech/erigon/polygon/bor"
 	"github.com/erigontech/erigon/polygon/bor/borcfg"
 	lru "github.com/hashicorp/golang-lru/arc/v2"
@@ -52,7 +52,7 @@ func (calc *wiggleCalc) CalculateWiggle(ctx context.Context, header *types.Heade
 		return 0, err
 	}
 
-	succession, err := producers.GetSignerSuccessionNumber(signer, header.Number.Uint64())
+	succession, err := producers.GetSignerSuccessionNumber(signer, header.Number.Uint64(), calc.borConfig)
 	if err != nil {
 		return 0, err
 	}

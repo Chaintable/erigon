@@ -24,7 +24,7 @@ import (
 	"github.com/erigontech/erigon-lib/common"
 	hexutil2 "github.com/erigontech/erigon-lib/common/hexutil"
 	"github.com/erigontech/erigon-lib/common/math"
-	"github.com/erigontech/erigon-lib/types"
+	"github.com/erigontech/erigon/execution/types"
 	"github.com/erigontech/erigon/rpc"
 	"github.com/erigontech/erigon/rpc/ethapi"
 )
@@ -107,9 +107,9 @@ func (b *Block) UnmarshalJSON(input []byte) error {
 	b.Transactions = bd.Transactions
 
 	if bd.Transactions != nil {
-		b.TransactionHashes = make([]common.Hash, len(b.Transactions))
-		for _, t := range bd.Transactions {
-			b.TransactionHashes = append(b.TransactionHashes, t.Hash)
+		b.TransactionHashes = make([]common.Hash, len(bd.Transactions))
+		for i, t := range bd.Transactions {
+			b.TransactionHashes[i] = t.Hash
 		}
 	}
 

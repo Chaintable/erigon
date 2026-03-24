@@ -21,14 +21,15 @@ import (
 	"fmt"
 	"math/big"
 
+	"google.golang.org/grpc"
+
 	"github.com/erigontech/erigon-lib/common"
 	"github.com/erigontech/erigon-lib/common/hexutil"
 	"github.com/erigontech/erigon-lib/gointerfaces"
-	txpool_proto "github.com/erigontech/erigon-lib/gointerfaces/txpoolproto"
+	"github.com/erigontech/erigon-lib/gointerfaces/txpoolproto"
 	"github.com/erigontech/erigon-lib/log/v3"
 	"github.com/erigontech/erigon/rpc"
 	"github.com/erigontech/erigon/rpc/rpchelper"
-	"google.golang.org/grpc"
 )
 
 // GetBalance implements eth_getBalance. Returns the balance of an account for a given address.
@@ -38,6 +39,19 @@ func (api *APIImpl) GetBalance(ctx context.Context, address common.Address, bloc
 		return nil, fmt.Errorf("getBalance cannot open tx: %w", err1)
 	}
 	defer tx.Rollback()
+
+	// Check if the requested block is in the future
+	if blockNrOrHash.BlockNumber != nil && *blockNrOrHash.BlockNumber >= rpc.EarliestBlockNumber {
+		latestBlock, err := rpchelper.GetLatestBlockNumber(tx)
+		if err != nil {
+			return nil, err
+		}
+		requestedBlock := blockNrOrHash.BlockNumber.Uint64()
+		if latestBlock < requestedBlock {
+			return nil, fmt.Errorf("block number is in the future latest=%d requested=%d", latestBlock, requestedBlock)
+		}
+	}
+
 	reader, err := rpchelper.CreateStateReader(ctx, tx, api._blockReader, blockNrOrHash, 0, api.filters, api.stateCache, api._txNumReader)
 	if err != nil {
 		return nil, err
@@ -58,7 +72,7 @@ func (api *APIImpl) GetBalance(ctx context.Context, address common.Address, bloc
 // GetTransactionCount implements eth_getTransactionCount. Returns the number of transactions sent from an address (the nonce).
 func (api *APIImpl) GetTransactionCount(ctx context.Context, address common.Address, blockNrOrHash rpc.BlockNumberOrHash) (*hexutil.Uint64, error) {
 	if blockNrOrHash.BlockNumber != nil && *blockNrOrHash.BlockNumber == rpc.PendingBlockNumber {
-		reply, err := api.txPool.Nonce(ctx, &txpool_proto.NonceRequest{
+		reply, err := api.txPool.Nonce(ctx, &txpoolproto.NonceRequest{
 			Address: gointerfaces.ConvertAddressToH160(address),
 		}, &grpc.EmptyCallOption{})
 		if err != nil {

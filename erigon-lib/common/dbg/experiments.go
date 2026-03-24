@@ -26,12 +26,12 @@ import (
 	"time"
 
 	"github.com/erigontech/erigon-lib/common"
+	"github.com/erigontech/erigon-lib/estimate"
 	"github.com/erigontech/erigon-lib/log/v3"
-	"github.com/erigontech/erigon-lib/mmap"
 )
 
 var (
-	MaxReorgDepth = EnvInt("MAX_REORG_DEPTH", 512)
+	MaxReorgDepth = EnvUint("MAX_REORG_DEPTH", 512)
 
 	noMemstat            = EnvBool("NO_MEMSTAT", false)
 	saveHeapProfile      = EnvBool("SAVE_HEAP_PROFILE", false)
@@ -78,6 +78,8 @@ var (
 	TraceInstructions    = EnvBool("TRACE_INSTRUCTIONS", false)
 	TraceTransactionIO   = EnvBool("TRACE_TRANSACTION_IO", false)
 	TraceBlocks          = EnvUints("TRACE_BLOCKS", ",", nil)
+	TraceGas             = EnvBool("TRACE_GAS", false)
+	TraceDyanmicGas      = EnvBool("TRACE_DYNAMIC_GAS", false)
 	TraceTxIndexes       = EnvInts("TRACE_TRANSACTIONS", ",", nil)
 	StopAfterBlock       = EnvUint("STOP_AFTER_BLOCK", 0)
 	BatchCommitments     = EnvBool("BATCH_COMMITMENTS", true)
@@ -203,7 +205,7 @@ func SaveHeapProfileNearOOM(opts ...SaveHeapOption) {
 		ReadMemStats(&memStats)
 	}
 
-	totalMemory := mmap.TotalMemory()
+	totalMemory := estimate.TotalMemory()
 	if logger != nil {
 		logger.Info(
 			"[Experiment] heap profile threshold check",

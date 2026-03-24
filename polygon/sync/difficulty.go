@@ -22,7 +22,7 @@ import (
 	lru "github.com/hashicorp/golang-lru/arc/v2"
 
 	"github.com/erigontech/erigon-lib/common"
-	"github.com/erigontech/erigon-lib/types"
+	"github.com/erigontech/erigon/execution/types"
 	"github.com/erigontech/erigon/polygon/bor"
 	"github.com/erigontech/erigon/polygon/bor/borcfg"
 )
@@ -52,5 +52,5 @@ func (calc *DifficultyCalculator) signerDifficulty(
 		return 0, err
 	}
 
-	return producers.Difficulty(signer)
+	return producers.Difficulty(signer, calc.borConfig)
 }

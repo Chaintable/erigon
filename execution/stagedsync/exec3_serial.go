@@ -6,15 +6,16 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/erigontech/erigon-db/rawdb/rawtemporaldb"
-	"github.com/erigontech/erigon-lib/kv"
 	"github.com/erigontech/erigon-lib/log/v3"
-	state2 "github.com/erigontech/erigon-lib/state"
-	"github.com/erigontech/erigon-lib/types"
 	"github.com/erigontech/erigon/core"
 	"github.com/erigontech/erigon/core/state"
+	"github.com/erigontech/erigon/db/kv"
+	"github.com/erigontech/erigon/db/rawdb/rawtemporaldb"
+	dbstate "github.com/erigontech/erigon/db/state"
 	"github.com/erigontech/erigon/execution/consensus"
-	chaos_monkey "github.com/erigontech/erigon/tests/chaos-monkey"
+	"github.com/erigontech/erigon/execution/stagedsync/stages"
+	"github.com/erigontech/erigon/execution/tests/chaos_monkey"
+	"github.com/erigontech/erigon/execution/types"
 )
 
 type serialExecutor struct {
@@ -30,7 +31,7 @@ func (se *serialExecutor) wait() error {
 	return nil
 }
 
-func (se *serialExecutor) status(ctx context.Context, commitThreshold uint64) error {
+func (se *serialExecutor) status(_ context.Context, _ uint64) error {
 	return nil
 }
 
@@ -38,6 +39,10 @@ func (se *serialExecutor) execute(ctx context.Context, tasks []*state.TxTask, gp
 	for _, txTask := range tasks {
 		if txTask.Error != nil {
 			return false, nil
+		}
+		// skip state sync txs
+		if txTask.Tx != nil && txTask.Tx.Type() == types.StateSyncTxType {
+			continue
 		}
 		if gp != nil {
 			se.applyWorker.SetGaspool(gp)
@@ -62,13 +67,23 @@ func (se *serialExecutor) execute(ctx context.Context, tasks []*state.TxTask, gp
 
 			if txTask.Final {
 				if !se.isMining && !se.skipPostEvaluation && !se.execStage.CurrentSyncCycle.IsInitialCycle {
-					// note this assumes the bloach reciepts is a fixed array shared by
-					// all tasks - if that changes this will need to change - robably need to
+					// note this assumes the block receipts is a fixed array shared by
+					// all tasks - if that changes this will need to change - probably need to
 					// add this to the executor
-					se.cfg.notifications.RecentLogs.Add(txTask.BlockReceipts)
+					receiptsToPush := txTask.BlockReceipts
+					// Madhugiri HF behavior
+					if se.cfg.chainConfig.Bor != nil && se.cfg.chainConfig.Bor.IsMadhugiri(txTask.BlockNum) {
+						// Nothing to do here
+						// Post Madhugiri HF (PIP-74), `FinalizeAndAssemble` already appends the state-sync receipt.
+						// It included in `receiptsToPush`, so we don't add it twice.
+						// Keeping the comment to make the state-sync handling explicit.
+					}
+					se.cfg.notifications.RecentLogs.Add(receiptsToPush)
 				}
 				checkReceipts := !se.cfg.vmConfig.StatelessExec && se.cfg.chainConfig.IsByzantium(txTask.BlockNum) && !se.cfg.vmConfig.NoReceipts && !se.isMining
-				if txTask.BlockNum > 0 && !se.skipPostEvaluation { //Disable check for genesis. Maybe need somehow improve it in future - to satisfy TestExecutionSpec
+				if txTask.BlockNum > 0 && !se.skipPostEvaluation { // Disable check for genesis.
+					// Maybe we need to somehow improve it in the future
+					// to satisfy TestExecutionSpec
 					if err := core.BlockPostValidation(se.gasUsed, se.blobGasUsed, checkReceipts, txTask.BlockReceipts, txTask.Header, se.isMining, txTask.Txs, se.cfg.chainConfig, se.logger); err != nil {
 						return fmt.Errorf("%w, txnIdx=%d, %v", consensus.ErrInvalidBlock, txTask.TxIndex, err) //same as in stage_exec.go
 					}
@@ -124,7 +139,7 @@ func (se *serialExecutor) execute(ctx context.Context, tasks []*state.TxTask, gp
 			}
 		} else {
 			if se.cfg.chainConfig.Bor != nil && txTask.TxIndex >= 1 {
-				// get last receipt and store the last log index + 1
+				// get the last receipt and store the last log index + 1
 				lastReceipt := txTask.BlockReceipts[txTask.TxIndex-1]
 				if lastReceipt == nil {
 					if se.skipPostEvaluation {
@@ -162,7 +177,7 @@ func (se *serialExecutor) execute(ctx context.Context, tasks []*state.TxTask, gp
 			if rawtemporaldb.ReceiptStoresFirstLogIdx(se.applyTx.(kv.TemporalTx)) {
 				logIndexAfterTx -= uint32(len(txTask.Logs))
 			}
-			if err := rawtemporaldb.AppendReceipt(se.doms.AsPutDel(se.applyTx), logIndexAfterTx, cumGasUsed, se.blobGasUsed, txTask.TxNum); err != nil {
+			if err := rawtemporaldb.AppendReceipt(se.doms.AsPutDel(se.applyTx.(kv.TemporalTx)), logIndexAfterTx, cumGasUsed, se.blobGasUsed, txTask.TxNum); err != nil {
 				return false, err
 			}
 		}
@@ -193,7 +208,9 @@ func (se *serialExecutor) commit(ctx context.Context, txNum uint64, blockNum uin
 		}
 
 		t2 = time.Since(tt)
-		se.agg.BuildFilesInBackground(se.outputTxNum.Load())
+		if se.execStage.SyncMode() == stages.ModeApplyingBlocks {
+			se.agg.BuildFilesInBackground(se.outputTxNum.Load())
+		}
 
 		se.applyTx, err = se.cfg.db.BeginRw(context.Background()) //nolint
 		if err != nil {
@@ -204,7 +221,7 @@ func (se *serialExecutor) commit(ctx context.Context, txNum uint64, blockNum uin
 	if !ok {
 		return t2, errors.New("tx is not a temporal tx")
 	}
-	se.doms, err = state2.NewSharedDomains(temporalTx, se.logger)
+	se.doms, err = dbstate.NewSharedDomains(temporalTx, se.logger)
 	if err != nil {
 		return t2, err
 	}

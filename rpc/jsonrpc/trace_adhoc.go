@@ -23,6 +23,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"math/big"
 	"strings"
 
 	"github.com/holiman/uint256"
@@ -30,17 +31,17 @@ import (
 	"github.com/erigontech/erigon-lib/common"
 	"github.com/erigontech/erigon-lib/common/hexutil"
 	math2 "github.com/erigontech/erigon-lib/common/math"
-	"github.com/erigontech/erigon-lib/kv"
 	"github.com/erigontech/erigon-lib/log/v3"
-	"github.com/erigontech/erigon-lib/types"
-	"github.com/erigontech/erigon-lib/types/accounts"
 	"github.com/erigontech/erigon/core"
 	"github.com/erigontech/erigon/core/state"
 	"github.com/erigontech/erigon/core/tracing"
 	"github.com/erigontech/erigon/core/vm"
 	"github.com/erigontech/erigon/core/vm/evmtypes"
+	"github.com/erigontech/erigon/db/kv"
 	"github.com/erigontech/erigon/eth/tracers"
 	"github.com/erigontech/erigon/eth/tracers/config"
+	"github.com/erigontech/erigon/execution/types"
+	"github.com/erigontech/erigon/execution/types/accounts"
 	ptracer "github.com/erigontech/erigon/polygon/tracer"
 	"github.com/erigontech/erigon/rpc"
 	"github.com/erigontech/erigon/rpc/rpchelper"
@@ -239,7 +240,7 @@ func (args *TraceCallParam) ToMessage(globalGasCap uint64, baseFee *uint256.Int)
 	if args.AccessList != nil {
 		accessList = *args.AccessList
 	}
-	msg := types.NewMessage(addr, args.To, 0, value, gas, gasPrice, gasFeeCap, gasTipCap, data, accessList, false /* checkNonce */, false /* isFree */, maxFeePerBlobGas)
+	msg := types.NewMessage(addr, args.To, 0, value, gas, gasPrice, gasFeeCap, gasTipCap, data, accessList, false /* checkNonce */, false /* checkGas */, false /* isFree */, maxFeePerBlobGas)
 	return msg, nil
 }
 
@@ -393,7 +394,7 @@ func (ot *OeTracer) captureStartOrEnter(deep bool, typ vm.OpCode, from common.Ad
 		copy(trResult.Address[:], to.Bytes())
 		trace.Result = trResult
 	} else {
-		trace.Result = &TraceResult{}
+		trace.Result = &TraceResult{GasUsed: (*hexutil.Big)(big.NewInt(0)), Output: nil}
 		trace.Type = CALL
 	}
 	if deep {
@@ -418,6 +419,7 @@ func (ot *OeTracer) captureStartOrEnter(deep bool, typ vm.OpCode, from common.Ad
 	if create {
 		action := CreateTraceAction{}
 		action.From = from
+		action.CreationMethod = strings.ToLower(typ.String())
 		action.Gas.ToInt().SetUint64(gas)
 		action.Init = common.CopyBytes(input)
 		action.Value.ToInt().Set(value.ToBig())
@@ -1416,6 +1418,12 @@ func (api *TraceAPIImpl) doCallBlock(ctx context.Context, dbtx kv.Tx, stateReade
 		var txFinalized bool
 		var execResult *evmtypes.ExecutionResult
 		if args.isBorStateSyncTxn {
+			if chainConfig.Bor != nil && chainConfig.Bor.IsMadhugiri(header.Number.Uint64()) {
+				if msg == nil {
+					msg = &types.Message{}
+				}
+				msg.SetIsFree(true)
+			}
 			txFinalized = true
 			var stateSyncEvents []*types.Message
 			stateSyncEvents, err = api.bridgeReader.Events(ctx, header.Hash(), parentBlockNumber+1)
@@ -1461,7 +1469,7 @@ func (api *TraceAPIImpl) doCallBlock(ctx context.Context, dbtx kv.Tx, stateReade
 			tracer.Hooks.OnTxEnd(&types.Receipt{GasUsed: execResult.GasUsed}, nil)
 		}
 
-		chainRules := chainConfig.Rules(blockCtx.BlockNumber, blockCtx.Time)
+		chainRules := blockCtx.Rules(chainConfig)
 		traceResult.Output = common.CopyBytes(execResult.ReturnData)
 		if traceTypeStateDiff {
 			initialIbs := state.New(cloneReader)
@@ -1629,6 +1637,10 @@ func (api *TraceAPIImpl) doCall(ctx context.Context, dbtx kv.Tx, stateReader sta
 	var txFinalized bool
 	var execResult *evmtypes.ExecutionResult
 	if args.isBorStateSyncTxn {
+		if msg == nil {
+			msg = &types.Message{}
+		}
+		msg.SetIsFree(true)
 		txFinalized = true
 		var stateSyncEvents []*types.Message
 		stateSyncEvents, err = api.bridgeReader.Events(ctx, header.Hash(), parentBlockNumber+1)
@@ -1661,7 +1673,7 @@ func (api *TraceAPIImpl) doCall(ctx context.Context, dbtx kv.Tx, stateReader sta
 		return nil, fmt.Errorf("first run for txIndex %d error: %w", txIndex, err)
 	}
 
-	chainRules := chainConfig.Rules(blockCtx.BlockNumber, blockCtx.Time)
+	chainRules := blockCtx.Rules(chainConfig)
 	traceResult.Output = common.CopyBytes(execResult.ReturnData)
 	if traceTypeStateDiff {
 		initialIbs := state.New(cloneReader)

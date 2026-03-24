@@ -242,6 +242,10 @@ func (d *peerdas) blobsRecoverWorker(ctx context.Context) {
 				d.columnStorage.RemoveColumnSidecars(ctx, slot, blockRoot, int64(columnIndex))
 				return
 			}
+			if sidecar.Column.Len() > int(d.beaconConfig.MaxBlobCommittmentsPerBlock) {
+				log.Warn("[blobsRecover] invalid column sidecar", "slot", slot, "blockRoot", blockRoot, "columnIndex", columnIndex, "columnLen", sidecar.Column.Len())
+				return
+			}
 			for i := 0; i < sidecar.Column.Len(); i++ {
 				matrixEntries = append(matrixEntries, cltypes.MatrixEntry{
 					Cell:        *sidecar.Column.Get(i),
@@ -420,8 +424,7 @@ func (d *peerdas) blobsRecoverWorker(ctx context.Context) {
 }
 
 func (d *peerdas) TryScheduleRecover(slot uint64, blockRoot common.Hash) error {
-	if !d.IsArchivedMode() {
-		// only recover blobs in archived mode
+	if !d.IsArchivedMode() && !d.StateReader().IsSupernode() {
 		return nil
 	}
 
@@ -468,11 +471,24 @@ func (d *peerdas) DownloadOnlyCustodyColumns(ctx context.Context, blocks []*clty
 	if err != nil {
 		return err
 	}
-	req, err := initializeDownloadRequest(blocks, d.beaconConfig, d.columnStorage, custodyColumns)
-	if err != nil {
-		return err
+
+	batchBlcokSize := 4
+	wg := sync.WaitGroup{}
+	for i := 0; i < len(blocks); i += batchBlcokSize {
+		blocks := blocks[i:min(i+batchBlcokSize, len(blocks))]
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			req, err := initializeDownloadRequest(blocks, d.beaconConfig, d.columnStorage, custodyColumns)
+			if err != nil {
+				log.Warn("failed to initialize download request", "err", err)
+				return
+			}
+			d.runDownload(ctx, req, false)
+		}()
 	}
-	return d.runDownload(ctx, req, false)
+	wg.Wait()
+	return nil
 }
 
 func (d *peerdas) DownloadColumnsAndRecoverBlobs(ctx context.Context, blocks []*cltypes.SignedBlindedBeaconBlock) error {
@@ -513,12 +529,23 @@ func (d *peerdas) DownloadColumnsAndRecoverBlobs(ctx context.Context, blocks []*
 	}()
 
 	// initialize the download request
-	req, err := initializeDownloadRequest(blocksToProcess, d.beaconConfig, d.columnStorage, allColumns)
-	if err != nil {
-		return err
+	batchBlcokSize := 4
+	wg := sync.WaitGroup{}
+	for i := 0; i < len(blocksToProcess); i += batchBlcokSize {
+		blocks := blocksToProcess[i:min(i+batchBlcokSize, len(blocksToProcess))]
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			req, err := initializeDownloadRequest(blocks, d.beaconConfig, d.columnStorage, allColumns)
+			if err != nil {
+				log.Warn("failed to initialize download request", "err", err)
+				return
+			}
+			d.runDownload(ctx, req, true)
+		}()
 	}
-
-	return d.runDownload(ctx, req, true)
+	wg.Wait()
+	return nil
 }
 
 func (d *peerdas) runDownload(ctx context.Context, req *downloadRequest, needToRecoverBlobs bool) error {
@@ -639,6 +666,12 @@ mainloop:
 					}
 					if exist {
 						req.removeColumn(slot, blockRoot, columnIndex)
+						return
+					}
+					blobParameters := d.beaconConfig.GetBlobParameters(slot / d.beaconConfig.SlotsPerEpoch)
+					if sidecar.Column.Len() > int(blobParameters.MaxBlobsPerBlock) {
+						log.Warn("invalid column sidecar length", "blockRoot", blockRoot, "columnIndex", sidecar.Index, "columnLen", sidecar.Column.Len())
+						d.rpc.BanPeer(result.pid)
 						return
 					}
 

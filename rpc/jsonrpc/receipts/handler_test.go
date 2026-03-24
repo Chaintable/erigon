@@ -28,17 +28,21 @@ import (
 	"github.com/holiman/uint256"
 	"github.com/stretchr/testify/require"
 
-	"github.com/erigontech/erigon-db/rawdb"
-	"github.com/erigontech/erigon-lib/chain"
-	"github.com/erigontech/erigon-lib/chain/params"
 	"github.com/erigontech/erigon-lib/common"
+	"github.com/erigontech/erigon-lib/common/empty"
 	"github.com/erigontech/erigon-lib/crypto"
-	"github.com/erigontech/erigon-lib/direct"
-	sentry "github.com/erigontech/erigon-lib/gointerfaces/sentryproto"
-	"github.com/erigontech/erigon-lib/rlp"
-	"github.com/erigontech/erigon-lib/types"
+	"github.com/erigontech/erigon-lib/gointerfaces/sentryproto"
+	"github.com/erigontech/erigon-lib/log/v3"
 	"github.com/erigontech/erigon/core"
+	"github.com/erigontech/erigon/db/kv"
+	"github.com/erigontech/erigon/db/rawdb"
+	"github.com/erigontech/erigon/db/state"
+	"github.com/erigontech/erigon/execution/chain"
+	"github.com/erigontech/erigon/execution/chain/params"
+	"github.com/erigontech/erigon/execution/rlp"
 	"github.com/erigontech/erigon/execution/stages/mock"
+	"github.com/erigontech/erigon/execution/types"
+	"github.com/erigontech/erigon/node/direct"
 	"github.com/erigontech/erigon/p2p/protocols/eth"
 	"github.com/erigontech/erigon/rpc/jsonrpc/receipts"
 )
@@ -248,7 +252,7 @@ func TestGetBlockHeaders(t *testing.T) {
 		backend.ReceiveWg.Add(1)
 		encodedMessage, err := rlp.EncodeToBytes(eth.GetBlockHeadersPacket66{RequestId: 1, GetBlockHeadersPacket: tt.query})
 		require.NoError(t, err)
-		for _, err = range backend.Send(&sentry.InboundMessage{Id: eth.ToProto[direct.ETH68][eth.GetBlockHeadersMsg], Data: encodedMessage, PeerId: backend.PeerId}) {
+		for _, err = range backend.Send(&sentryproto.InboundMessage{Id: eth.ToProto[direct.ETH68][eth.GetBlockHeadersMsg], Data: encodedMessage, PeerId: backend.PeerId}) {
 			require.NoError(t, err)
 		}
 		expect, err := rlp.EncodeToBytes(eth.BlockHeadersPacket66{RequestId: 1, BlockHeadersPacket: expectedHeaders})
@@ -298,7 +302,7 @@ func TestGetBlockReceipts(t *testing.T) {
 	}
 	// Assemble the test environment
 	m := mockWithGenerator(t, 4, generator)
-	receiptsGetter := receipts.NewGenerator(m.BlockReader, m.Engine, time.Minute)
+	receiptsGetter := receipts.NewGenerator(m.BlockReader, m.Engine, time.Minute, nil)
 	// Collect the hashes to request, and the response to expect
 	var (
 		hashes   []common.Hash
@@ -330,7 +334,7 @@ func TestGetBlockReceipts(t *testing.T) {
 
 	m.ReceiveWg.Add(1)
 	// Send the hash request and verify the response
-	for _, err = range m.Send(&sentry.InboundMessage{Id: eth.ToProto[direct.ETH67][eth.GetReceiptsMsg], Data: b, PeerId: m.PeerId}) {
+	for _, err = range m.Send(&sentryproto.InboundMessage{Id: eth.ToProto[direct.ETH67][eth.GetReceiptsMsg], Data: b, PeerId: m.PeerId}) {
 		require.NoError(t, err)
 	}
 
@@ -342,7 +346,231 @@ func TestGetBlockReceipts(t *testing.T) {
 	require.Equal(t, expect, sent.Data)
 }
 
-// newTestBackend creates a chain with a number of explicitly defined blocks and
+func TestReadStateSyncReceiptByHash_Found(t *testing.T) {
+	m := mock.Mock(t)
+	// Enable receipt cache domain
+	m.DB.(state.HasAgg).Agg().(*state.Aggregator).EnableDomain(kv.RCacheDomain)
+
+	txRw, err := m.DB.BeginTemporalRw(m.Ctx)
+	require.NoError(t, err)
+	defer txRw.Rollback()
+	ctx := m.Ctx
+	br := m.BlockReader
+	txNumReader := br.TxnumReader(ctx)
+
+	// Create a fake (legacy) transaction
+	tx := types.NewTransaction(
+		0,
+		common.HexToAddress("0x01"),
+		uint256.NewInt(0),
+		21000,
+		uint256.NewInt(1),
+		nil,
+	)
+	body := &types.Body{Transactions: types.Transactions{tx}}
+	header := &types.Header{
+		Number:      big.NewInt(1),
+		TxHash:      types.DeriveSha(types.Transactions{tx}),
+		UncleHash:   empty.UncleHash,
+		ReceiptHash: empty.RootHash,
+	}
+
+	// Write header and body to DB
+	require.NoError(t, rawdb.WriteCanonicalHash(txRw, header.Hash(), 1))
+	require.NoError(t, rawdb.WriteHeader(txRw, header))
+	require.NoError(t, rawdb.WriteBody(txRw, header.Hash(), 1, body))
+
+	// Create a state-sync receipt (Type == 0 as legacy, CumulativeGasUsed == 0)
+	ssr := &types.Receipt{
+		Type:              0,
+		CumulativeGasUsed: 0,
+		TxHash:            tx.Hash(),
+		BlockHash:         header.Hash(),
+		BlockNumber:       header.Number,
+		TransactionIndex:  0,
+		Status:            types.ReceiptStatusSuccessful,
+	}
+	ssr.Bloom = types.CreateBloom(types.Receipts{ssr})
+
+	// Insert into the receipt cache
+	sd, err := state.NewSharedDomains(txRw, log.New())
+	require.NoError(t, err)
+	defer sd.Close()
+
+	base, err := txNumReader.Min(txRw, 1)
+	require.NoError(t, err)
+
+	require.NoError(t, rawdb.WriteReceiptCacheV2(sd.AsPutDel(txRw), nil, base))
+	require.NoError(t, rawdb.WriteReceiptCacheV2(sd.AsPutDel(txRw), ssr, base+1))
+	require.NoError(t, rawdb.WriteReceiptCacheV2(sd.AsPutDel(txRw), nil, base+2))
+
+	_, err = sd.ComputeCommitment(ctx, true, header.Number.Uint64(), base+2, "flush")
+	require.NoError(t, err)
+	require.NoError(t, sd.Flush(ctx, txRw))
+
+	// Build the block
+	b := types.NewBlockFromStorage(header.Hash(), header, body.Transactions, body.Uncles, nil)
+	require.NotNil(t, b)
+
+	// Assert state-sync receipt is found
+	got, err := rawdb.ReadReceiptsCacheV2(txRw, b, txNumReader)
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	require.Equal(t, got.Len(), 1)
+
+	r := got[0]
+
+	require.Equal(t, tx.Hash(), r.TxHash)
+	require.Equal(t, header.Hash(), r.BlockHash)
+	require.Equal(t, header.Number.Uint64(), r.BlockNumber.Uint64())
+}
+
+func TestReadStateSyncReceiptByHash_NoStateSync(t *testing.T) {
+	m := mock.Mock(t)
+	m.DB.(state.HasAgg).Agg().(*state.Aggregator).EnableDomain(kv.RCacheDomain)
+
+	txRw, err := m.DB.BeginTemporalRw(m.Ctx)
+	require.NoError(t, err)
+	defer txRw.Rollback()
+
+	ctx := m.Ctx
+	br := m.BlockReader
+	txNumReader := br.TxnumReader(ctx)
+
+	// Single transaction block
+	tx := types.NewTransaction(0, common.HexToAddress("0x02"), uint256.NewInt(0), 21000, uint256.NewInt(1), nil)
+	body := &types.Body{Transactions: types.Transactions{tx}}
+
+	header := &types.Header{
+		Number:      big.NewInt(2),
+		TxHash:      types.DeriveSha(types.Transactions(body.Transactions)),
+		UncleHash:   empty.UncleHash,
+		ReceiptHash: empty.RootHash,
+	}
+
+	require.NoError(t, rawdb.WriteCanonicalHash(txRw, header.Hash(), 2))
+	require.NoError(t, rawdb.WriteHeader(txRw, header))
+	require.NoError(t, rawdb.WriteBody(txRw, header.Hash(), 2, body))
+
+	// No state-sync receipt (CumulativeGasUsed != 0)
+	norm := &types.Receipt{
+		Type:              0,
+		CumulativeGasUsed: 21000,
+		TxHash:            tx.Hash(),
+		BlockHash:         header.Hash(),
+		BlockNumber:       header.Number,
+		TransactionIndex:  0,
+		Status:            types.ReceiptStatusSuccessful,
+	}
+	norm.Bloom = types.CreateBloom(types.Receipts{norm})
+
+	sd, err := state.NewSharedDomains(txRw, log.New())
+	require.NoError(t, err)
+	defer sd.Close()
+
+	base, err := txNumReader.Min(txRw, 1)
+	require.NoError(t, err)
+
+	require.NoError(t, rawdb.WriteReceiptCacheV2(sd.AsPutDel(txRw), norm, base))
+	require.NoError(t, sd.Flush(ctx, txRw))
+
+	b := types.NewBlockFromStorage(header.Hash(), header, body.Transactions, body.Uncles, nil)
+	require.NotNil(t, b)
+
+	// Expect nil (no state-sync)
+	got, err := rawdb.ReadReceiptsCacheV2(txRw, b, txNumReader)
+	require.NoError(t, err)
+	require.Equal(t, got.Len(), 0)
+}
+
+func TestReadStateSyncReceiptByHash_EqualGasUsedStateSync(t *testing.T) {
+	m := mock.Mock(t)
+	m.DB.(state.HasAgg).Agg().(*state.Aggregator).EnableDomain(kv.RCacheDomain)
+
+	txRw, err := m.DB.BeginTemporalRw(m.Ctx)
+	require.NoError(t, err)
+	defer txRw.Rollback()
+
+	ctx := m.Ctx
+	br := m.BlockReader
+	txNumReader := br.TxnumReader(ctx)
+
+	// Create two transactions: one "normal" and one state-sync
+	tx1 := types.NewTransaction(0, common.HexToAddress("0x10"), uint256.NewInt(0), 21000, uint256.NewInt(1), nil)
+	tx2 := types.NewTransaction(1, common.HexToAddress("0x11"), uint256.NewInt(0), 21000, uint256.NewInt(1), nil)
+	body := &types.Body{Transactions: types.Transactions{tx1, tx2}}
+
+	header := &types.Header{
+		Number:      big.NewInt(3),
+		TxHash:      types.DeriveSha(types.Transactions(body.Transactions)),
+		UncleHash:   empty.UncleHash,
+		ReceiptHash: empty.RootHash,
+	}
+
+	require.NoError(t, rawdb.WriteCanonicalHash(txRw, header.Hash(), 3))
+	require.NoError(t, rawdb.WriteHeader(txRw, header))
+	require.NoError(t, rawdb.WriteBody(txRw, header.Hash(), 3, body))
+
+	// Receipt 1: normal tx
+	r1 := &types.Receipt{
+		Type:              0,
+		CumulativeGasUsed: 21000,
+		TxHash:            tx1.Hash(),
+		BlockHash:         header.Hash(),
+		BlockNumber:       header.Number,
+		TransactionIndex:  0,
+		Status:            types.ReceiptStatusSuccessful,
+	}
+	// Receipt 2: equal cumulative gas used (state-sync)
+	r2 := &types.Receipt{
+		Type:              0,
+		CumulativeGasUsed: 21000, // same as r1
+		TxHash:            tx2.Hash(),
+		BlockHash:         header.Hash(),
+		BlockNumber:       header.Number,
+		TransactionIndex:  1,
+		Status:            types.ReceiptStatusSuccessful,
+	}
+	r1.Bloom = types.CreateBloom(types.Receipts{r1})
+	r2.Bloom = types.CreateBloom(types.Receipts{r2})
+
+	// Insert into receipts cache domain
+	sd, err := state.NewSharedDomains(txRw, log.New())
+	require.NoError(t, err)
+	defer sd.Close()
+
+	base, err := txNumReader.Min(txRw, 1)
+	require.NoError(t, err)
+
+	// Write receipts
+	require.NoError(t, rawdb.WriteReceiptCacheV2(sd.AsPutDel(txRw), r1, base))
+	require.NoError(t, rawdb.WriteReceiptCacheV2(sd.AsPutDel(txRw), r2, base+1))
+	require.NoError(t, rawdb.WriteReceiptCacheV2(sd.AsPutDel(txRw), nil, base+2))
+
+	// Compute commitment with base+2 to include both receipts (base and base+1)
+	_, err = sd.ComputeCommitment(ctx, true, header.Number.Uint64(), base+2, "flush")
+	require.NoError(t, err)
+	require.NoError(t, sd.Flush(ctx, txRw))
+
+	// Build the block
+	b := types.NewBlockFromStorage(header.Hash(), header, body.Transactions, body.Uncles, nil)
+	require.NotNil(t, b)
+
+	// Expect ssTx found: receipt r2
+	got, err := rawdb.ReadReceiptsCacheV2(txRw, b, txNumReader)
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	require.Equal(t, got.Len(), 2)
+
+	r := got[1]
+
+	require.Equal(t, tx2.Hash(), r.TxHash)
+	require.Equal(t, r2.CumulativeGasUsed, r.CumulativeGasUsed)
+	require.Equal(t, header.Hash(), r.BlockHash)
+	require.Equal(t, header.Number.Uint64(), r.BlockNumber.Uint64())
+}
+
+// mockWithGenerator creates a chain with a number of explicitly defined blocks and
 // wraps it into a mock backend.
 func mockWithGenerator(t *testing.T, blocks int, generator func(int, *core.BlockGen)) *mock.MockSentry {
 	m := mock.MockWithGenesis(t, &types.Genesis{

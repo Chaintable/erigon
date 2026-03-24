@@ -27,18 +27,18 @@ import (
 	"github.com/erigontech/erigon-lib/common"
 	"github.com/erigontech/erigon-lib/common/dbg"
 	"github.com/erigontech/erigon-lib/common/hexutil"
-	"github.com/erigontech/erigon-lib/jsonstream"
 	"github.com/erigontech/erigon-lib/log/v3"
-	"github.com/erigontech/erigon-lib/types"
 	"github.com/erigontech/erigon/core"
 	"github.com/erigontech/erigon/core/state"
 	"github.com/erigontech/erigon/core/vm"
 	"github.com/erigontech/erigon/core/vm/evmtypes"
 	tracersConfig "github.com/erigontech/erigon/eth/tracers/config"
+	"github.com/erigontech/erigon/execution/types"
 	bortypes "github.com/erigontech/erigon/polygon/bor/types"
 	polygontracer "github.com/erigontech/erigon/polygon/tracer"
 	"github.com/erigontech/erigon/rpc"
 	"github.com/erigontech/erigon/rpc/ethapi"
+	"github.com/erigontech/erigon/rpc/jsonstream"
 	"github.com/erigontech/erigon/rpc/rpchelper"
 	"github.com/erigontech/erigon/turbo/transactions"
 )
@@ -64,6 +64,12 @@ func (api *DebugAPIImpl) traceBlock(ctx context.Context, blockNrOrHash rpc.Block
 	if err != nil {
 		return err
 	}
+
+	if blockNumber == 0 {
+		stream.WriteNil()
+		return fmt.Errorf("genesis is not traceable")
+	}
+
 	block, err := api.blockWithSenders(ctx, tx, hash, blockNumber)
 	if err != nil {
 		return err
@@ -106,7 +112,9 @@ func (api *DebugAPIImpl) traceBlock(ctx context.Context, blockNrOrHash rpc.Block
 
 	var borStateSyncTxn types.Transaction
 
-	if *config.BorTraceEnabled {
+	// Pre-Madhugiri the state sync txs are "synthetic", so we optionally append tracer-only txs.
+	// Post-Madhugiri the state-sync is a "real" tx, so we don't append the synthetic ones.
+	if *config.BorTraceEnabled && chainConfig.Bor != nil && !chainConfig.Bor.IsMadhugiri(block.NumberU64()) {
 		borStateSyncTxHash := bortypes.ComputeBorTxHash(block.NumberU64(), block.Hash())
 
 		_, ok, err := api.bridgeReader.EventTxnLookup(ctx, borStateSyncTxHash)
@@ -122,10 +130,18 @@ func (api *DebugAPIImpl) traceBlock(ctx context.Context, blockNrOrHash rpc.Block
 
 	var gasUsed uint64
 	for txnIndex, txn := range txns {
-		isBorStateSyncTxn := borStateSyncTxn == txn
+		// Synthetic bor state-sync tx (pre-Madhugiri) or real bor state-sync tx (post-Madhugiri)
+		isSyntheticTxBorStateSync := borStateSyncTxn == txn
+		isRealTxBorStateSync := txn != nil && txn.Type() == types.StateSyncTxType
+		isBorStateSyncTxn := isSyntheticTxBorStateSync || isRealTxBorStateSync
 		var txnHash common.Hash
 		if isBorStateSyncTxn {
-			txnHash = bortypes.ComputeBorTxHash(block.NumberU64(), block.Hash())
+			if isSyntheticTxBorStateSync {
+				txnHash = bortypes.ComputeBorTxHash(block.NumberU64(), block.Hash())
+			} else {
+				// real state-sync tx has a real hash
+				txnHash = txn.Hash()
+			}
 		} else {
 			txnHash = txn.Hash()
 		}
@@ -141,16 +157,11 @@ func (api *DebugAPIImpl) traceBlock(ctx context.Context, blockNrOrHash rpc.Block
 			return ctx.Err()
 		}
 		ibs.SetTxContext(blockCtx.BlockNumber, txnIndex)
-		msg, _ := txn.AsMessage(*signer, block.BaseFee(), rules)
-
-		txCtx := evmtypes.TxContext{
-			TxHash:     txnHash,
-			Origin:     msg.From(),
-			GasPrice:   msg.GasPrice(),
-			BlobHashes: msg.BlobHashes(),
-		}
-
+		msg := &types.Message{}
 		if isBorStateSyncTxn {
+			if rules.IsMadhugiri {
+				msg.SetIsFree(true)
+			}
 			var stateSyncEvents []*types.Message
 			stateSyncEvents, err = api.bridgeReader.Events(ctx, block.Hash(), blockNumber)
 			if err != nil {
@@ -158,6 +169,7 @@ func (api *DebugAPIImpl) traceBlock(ctx context.Context, blockNrOrHash rpc.Block
 			}
 
 			var _gasUsed uint64
+			//nolint:ineffassign // err is checked below
 			_gasUsed, err = polygontracer.TraceBorStateSyncTxnDebugAPI(
 				ctx,
 				chainConfig,
@@ -174,7 +186,13 @@ func (api *DebugAPIImpl) traceBlock(ctx context.Context, blockNrOrHash rpc.Block
 			)
 			gasUsed += _gasUsed
 		} else {
+			// compute the message and txCtx to run transaction tracer only for "normal" txs and not synthetic state syncs
+			msg, txCtx, err := transactions.ComputeTxContext(ibs, engine, rules, signer, block, chainConfig, txnIndex)
+			if err != nil {
+				return err
+			}
 			var _gasUsed uint64
+			//nolint:ineffassign // err is checked below
 			_gasUsed, err = transactions.TraceTx(ctx, engine, txn, msg, blockCtx, txCtx, block.Hash(), txnIndex, ibs, config, chainConfig, stream, api.evmCallTimeout)
 			gasUsed += _gasUsed
 		}
@@ -234,6 +252,7 @@ func (api *DebugAPIImpl) TraceTransaction(ctx context.Context, hash common.Hash,
 	if err != nil {
 		return err
 	}
+
 	if !ok {
 		if chainConfig.Bor == nil {
 			stream.WriteNil()
@@ -256,6 +275,11 @@ func (api *DebugAPIImpl) TraceTransaction(ctx context.Context, hash common.Hash,
 		}
 
 		isBorStateSyncTxn = true
+	}
+
+	if blockNum == 0 {
+		stream.WriteNil()
+		return fmt.Errorf("genesis is not traceable")
 	}
 
 	// check pruning to ensure we have history at this block level
@@ -519,7 +543,7 @@ func (api *DebugAPIImpl) TraceCallMany(ctx context.Context, bundles []Bundle, si
 	blockCtx = core.NewEVMBlockContext(header, getHash, api.engine(), nil /* author */, chainConfig)
 	// Get a new instance of the EVM
 	evm = vm.NewEVM(blockCtx, txCtx, ibs, chainConfig, vm.Config{})
-	rules := chainConfig.Rules(blockNum, blockCtx.Time)
+	rules := evm.ChainRules()
 
 	// after replaying the txns, we want to overload the state
 	if config.StateOverrides != nil {

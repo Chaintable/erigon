@@ -25,30 +25,30 @@ import (
 	"io"
 	"math/bits"
 
-	"github.com/erigontech/erigon-lib/common/dbg"
-
-	gokzg4844 "github.com/crate-crypto/go-kzg-4844"
+	goethkzg "github.com/crate-crypto/go-eth-kzg"
 	"github.com/erigontech/secp256k1"
 	"github.com/holiman/uint256"
 	"golang.org/x/crypto/sha3"
 
-	"github.com/erigontech/erigon-lib/chain/params"
 	"github.com/erigontech/erigon-lib/common"
+	"github.com/erigontech/erigon-lib/common/dbg"
 	"github.com/erigontech/erigon-lib/common/length"
 	"github.com/erigontech/erigon-lib/common/u256"
 	"github.com/erigontech/erigon-lib/crypto"
 	"github.com/erigontech/erigon-lib/gointerfaces/typesproto"
-	"github.com/erigontech/erigon-lib/rlp"
-	"github.com/erigontech/erigon-lib/types"
+	"github.com/erigontech/erigon/execution/chain/params"
+	"github.com/erigontech/erigon/execution/rlp"
+	"github.com/erigontech/erigon/execution/types"
 )
 
 const (
 	LegacyTxnType     byte = 0
-	AccessListTxnType byte = 1 // EIP-2930
-	DynamicFeeTxnType byte = 2 // EIP-1559
-	BlobTxnType       byte = 3 // EIP-4844
-	SetCodeTxnType    byte = 4 // EIP-7702
-	AATxnType         byte = 5 // RIP-7560
+	AccessListTxnType byte = 1   // EIP-2930
+	DynamicFeeTxnType byte = 2   // EIP-1559
+	BlobTxnType       byte = 3   // EIP-4844
+	SetCodeTxnType    byte = 4   // EIP-7702
+	AATxnType         byte = 5   // RIP-7560
+	StateSyncTxType   byte = 127 // PIP-74
 )
 
 var ErrParseTxn = fmt.Errorf("%w transaction", rlp.ErrParse)
@@ -159,7 +159,7 @@ func (ctx *TxnParseContext) ParseTransaction(payload []byte, pos int, slot *TxnS
 	// If it is non-legacy transaction, the transaction type follows, and then the list
 	if !legacy {
 		slot.Type = payload[p]
-		if slot.Type > AATxnType {
+		if slot.Type > AATxnType && slot.Type != StateSyncTxType {
 			return 0, fmt.Errorf("%w: unknown transaction type: %d", ErrParseTxn, slot.Type)
 		}
 		p++
@@ -202,6 +202,9 @@ func (ctx *TxnParseContext) ParseTransaction(payload []byte, pos int, slot *TxnS
 		proofsPerBlob := 1
 		_, dataLen, err = rlp.ParseString(payload, p)
 		if err == nil && dataLen == 1 {
+			if payload[p] != 0x01 { // Validate wrapper_version == 1 for EIP-7594
+				return 0, fmt.Errorf("%w: invalid wrapper version: expected 1, got %d", ErrParseTxn, payload[p])
+			}
 			p = p + 1
 			proofsPerBlob = int(params.CellsPerExtBlob)
 		}
@@ -234,15 +237,21 @@ func (ctx *TxnParseContext) ParseTransaction(payload []byte, pos int, slot *TxnS
 		commitmentPos := dataPos
 		blobIdx = 0
 		for commitmentPos < dataPos+dataLen {
+			if blobIdx >= len(slot.BlobBundles) {
+				return 0, fmt.Errorf("%w: more commitments than blobs (%d > %d)", ErrParseTxn, blobIdx+1, len(slot.BlobBundles))
+			}
 			commitmentPos, err = rlp.StringOfLen(payload, commitmentPos, 48)
 			if err != nil {
 				return 0, fmt.Errorf("%w: commitment: %s", ErrParseTxn, err) //nolint
 			}
-			var commitment gokzg4844.KZGCommitment
+			var commitment goethkzg.KZGCommitment
 			copy(commitment[:], payload[commitmentPos:commitmentPos+48])
 			slot.BlobBundles[blobIdx].Commitment = commitment
 			commitmentPos += 48
 			blobIdx++
+		}
+		if blobIdx != len(slot.BlobBundles) {
+			return 0, fmt.Errorf("%w: fewer commitments than blobs (%d < %d)", ErrParseTxn, blobIdx, len(slot.BlobBundles))
 		}
 		if commitmentPos != dataPos+dataLen {
 			return 0, fmt.Errorf("%w: extraneous space in commitments", ErrParseTxn)
@@ -254,13 +263,13 @@ func (ctx *TxnParseContext) ParseTransaction(payload []byte, pos int, slot *TxnS
 			return 0, fmt.Errorf("%w: proofs len: %s", ErrParseTxn, err) //nolint
 		}
 		proofPos := dataPos
-		proofs := make([]gokzg4844.KZGProof, 0)
+		proofs := make([]goethkzg.KZGProof, 0)
 		for proofPos < dataPos+dataLen {
 			proofPos, err = rlp.StringOfLen(payload, proofPos, 48)
 			if err != nil {
 				return 0, fmt.Errorf("%w: proof: %s", ErrParseTxn, err) //nolint
 			}
-			var proof gokzg4844.KZGProof
+			var proof goethkzg.KZGProof
 			copy(proof[:], payload[proofPos:proofPos+48])
 			proofs = append(proofs, proof)
 			proofPos += 48
@@ -844,9 +853,9 @@ type AuthAndNonce struct {
 }
 
 type PoolBlobBundle struct {
-	Commitment gokzg4844.KZGCommitment
+	Commitment goethkzg.KZGCommitment
 	Blob       []byte
-	Proofs     []gokzg4844.KZGProof // Can be 1 or more Proofs/CellProofs
+	Proofs     []goethkzg.KZGProof // Can be 1 or more Proofs/CellProofs
 }
 
 // TxnSlot contains information extracted from an Ethereum transaction, which is enough to manage it inside the transaction.
@@ -897,16 +906,16 @@ func (tx *TxnSlot) Blobs() [][]byte {
 	return b
 }
 
-func (tx *TxnSlot) Commitments() []gokzg4844.KZGCommitment {
-	c := make([]gokzg4844.KZGCommitment, 0, len(tx.BlobBundles))
+func (tx *TxnSlot) Commitments() []goethkzg.KZGCommitment {
+	c := make([]goethkzg.KZGCommitment, 0, len(tx.BlobBundles))
 	for _, bb := range tx.BlobBundles {
 		c = append(c, bb.Commitment)
 	}
 	return c
 }
 
-func (tx *TxnSlot) Proofs() []gokzg4844.KZGProof {
-	p := make([]gokzg4844.KZGProof, 0, len(tx.BlobBundles))
+func (tx *TxnSlot) Proofs() []goethkzg.KZGProof {
+	p := make([]goethkzg.KZGProof, 0, len(tx.BlobBundles))
 	for _, bb := range tx.BlobBundles {
 		p = append(p, bb.Proofs...)
 	}

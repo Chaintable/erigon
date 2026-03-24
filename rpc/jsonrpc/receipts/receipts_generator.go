@@ -7,25 +7,26 @@ import (
 	"sync"
 	"time"
 
-	"github.com/erigontech/erigon-db/rawdb"
-	"github.com/erigontech/erigon-db/rawdb/rawtemporaldb"
-	"github.com/erigontech/erigon-lib/chain"
+	"github.com/google/go-cmp/cmp"
+	lru "github.com/hashicorp/golang-lru/v2"
+
 	"github.com/erigontech/erigon-lib/common"
 	"github.com/erigontech/erigon-lib/common/dbg"
-	"github.com/erigontech/erigon-lib/kv"
-	"github.com/erigontech/erigon-lib/kv/rawdbv3"
 	"github.com/erigontech/erigon-lib/log/v3"
-	"github.com/erigontech/erigon-lib/types"
 	"github.com/erigontech/erigon/core"
 	"github.com/erigontech/erigon/core/state"
 	"github.com/erigontech/erigon/core/vm"
 	"github.com/erigontech/erigon/core/vm/evmtypes"
+	"github.com/erigontech/erigon/db/kv"
+	"github.com/erigontech/erigon/db/kv/rawdbv3"
+	"github.com/erigontech/erigon/db/rawdb"
+	"github.com/erigontech/erigon/db/rawdb/rawtemporaldb"
+	"github.com/erigontech/erigon/execution/aa"
+	"github.com/erigontech/erigon/execution/chain"
 	"github.com/erigontech/erigon/execution/consensus"
-	"github.com/erigontech/erigon/polygon/aa"
+	"github.com/erigontech/erigon/execution/types"
 	"github.com/erigontech/erigon/turbo/services"
 	"github.com/erigontech/erigon/turbo/transactions"
-	"github.com/google/go-cmp/cmp"
-	lru "github.com/hashicorp/golang-lru/v2"
 )
 
 type Generator struct {
@@ -45,6 +46,8 @@ type Generator struct {
 	blockReader services.FullBlockReader
 	txNumReader rawdbv3.TxNumsReader
 	engine      consensus.EngineReader
+
+	borGenerator *BorGenerator // to handle state-sync receipts only if needed
 }
 
 type ReceiptEnv struct {
@@ -62,7 +65,7 @@ var (
 	receiptsCacheTrace = dbg.EnvBool("R_LRU_TRACE", false)
 )
 
-func NewGenerator(blockReader services.FullBlockReader, engine consensus.EngineReader, evmTimeout time.Duration) *Generator {
+func NewGenerator(blockReader services.FullBlockReader, engine consensus.EngineReader, evmTimeout time.Duration, borGenerator *BorGenerator) *Generator {
 	receiptsCache, err := lru.New[common.Hash, types.Receipts](receiptsCacheLimit) //TODO: is handling both of them a good idea though...?
 	if err != nil {
 		panic(err)
@@ -87,6 +90,8 @@ func NewGenerator(blockReader services.FullBlockReader, engine consensus.EngineR
 
 		blockExecMutex: &loaderMutex[common.Hash]{},
 		txnExecMutex:   &loaderMutex[common.Hash]{},
+
+		borGenerator: borGenerator,
 	}
 }
 
@@ -148,6 +153,11 @@ func (g *Generator) addToCacheReceipt(hash common.Hash, receipt *types.Receipt) 
 }
 
 func (g *Generator) GetReceipt(ctx context.Context, cfg *chain.Config, tx kv.TemporalTx, header *types.Header, txn types.Transaction, index int, txNum uint64) (*types.Receipt, error) {
+	// Use bor receipt generator for state-sync txns, exit early
+	if txn.Type() == types.StateSyncTxType {
+		return nil, fmt.Errorf("ReceiptGen.GetReceipt: txn is a state-sync transaction")
+	}
+
 	blockHash := header.Hash()
 	blockNum := header.Number.Uint64()
 	txnHash := txn.Hash()
@@ -276,12 +286,19 @@ func (g *Generator) GetReceipt(ctx context.Context, cfg *chain.Config, tx kv.Tem
 	return receipt, nil
 }
 
+// GetReceipts regenerates or loads receipts for a given block
+// This DOES NOT generate state-sync transaction receipt for bor.
 func (g *Generator) GetReceipts(ctx context.Context, cfg *chain.Config, tx kv.TemporalTx, block *types.Block) (types.Receipts, error) {
 	blockHash := block.Hash()
 
-	//if can find in DB - then don't need store in `receiptsCache` - because DB it's already kind-of cache (small, mmaped, hot file)
 	var receiptsFromDB types.Receipts
-	receipts := make(types.Receipts, len(block.Transactions()))
+	var txCount = len(block.Transactions())
+	if txCount > 0 {
+		if block.Transactions()[txCount-1].Type() == types.StateSyncTxType {
+			txCount-- // exclude state-sync tx
+		}
+	}
+	receipts := make(types.Receipts, txCount)
 	defer func() {
 		if dbg.Enabled(ctx) {
 			log.Info("[dbg] ReceiptGenerator.GetReceipts",
@@ -290,10 +307,11 @@ func (g *Generator) GetReceipts(ctx context.Context, cfg *chain.Config, tx kv.Te
 		}
 	}()
 
-	mu := g.blockExecMutex.lock(blockHash) // parallel requests of same blockNum will executed only once
+	mu := g.blockExecMutex.lock(blockHash) // parallel requests of the same blockNum will be executed only once
 	defer g.blockExecMutex.unlock(mu, blockHash)
-	if receipts, ok := g.receiptsCache.Get(blockHash); ok {
-		return receipts, nil
+
+	if cachedReceipts, ok := g.receiptsCache.Get(blockHash); ok {
+		return cachedReceipts, nil
 	}
 
 	if !rpcDisableRCache {
@@ -302,9 +320,13 @@ func (g *Generator) GetReceipts(ctx context.Context, cfg *chain.Config, tx kv.Te
 		if err != nil {
 			return nil, err
 		}
-		if len(receiptsFromDB) > 0 && !dbg.AssertEnabled {
+		// Only trust cache if it has the full expected receipts count (to avoid any silent truncation)
+		if len(receiptsFromDB) > 0 && !dbg.AssertEnabled && len(receiptsFromDB) == txCount {
 			g.addToCacheReceipts(block.HeaderNoCopy(), receiptsFromDB)
 			return receiptsFromDB, nil
+		} else {
+			log.Warn("Receipts cache length mismatch, regenerating...",
+				"block", block.NumberU64(), "cached", len(receiptsFromDB), "expected", txCount)
 		}
 	}
 
@@ -322,11 +344,17 @@ func (g *Generator) GetReceipts(ctx context.Context, cfg *chain.Config, tx kv.Te
 	ctx, cancel := context.WithTimeout(ctx, g.evmTimeout)
 	defer cancel()
 
+	// Handle normal transactions
 	for i, txn := range block.Transactions() {
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		default:
+		}
+
+		// skip state-sync transaction
+		if txn.Type() == types.StateSyncTxType {
+			continue
 		}
 
 		evm := core.CreateEVM(cfg, core.GetHashFn(genEnv.header, genEnv.getHeader), g.engine, nil, genEnv.ibs, genEnv.header, vmCfg)
@@ -423,6 +451,14 @@ func (g *Generator) GetReceiptsGasUsed(tx kv.TemporalTx, block *types.Block, txN
 	}
 
 	return receipts, nil
+}
+
+func (g *Generator) extractBorEvents(ctx context.Context, block *types.Block) ([]*types.Message, error) {
+	events, err := g.borGenerator.bridgeReader.Events(ctx, block.Hash(), block.NumberU64())
+	if err != nil {
+		return nil, err
+	}
+	return events, nil
 }
 
 type loaderMutex[K comparable] struct {

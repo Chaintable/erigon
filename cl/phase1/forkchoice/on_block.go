@@ -26,7 +26,6 @@ import (
 	"github.com/erigontech/erigon-lib/common"
 	"github.com/erigontech/erigon-lib/common/hexutil"
 	"github.com/erigontech/erigon-lib/log/v3"
-	"github.com/erigontech/erigon-lib/types"
 	"github.com/erigontech/erigon/cl/beacon/beaconevents"
 	"github.com/erigontech/erigon/cl/clparams"
 	"github.com/erigontech/erigon/cl/cltypes"
@@ -39,6 +38,7 @@ import (
 	"github.com/erigontech/erigon/cl/utils"
 	"github.com/erigontech/erigon/cl/utils/eth_clock"
 	"github.com/erigontech/erigon/eth/ethutils"
+	"github.com/erigontech/erigon/execution/types"
 )
 
 const foreseenProposers = 16
@@ -115,8 +115,15 @@ func (f *ForkChoiceStore) OnBlock(ctx context.Context, block *cltypes.SignedBeac
 		})
 	}
 
-	// Check if blob data is available
-	if checkDataAvaiability && block.Block.Body.BlobKzgCommitments.Len() > 0 {
+	elHasBlobs := false
+	if f.engine != nil && checkDataAvaiability && block.Block.Body.BlobKzgCommitments.Len() > 0 && !f.peerDas.IsArchivedMode() {
+		blobsWithProof, proofs := f.engine.GetBlobs(ctx, versionedHashes)
+		elHasBlobs = len(blobsWithProof) == len(versionedHashes) && len(proofs) == len(versionedHashes)
+		log.Debug("OnBlock: EL blob data availability", "blockRoot", common.Hash(blockRoot), "elHasBlobs", elHasBlobs)
+	}
+
+	// Check if blob data is available (skip if blobs are in txpool)
+	if checkDataAvaiability && block.Block.Body.BlobKzgCommitments.Len() > 0 && !elHasBlobs {
 		if block.Version() >= clparams.FuluVersion {
 			available, err := f.peerDas.IsDataAvailable(block.Block.Slot, blockRoot)
 			if err != nil {

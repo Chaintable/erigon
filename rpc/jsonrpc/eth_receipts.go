@@ -23,17 +23,17 @@ import (
 
 	"github.com/RoaringBitmap/roaring/v2"
 
-	"github.com/erigontech/erigon-lib/chain"
 	"github.com/erigontech/erigon-lib/common"
-	"github.com/erigontech/erigon-lib/kv"
-	"github.com/erigontech/erigon-lib/kv/order"
-	"github.com/erigontech/erigon-lib/kv/rawdbv3"
-	"github.com/erigontech/erigon-lib/kv/stream"
 	"github.com/erigontech/erigon-lib/log/v3"
-	"github.com/erigontech/erigon-lib/types"
 	"github.com/erigontech/erigon/core/state"
+	"github.com/erigontech/erigon/db/kv"
+	"github.com/erigontech/erigon/db/kv/order"
+	"github.com/erigontech/erigon/db/kv/rawdbv3"
+	"github.com/erigontech/erigon/db/kv/stream"
 	"github.com/erigontech/erigon/eth/ethutils"
 	"github.com/erigontech/erigon/eth/filters"
+	"github.com/erigontech/erigon/execution/chain"
+	"github.com/erigontech/erigon/execution/types"
 	bortypes "github.com/erigontech/erigon/polygon/bor/types"
 	"github.com/erigontech/erigon/rpc"
 	"github.com/erigontech/erigon/rpc/rpchelper"
@@ -66,9 +66,9 @@ func (api *BaseAPI) getCachedReceipts(ctx context.Context, hash common.Hash) (ty
 }
 
 // GetLogs implements eth_getLogs. Returns an array of logs matching a given filter object.
-func (api *APIImpl) GetLogs(ctx context.Context, crit filters.FilterCriteria) (types.Logs, error) {
+func (api *APIImpl) GetLogs(ctx context.Context, crit filters.FilterCriteria) (types.RPCLogs, error) {
 	var begin, end uint64
-	logs := types.Logs{}
+	logs := types.RPCLogs{}
 
 	tx, beginErr := api.db.BeginTemporalRo(ctx)
 	if beginErr != nil {
@@ -109,7 +109,7 @@ func (api *APIImpl) GetLogs(ctx context.Context, crit filters.FilterCriteria) (t
 			}
 
 			if begin > latest {
-				return types.Logs{}, nil
+				return types.RPCLogs{}, nil
 			}
 		}
 		end = latest
@@ -145,21 +145,54 @@ func (api *APIImpl) GetLogs(ctx context.Context, crit filters.FilterCriteria) (t
 	if err != nil {
 		return nil, err
 	}
-	logs = make(types.Logs, len(erigonLogs))
+
+	rpcLogs := make(types.RPCLogs, len(erigonLogs))
 	for i, log := range erigonLogs {
-		logs[i] = &types.Log{
-			Address:     log.Address,
-			Topics:      log.Topics,
-			Data:        log.Data,
-			BlockNumber: log.BlockNumber,
-			TxHash:      log.TxHash,
-			TxIndex:     log.TxIndex,
-			BlockHash:   log.BlockHash,
-			Index:       log.Index,
-			Removed:     log.Removed,
+		rpcLogs[i] = &types.RPCLog{
+			Log: types.Log{
+				Address:     log.Address,
+				Topics:      log.Topics,
+				Data:        log.Data,
+				BlockNumber: log.BlockNumber,
+				TxHash:      log.TxHash,
+				TxIndex:     log.TxIndex,
+				BlockHash:   log.BlockHash,
+				Index:       log.Index,
+				Removed:     log.Removed,
+			},
+			BlockTimestamp: log.Timestamp,
 		}
 	}
-	return logs, nil
+
+	// For a whole block query (blockHash set, no address/topics filters),
+	// normalize logIndex (if required) to be continuous 0..N-1 in canonical order.
+	/* TODO deactivated for memory spike, although already optimizated with `needsRenumber` addition
+	if isWholeBlockUnfiltered(crit) && len(rpcLogs) > 0 && needsRenumber(rpcLogs) {
+		sort.Slice(rpcLogs, func(i, j int) bool {
+			if rpcLogs[i].BlockNumber == rpcLogs[j].BlockNumber {
+				if rpcLogs[i].TxIndex == rpcLogs[j].TxIndex {
+					return rpcLogs[i].Index < rpcLogs[j].Index
+				}
+				return rpcLogs[i].TxIndex < rpcLogs[j].TxIndex
+			}
+			return rpcLogs[i].BlockNumber < rpcLogs[j].BlockNumber
+		})
+
+		currentBlock := rpcLogs[0].BlockHash
+		var idx uint
+		idx = 0
+		for _, l := range rpcLogs {
+			if l.BlockHash != currentBlock {
+				currentBlock = l.BlockHash
+				idx = 0
+			}
+			l.Index = idx
+			idx++
+		}
+	}
+	*/
+
+	return rpcLogs, nil
 }
 
 func applyFiltersV3(txNumsReader rawdbv3.TxNumsReader, tx kv.TemporalTx, begin, end uint64, crit filters.FilterCriteria, asc order.By) (out stream.U64, err error) {
@@ -242,7 +275,6 @@ func (api *BaseAPI) getLogsV3(ctx context.Context, tx kv.TemporalTx, begin, end 
 		return nil, err
 	}
 
-	//var blockHash common.Hash
 	var header *types.Header
 
 	txNumbers, err := applyFiltersV3(api._txNumReader, tx, begin, end, crit, order.Asc)
@@ -281,6 +313,12 @@ func (api *BaseAPI) getLogsV3(ctx context.Context, tx kv.TemporalTx, begin, end 
 						return nil, err
 					}
 				}
+
+				block, err := api._blockReader.BlockByHash(ctx, tx, header.Hash())
+				if err != nil {
+					return nil, err
+				}
+
 				// check for state sync event logs
 				events, err := api.bridgeReader.Events(ctx, header.Hash(), blockNum)
 				if err != nil {
@@ -291,7 +329,16 @@ func (api *BaseAPI) getLogsV3(ctx context.Context, tx kv.TemporalTx, begin, end 
 					continue
 				}
 
-				borLogs, err := api.borReceiptGenerator.GenerateBorLogs(ctx, events, api._txNumReader, tx, header, chainConfig, txIndex, txNum)
+				// Post HF, calculate the hash directly from txn instead of deriving it from block number and hash.
+				var txHash common.Hash
+				if chainConfig.Bor.IsMadhugiri(block.NumberU64()) {
+					borTx := block.Transactions()[len(block.Transactions())-1]
+					txHash = borTx.Hash()
+				} else {
+					txHash = bortypes.ComputeBorTxHash(block.NumberU64(), block.Hash())
+				}
+
+				borLogs, err := api.borReceiptGenerator.GenerateBorLogs(ctx, events, api._txNumReader, tx, header, chainConfig, txHash, txIndex, txNum)
 				if err != nil {
 					return logs, err
 				}
@@ -451,7 +498,7 @@ func (api *APIImpl) GetTransactionReceipt(ctx context.Context, txnHash common.Ha
 		return nil, err
 	}
 
-	if isBorStateSyncTx {
+	generateBorReceipt := func(txn types.Transaction) (map[string]interface{}, error) {
 		block, err := api.blockByNumberWithSenders(ctx, tx, blockNum)
 		if err != nil {
 			return nil, err
@@ -474,7 +521,12 @@ func (api *APIImpl) GetTransactionReceipt(ctx context.Context, txnHash common.Ha
 			return nil, err
 		}
 
-		return ethutils.MarshalReceipt(borReceipt, bortypes.NewBorTransaction(), chainConfig, block.HeaderNoCopy(), txnHash, false), nil
+		return ethutils.MarshalReceipt(borReceipt, txn, chainConfig, block.HeaderNoCopy(), txnHash, false, true), nil
+	}
+
+	// This case covers state-sync txs before HF as they're not available in the txn lookup
+	if isBorStateSyncTx {
+		return generateBorReceipt(bortypes.NewBorTransaction())
 	}
 
 	var txnIndex = int(txNum - txNumMin - 1)
@@ -484,12 +536,18 @@ func (api *APIImpl) GetTransactionReceipt(ctx context.Context, txnHash common.Ha
 		return nil, err
 	}
 
+	// This case covers state-sync txs post HF as they're available in the txn lookup so we can
+	// use the actual state-sync tx type to generate receipt.
+	if txn.Type() == types.StateSyncTxType {
+		return generateBorReceipt(txn)
+	}
+
 	receipt, err := api.getReceipt(ctx, chainConfig, tx, header, txn, txnIndex, txNum)
 	if err != nil {
 		return nil, fmt.Errorf("getReceipt error: %w", err)
 	}
 
-	return ethutils.MarshalReceipt(receipt, txn, chainConfig, header, txnHash, true), nil
+	return ethutils.MarshalReceipt(receipt, txn, chainConfig, header, txnHash, true, true), nil
 }
 
 // GetBlockReceipts - receipts for individual block
@@ -518,31 +576,83 @@ func (api *APIImpl) GetBlockReceipts(ctx context.Context, numberOrHash rpc.Block
 	if err != nil {
 		return nil, err
 	}
+
+	// Get normal transaction receipts.
+	// This DOES NOT generate state-sync transaction receipt for bor.
 	receipts, err := api.getReceipts(ctx, tx, block)
 	if err != nil {
 		return nil, fmt.Errorf("getReceipts error: %w", err)
 	}
-	result := make([]map[string]interface{}, 0, len(receipts))
+
+	numReceipts := len(receipts)
+	result := make([]map[string]interface{}, 0, numReceipts)
+
+	// Marshal normal transaction receipts and append to result
 	for _, receipt := range receipts {
 		txn := block.Transactions()[receipt.TransactionIndex]
-		result = append(result, ethutils.MarshalReceipt(receipt, txn, chainConfig, block.HeaderNoCopy(), txn.Hash(), true))
+		result = append(result, ethutils.MarshalReceipt(receipt, txn, chainConfig, block.HeaderNoCopy(), txn.Hash(), true, true))
 	}
 
-	if chainConfig.Bor != nil {
-		events, err := api.bridgeReader.Events(ctx, block.Hash(), blockNum)
-		if err != nil {
-			return nil, err
-		}
+	// check for state sync event logs and generate state-sync transaction receipt for bor.
+	events, err := api.bridgeReader.Events(ctx, block.Hash(), blockNum)
+	if err != nil {
+		return nil, err
+	}
 
-		if len(events) != 0 {
-			borReceipt, err := api.borReceiptGenerator.GenerateBorReceipt(ctx, tx, block, events, chainConfig)
-			if err != nil {
-				return nil, err
-			}
+	if len(events) == 0 {
+		return result, nil
+	}
 
-			result = append(result, ethutils.MarshalReceipt(borReceipt, bortypes.NewBorTransaction(), chainConfig, block.HeaderNoCopy(), borReceipt.TxHash, false))
+	var borTx types.Transaction = bortypes.NewBorTransaction()
+	if chainConfig.Bor != nil && chainConfig.Bor.IsMadhugiri(blockNum) && len(receipts)+1 == len(block.Transactions()) {
+		borTx = block.Transactions()[len(block.Transactions())-1]
+		if borTx.Type() != types.StateSyncTxType {
+			return result, nil
 		}
 	}
+
+	borReceipt, err := api.borReceiptGenerator.GenerateBorReceipt(ctx, tx, block, events, chainConfig)
+	if err != nil {
+		return nil, err
+	}
+
+	result = append(result, ethutils.MarshalReceipt(borReceipt, borTx, chainConfig, block.HeaderNoCopy(), borReceipt.TxHash, false, true))
 
 	return result, nil
+}
+
+// isWholeBlockUnfiltered returns true if the filter is to get all logs for a specific block hash.
+func isWholeBlockUnfiltered(crit filters.FilterCriteria) bool {
+	if crit.BlockHash == nil {
+		return false
+	}
+	if len(crit.Addresses) > 0 {
+		return false
+	}
+	if len(crit.Topics) > 0 {
+		return false
+	}
+	return true
+}
+
+// needsRenumber checks if the log indexes are continuous 0..N-1 per block.
+func needsRenumber(rpcLogs types.RPCLogs) bool {
+	if len(rpcLogs) == 0 {
+		return false
+	}
+	curBlock := rpcLogs[0].BlockHash
+	var expected uint
+	expected = 0
+
+	for _, l := range rpcLogs {
+		if l.BlockHash != curBlock {
+			curBlock = l.BlockHash
+			expected = 0
+		}
+		if l.Index != expected {
+			return true
+		}
+		expected++
+	}
+	return false
 }

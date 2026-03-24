@@ -27,14 +27,14 @@ import (
 
 	"github.com/holiman/uint256"
 
-	"github.com/erigontech/erigon-lib/abi"
 	"github.com/erigontech/erigon-lib/common"
 	"github.com/erigontech/erigon-lib/common/hexutil"
 	"github.com/erigontech/erigon-lib/common/math"
 	"github.com/erigontech/erigon-lib/log/v3"
-	"github.com/erigontech/erigon-lib/types"
 	"github.com/erigontech/erigon/core/vm/evmtypes"
 	"github.com/erigontech/erigon/eth/tracers/logger"
+	"github.com/erigontech/erigon/execution/abi"
+	"github.com/erigontech/erigon/execution/types"
 )
 
 // CallArgs represents the arguments for a call.
@@ -161,7 +161,7 @@ func (args *CallArgs) ToMessage(globalGasCap uint64, baseFee *uint256.Int) (*typ
 		accessList = *args.AccessList
 	}
 
-	msg := types.NewMessage(addr, args.To, 0, value, gas, gasPrice, gasFeeCap, gasTipCap, data, accessList, false /* checkNonce */, false /* isFree */, maxFeePerBlobGas)
+	msg := types.NewMessage(addr, args.To, 0, value, gas, gasPrice, gasFeeCap, gasTipCap, data, accessList, false /* checkNonce */, false /* checkGas */, false /* isFree */, maxFeePerBlobGas)
 
 	if args.BlobVersionedHashes != nil {
 		msg.SetBlobVersionedHashes(args.BlobVersionedHashes)
@@ -519,11 +519,16 @@ func NewRPCTransaction(txn types.Transaction, blockHash common.Hash, blockNumber
 		}
 		result.GasPrice = (*hexutil.Big)(txn.GetTipCap().ToBig())
 	} else {
-		chainId.Set(txn.GetChainID())
-		result.ChainID = (*hexutil.Big)(chainId.ToBig())
+		if txn.Type() != types.StateSyncTxType {
+			chainId.Set(txn.GetChainID())
+			result.ChainID = (*hexutil.Big)(chainId.ToBig())
+		}
 		result.YParity = (*hexutil.Big)(v.ToBig())
-		acl := txn.GetAccessList()
-		result.Accesses = &acl
+
+		if txn.Type() != types.StateSyncTxType {
+			acl := txn.GetAccessList()
+			result.Accesses = &acl
+		}
 
 		if txn.Type() == types.AccessListTxType {
 			result.GasPrice = (*hexutil.Big)(txn.GetTipCap().ToBig())

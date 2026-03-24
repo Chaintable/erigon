@@ -10,25 +10,25 @@ import (
 
 	"github.com/erigontech/erigon-lib/common"
 	"github.com/erigontech/erigon-lib/common/hexutil"
-	"github.com/erigontech/erigon-lib/kv"
-	"github.com/erigontech/erigon-lib/kv/rawdbv3"
 	"github.com/erigontech/erigon-lib/log/v3"
 	"github.com/erigontech/erigon-lib/metrics"
-	"github.com/erigontech/erigon-lib/rlp"
-	"github.com/erigontech/erigon-lib/types"
 	"github.com/erigontech/erigon/core"
 	"github.com/erigontech/erigon/core/state"
 	"github.com/erigontech/erigon/core/tracing"
 	"github.com/erigontech/erigon/core/vm"
 	"github.com/erigontech/erigon/core/vm/evmtypes"
+	"github.com/erigontech/erigon/db/kv"
+	"github.com/erigontech/erigon/db/kv/rawdbv3"
 	dtracer "github.com/erigontech/erigon/debank/tracer"
 	dtypes "github.com/erigontech/erigon/debank/types"
 	"github.com/erigontech/erigon/eth/consensuschain"
 	"github.com/erigontech/erigon/eth/tracers"
-	"github.com/erigontech/erigon/execution/chainspec"
 	"github.com/erigontech/erigon/execution/consensus"
+	"github.com/erigontech/erigon/execution/rlp"
+	"github.com/erigontech/erigon/execution/types"
 	"github.com/erigontech/erigon/polygon/bor/borcfg"
 	bortypes "github.com/erigontech/erigon/polygon/bor/types"
+	polygonchain "github.com/erigontech/erigon/polygon/chain"
 	"github.com/erigontech/erigon/polygon/tracer"
 	"github.com/erigontech/erigon/rpc"
 	"github.com/erigontech/erigon/rpc/rpchelper"
@@ -78,7 +78,7 @@ func (api *TraceAPIImpl) DebankBlockRaw(ctx context.Context, blockNrOrHash rpc.B
 	header := block.Header()
 
 	if block.NumberU64() == 0 {
-		genesis := chainspec.GenesisBlockByChainName(chainConfig.ChainName)
+		genesis := polygonchain.BorMainnetGenesisBlock()
 		return dtracer.OnGenesisBlock(block, genesis.Alloc)
 	}
 
@@ -176,7 +176,7 @@ func (api *TraceAPIImpl) DebankBlockRaw(ctx context.Context, blockNrOrHash rpc.B
 			}
 			stateReceiverContract := chainConfig.Bor.(*borcfg.BorConfig).StateReceiverContractAddress()
 			txCtx := evmtypes.TxContext{
-				TxHash:   bortypes.ComputeBorTxHash(blockNumber, blockHash),
+				TxHash:   borTxHash,
 				Origin:   common.Address{},
 				GasPrice: uint256.NewInt(0),
 			}
@@ -195,7 +195,7 @@ func (api *TraceAPIImpl) DebankBlockRaw(ctx context.Context, blockNrOrHash rpc.B
 			})
 			blockCtx := transactions.NewEVMBlockContext(engine, header, true, dbtx, api._blockReader, chainConfig)
 			evm := vm.NewEVM(blockCtx, txCtx, ibs, chainConfig, vmConfig)
-			rules := chainConfig.Rules(blockNumber, block.Time())
+			rules := blockCtx.Rules(chainConfig)
 
 			// OnTxStart initializes the callTracer's callstack and txID.
 			if vmConfig.Tracer != nil && vmConfig.Tracer.OnTxStart != nil {
@@ -219,7 +219,7 @@ func (api *TraceAPIImpl) DebankBlockRaw(ctx context.Context, blockNrOrHash rpc.B
 
 			receipt := &types.Receipt{
 				Type:             0,
-				TxHash:           bortypes.ComputeBorTxHash(block.NumberU64(), block.Hash()),
+				TxHash:           borTxHash,
 				GasUsed:          0,
 				BlockHash:        block.Hash(),
 				BlockNumber:      block.Number(),
@@ -237,15 +237,9 @@ func (api *TraceAPIImpl) DebankBlockRaw(ctx context.Context, blockNrOrHash rpc.B
 
 	}
 
-	chainReader := consensuschain.NewReader(chainConfig, dbtx, api._blockReader, logger)
-
-	newBlock, _, err := core.FinalizeBlockExecution(engine, stateReader, block.Header(), block.Transactions(), block.Uncles(), writer, chainConfig, ibs, receipts, block.Withdrawals(), chainReader, true, logger, vmConfig.Tracer)
-	if err != nil {
-		return nil, err
-	}
-
-	if newBlock.Root() != block.Root() {
-		return nil, fmt.Errorf("state root mismatch")
+	blockCtx := core.NewEVMBlockContext(header, core.GetHashFn(header, nil), engine, nil, chainConfig)
+	if err := ibs.CommitBlock(blockCtx.Rules(chainConfig), writer); err != nil {
+		return nil, fmt.Errorf("committing block %d failed: %w", header.Number.Uint64(), err)
 	}
 
 	receiptSha := types.DeriveSha(receipts)
@@ -281,7 +275,7 @@ func (api *TraceAPIImpl) DebankBlockRaw(ctx context.Context, blockNrOrHash rpc.B
 		return nil, fmt.Errorf("bloom mismatch")
 	}
 
-	stateDiff := writer.ToStateDiff(parentHeader.Root, newBlock.Root())
+	stateDiff := writer.ToStateDiff(parentHeader.Root, block.Root())
 
 	for addr := range writer.StorageChanges {
 		blockFile.StorageContracts = append(blockFile.StorageContracts, strings.ToLower(addr.Hex()))

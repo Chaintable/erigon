@@ -10,20 +10,20 @@ import (
 
 	"golang.org/x/sync/errgroup"
 
-	"github.com/erigontech/erigon-db/rawdb"
-	"github.com/erigontech/erigon-db/rawdb/rawdbhelpers"
 	"github.com/erigontech/erigon-lib/common"
-	"github.com/erigontech/erigon-lib/kv"
 	"github.com/erigontech/erigon-lib/log/v3"
 	"github.com/erigontech/erigon-lib/metrics"
-	state2 "github.com/erigontech/erigon-lib/state"
-	"github.com/erigontech/erigon-lib/types"
 	"github.com/erigontech/erigon/core"
 	"github.com/erigontech/erigon/core/state"
 	"github.com/erigontech/erigon/core/vm"
+	"github.com/erigontech/erigon/db/kv"
+	"github.com/erigontech/erigon/db/rawdb"
+	"github.com/erigontech/erigon/db/rawdb/rawdbhelpers"
+	dbstate "github.com/erigontech/erigon/db/state"
 	"github.com/erigontech/erigon/execution/consensus"
 	"github.com/erigontech/erigon/execution/exec3"
-	chaos_monkey "github.com/erigontech/erigon/tests/chaos-monkey"
+	"github.com/erigontech/erigon/execution/tests/chaos_monkey"
+	"github.com/erigontech/erigon/execution/types"
 	"github.com/erigontech/erigon/turbo/shards"
 )
 
@@ -77,22 +77,25 @@ type executor interface {
 	//these are reset by commit - so need to be read from the executor once its processing
 	tx() kv.RwTx
 	readState() *state.ParallelExecutionState
-	domains() *state2.SharedDomains
+	domains() *dbstate.SharedDomains
 }
 
 type txExecutor struct {
 	sync.RWMutex
 	cfg            ExecuteBlockCfg
 	execStage      *StageState
-	agg            *state2.Aggregator
+	agg            *dbstate.Aggregator
 	rs             *state.ParallelExecutionState
-	doms           *state2.SharedDomains
+	doms           *dbstate.SharedDomains
 	accumulator    *shards.Accumulator
 	u              Unwinder
 	isMining       bool
 	inMemExec      bool
+	initialCycle   bool
 	applyTx        kv.RwTx
 	applyWorker    *exec3.Worker
+	inputBlockNum  *atomic.Uint64
+	maxBlockNum    uint64
 	outputTxNum    *atomic.Uint64
 	outputBlockNum metrics.Gauge
 	logger         log.Logger
@@ -106,7 +109,7 @@ func (te *txExecutor) readState() *state.ParallelExecutionState {
 	return te.rs
 }
 
-func (te *txExecutor) domains() *state2.SharedDomains {
+func (te *txExecutor) domains() *dbstate.SharedDomains {
 	return te.doms
 }
 
@@ -128,24 +131,27 @@ func (te *txExecutor) getHeader(ctx context.Context, hash common.Hash, number ui
 	return h, err
 }
 
+func (te *txExecutor) shouldGenerateChangeSets() bool {
+	return shouldGenerateChangeSets(te.cfg, te.inputBlockNum.Load(), te.maxBlockNum, te.initialCycle)
+}
+
 type parallelExecutor struct {
 	txExecutor
-	rwLoopErrCh              chan error
-	rwLoopG                  *errgroup.Group
-	applyLoopWg              sync.WaitGroup
-	execWorkers              []*exec3.Worker
-	stopWorkers              func()
-	waitWorkers              func()
-	lastBlockNum             atomic.Uint64
-	in                       *state.QueueWithRetry
-	rws                      *state.ResultsQueue
-	rwsConsumed              chan struct{}
-	shouldGenerateChangesets bool
-	workerCount              int
-	pruneEvery               *time.Ticker
-	logEvery                 *time.Ticker
-	slowDownLimit            *time.Ticker
-	progress                 *Progress
+	rwLoopErrCh   chan error
+	rwLoopG       *errgroup.Group
+	applyLoopWg   sync.WaitGroup
+	execWorkers   []*exec3.Worker
+	stopWorkers   func()
+	waitWorkers   func()
+	lastBlockNum  atomic.Uint64
+	in            *state.QueueWithRetry
+	rws           *state.ResultsQueue
+	rwsConsumed   chan struct{}
+	workerCount   int
+	pruneEvery    *time.Ticker
+	logEvery      *time.Ticker
+	slowDownLimit *time.Ticker
+	progress      *Progress
 }
 
 func (pe *parallelExecutor) applyLoop(ctx context.Context, maxTxNum uint64, blockComplete *atomic.Bool, errCh chan error) {
@@ -233,7 +239,7 @@ func (pe *parallelExecutor) rwLoop(ctx context.Context, maxTxNum uint64, logger 
 
 		case <-pe.logEvery.C:
 			stepsInDB := rawdbhelpers.IdxStepsCountV3(tx)
-			pe.progress.Log("", pe.rs, pe.in, pe.rws, pe.rs.DoneCount(), 0 /* TODO logGas*/, pe.lastBlockNum.Load(), pe.outputBlockNum.GetValueUint64(), pe.outputTxNum.Load(), mxExecRepeats.GetValueUint64(), stepsInDB, pe.shouldGenerateChangesets || pe.cfg.syncCfg.KeepExecutionProofs, pe.inMemExec)
+			pe.progress.Log("", pe.rs, pe.in, pe.rws, pe.rs.DoneCount(), 0 /* TODO logGas*/, pe.inputBlockNum.Load(), pe.outputBlockNum.GetValueUint64(), pe.outputTxNum.Load(), mxExecRepeats.GetValueUint64(), stepsInDB, pe.shouldGenerateChangeSets() || pe.cfg.syncCfg.KeepExecutionProofs, pe.inMemExec)
 			if pe.agg.HasBackgroundFilesBuild() {
 				logger.Info(fmt.Sprintf("[%s] Background files build", pe.execStage.LogPrefix()), "progress", pe.agg.BackgroundProgress())
 			}
@@ -410,6 +416,25 @@ func (pe *parallelExecutor) processResultQueue(ctx context.Context, inputTxNum u
 		}
 
 		if txTask.Final {
+			// PIP-74: ensure that logs from state-sync tx are applied
+			// this is needed as the state-sync txs are skipped during execution,
+			// but we still want to apply their logs to the state
+			if pe.cfg.chainConfig.Bor != nil && pe.cfg.chainConfig.Bor.IsMadhugiri(txTask.BlockNum) {
+				if len(txTask.BlockReceipts) > 0 {
+					last := txTask.BlockReceipts[len(txTask.BlockReceipts)-1]
+					if last != nil && last.Type == types.StateSyncTxType {
+						// Ensure logs from the state-sync receipt are applied
+						if err := pe.rs.ApplyLogsAndTraces(&state.TxTask{
+							BlockNum:      txTask.BlockNum,
+							BlockReceipts: []*types.Receipt{last},
+							Logs:          last.Logs,
+						}, pe.rs.Domains()); err != nil {
+							return outputTxNum, conflicts, triggers, processedBlockNum, false,
+								fmt.Errorf("ParallelExecutionState.Apply state-sync logs addition error: %w", err)
+						}
+					}
+				}
+			}
 			pe.rs.SetTxNum(txTask.TxNum, txTask.BlockNum)
 			err := pe.rs.ApplyState(ctx, txTask)
 			if err != nil {
@@ -528,6 +553,10 @@ func (pe *parallelExecutor) wait() error {
 
 func (pe *parallelExecutor) execute(ctx context.Context, tasks []*state.TxTask, gp *core.GasPool) (bool, error) {
 	for _, txTask := range tasks {
+		// skip state sync txs
+		if txTask.Tx != nil && txTask.Tx.Type() == types.StateSyncTxType {
+			continue
+		}
 		if txTask.Sender() != nil {
 			if ok := pe.rs.RegisterSender(txTask); ok {
 				pe.rs.AddWork(ctx, txTask, pe.in)

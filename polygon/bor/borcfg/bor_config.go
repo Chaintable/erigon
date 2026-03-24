@@ -21,33 +21,46 @@ import (
 	"sort"
 	"strconv"
 
-	"github.com/erigontech/erigon-lib/chain"
 	"github.com/erigontech/erigon-lib/common"
+	"github.com/erigontech/erigon-lib/common/generics"
 )
 
-// BorConfig is the consensus engine configs for Matic bor based sealing.
+// BorConfig is the consensus engine configs for bor-based sealing.
 type BorConfig struct {
 	Period                map[string]uint64 `json:"period"`                // Number of seconds between blocks to enforce
-	ProducerDelay         map[string]uint64 `json:"producerDelay"`         // Number of seconds delay between two producer interval
+	ProducerDelay         map[string]uint64 `json:"producerDelay"`         // Number of seconds between two producers' intervals
 	Sprint                map[string]uint64 `json:"sprint"`                // Epoch length to proposer
 	BackupMultiplier      map[string]uint64 `json:"backupMultiplier"`      // Backup multiplier to determine the wiggle time
 	ValidatorContract     string            `json:"validatorContract"`     // Validator set contract
 	StateReceiverContract string            `json:"stateReceiverContract"` // State receiver contract
 
-	OverrideStateSyncRecords map[string]int         `json:"overrideStateSyncRecords"` // override state records count
-	BlockAlloc               map[string]interface{} `json:"blockAlloc"`
+	OverrideStateSyncRecords    map[string]int                   `json:"overrideStateSyncRecords"`    // override state records count
+	OverrideValidatorSetInRange []BlockRangeOverrideValidatorSet `json:"overrideValidatorSetInRange"` // override validator set in a given block range
+	BlockAlloc                  map[string]interface{}           `json:"blockAlloc"`
 
-	JaipurBlock                *big.Int                  `json:"jaipurBlock"`                // Jaipur switch block (nil = no fork, 0 = already on Jaipur)
-	DelhiBlock                 *big.Int                  `json:"delhiBlock"`                 // Delhi switch block (nil = no fork, 0 = already on Delhi)
-	IndoreBlock                *big.Int                  `json:"indoreBlock"`                // Indore switch block (nil = no fork, 0 = already on Indore)
-	AgraBlock                  *big.Int                  `json:"agraBlock"`                  // Agra switch block (nil = no fork, 0 = already on Agra)
-	NapoliBlock                *big.Int                  `json:"napoliBlock"`                // Napoli switch block (nil = no fork, 0 = already on Napoli)
-	AhmedabadBlock             *big.Int                  `json:"ahmedabadBlock"`             // Ahmedabad switch block (nil = no fork, 0 = already on Ahmedabad)
-	BhilaiBlock                *big.Int                  `json:"bhilaiBlock"`                // Bhilai switch block (nil = no fork, 0 = already on Ahmedabad)
-	RioBlock                   *big.Int                  `json:"rioBlock"`                   // Rio switch block (nil = no fork, 0 = already on Rio)
+	JaipurBlock       *big.Int `json:"jaipurBlock"`       // Jaipur switch block (nil = no fork, 0 = already on Jaipur)
+	DelhiBlock        *big.Int `json:"delhiBlock"`        // Delhi switch block (nil = no fork, 0 = already on Delhi)
+	IndoreBlock       *big.Int `json:"indoreBlock"`       // Indore switch block (nil = no fork, 0 = already on Indore)
+	AgraBlock         *big.Int `json:"agraBlock"`         // Agra switch block (nil = no fork, 0 = already on Agra)
+	NapoliBlock       *big.Int `json:"napoliBlock"`       // Napoli switch block (nil = no fork, 0 = already on Napoli)
+	AhmedabadBlock    *big.Int `json:"ahmedabadBlock"`    // Ahmedabad switch block (nil = no fork, 0 = already on Ahmedabad)
+	BhilaiBlock       *big.Int `json:"bhilaiBlock"`       // Bhilai switch block (nil = no fork, 0 = already on Ahmedabad)
+	RioBlock          *big.Int `json:"rioBlock"`          // Rio switch block (nil = no fork, 0 = already on Rio)
+	MadhugiriBlock    *big.Int `json:"madhugiriBlock"`    // Madhugiri switch block (nil = no fork, 0 = already on Madhugiri)
+	MadhugiriProBlock *big.Int `json:"madhugiriProBlock"` // MadhugiriPro switch block (nil = no fork, 0 = already on MadhugiriPro)
+	DandeliBlock      *big.Int `json:"dandeliBlock"`      // Dandeli switch block (nil = no fork, 0 = already on Dandeli)
+	LisovoBlock       *big.Int `json:"lisovoBlock"`       // Lisovo switch block (nil = no fork, 0 = already on Lisovo)
+	LisovoProBlock    *big.Int `json:"lisovoProBlock"`    // LisovoPro switch block (nil = no fork, 0 = already on LisovoPro)
+
 	StateSyncConfirmationDelay map[string]uint64         `json:"stateSyncConfirmationDelay"` // StateSync Confirmation Delay, in seconds, to calculate `to`
 	Coinbase                   map[string]common.Address `json:"coinbase"`                   // coinbase address
 	sprints                    sprints
+}
+
+type BlockRangeOverrideValidatorSet struct {
+	StartBlock uint64           `json:"startBlock"`
+	EndBlock   uint64           `json:"endBlock"`
+	Validators []common.Address `json:"validators"`
 }
 
 // String implements the stringer interface, returning the consensus engine details.
@@ -56,7 +69,7 @@ func (c *BorConfig) String() string {
 }
 
 func (c *BorConfig) CalculateProducerDelay(number uint64) uint64 {
-	return chain.ConfigValueLookup(common.ParseMapKeysIntoUint64(c.ProducerDelay), number)
+	return ConfigValueLookup(common.ParseMapKeysIntoUint64(c.ProducerDelay), number)
 }
 
 func (c *BorConfig) IsSprintStart(number uint64) bool {
@@ -114,11 +127,11 @@ func (c *BorConfig) CalculateSprintNumber(number uint64) uint64 {
 }
 
 func (c *BorConfig) CalculateBackupMultiplier(number uint64) uint64 {
-	return chain.ConfigValueLookup(common.ParseMapKeysIntoUint64(c.BackupMultiplier), number)
+	return ConfigValueLookup(common.ParseMapKeysIntoUint64(c.BackupMultiplier), number)
 }
 
 func (c *BorConfig) CalculatePeriod(number uint64) uint64 {
-	return chain.ConfigValueLookup(common.ParseMapKeysIntoUint64(c.Period), number)
+	return ConfigValueLookup(common.ParseMapKeysIntoUint64(c.Period), number)
 }
 
 // isForked returns whether a fork scheduled at block s is active at the given head block.
@@ -141,9 +154,9 @@ func (c *BorConfig) IsIndore(number uint64) bool {
 	return isForked(c.IndoreBlock, number)
 }
 
-// IsAgra returns whether num is either equal to the Agra fork block or greater.
+// IsAgra returns whether the num is either equal to the Agra fork block or greater.
 // The Agra hard fork is based on the Shanghai hard fork, but it doesn't include withdrawals.
-// Also Agra is activated based on the block number rather than the timestamp.
+// Also, Agra is activated based on the block number rather than the timestamp.
 // Refer to https://forum.polygon.technology/t/pip-28-agra-hardfork
 func (c *BorConfig) IsAgra(num uint64) bool {
 	return isForked(c.AgraBlock, num)
@@ -186,13 +199,49 @@ func (c *BorConfig) GetRioBlock() *big.Int {
 	return c.RioBlock
 }
 
+func (c *BorConfig) IsMadhugiri(number uint64) bool {
+	return isForked(c.MadhugiriBlock, number)
+}
+
+func (c *BorConfig) GetMadhugiriBlock() *big.Int {
+	return c.MadhugiriBlock
+}
+
+func (c *BorConfig) IsMadhugiriPro(number uint64) bool {
+	return isForked(c.MadhugiriProBlock, number)
+}
+
+func (c *BorConfig) GetMadhugiriProBlock() *big.Int {
+	return c.MadhugiriProBlock
+}
+
+func (c *BorConfig) IsDandeli(number uint64) bool {
+	return isForked(c.DandeliBlock, number)
+}
+
+func (c *BorConfig) IsLisovo(number uint64) bool {
+	return isForked(c.LisovoBlock, number)
+}
+
+func (c *BorConfig) GetLisovoBlock() *big.Int {
+	return c.LisovoBlock
+}
+
+func (c *BorConfig) IsLisovoPro(number uint64) bool {
+	return isForked(c.LisovoProBlock, number)
+}
+
+func (c *BorConfig) GetLisovoProBlock() *big.Int {
+	return c.LisovoProBlock
+}
+
 func (c *BorConfig) CalculateStateSyncDelay(number uint64) uint64 {
-	return chain.ConfigValueLookup(common.ParseMapKeysIntoUint64(c.StateSyncConfirmationDelay), number)
+	return ConfigValueLookup(common.ParseMapKeysIntoUint64(c.StateSyncConfirmationDelay), number)
 }
 
 func (c *BorConfig) CalculateCoinbase(number uint64) common.Address {
 	if c.Coinbase != nil {
-		return chain.ConfigValueLookup(common.ParseMapKeysIntoUint64(c.Coinbase), number)
+		return ConfigValueLookup(common.ParseMapKeysIntoUint64(c.Coinbase), number)
 	} else {
 		return common.Address{}
 	}
@@ -233,4 +282,25 @@ func asSprints(configSprints map[string]uint64) sprints {
 	sort.Sort(sprints)
 
 	return sprints
+}
+
+// Duplicate of execution/chain's ConfigValueLookup function to avoid circular import
+
+// Looks up a config value as of a given block number (or time).
+// The assumption here is that config is a càdlàg map of starting_from_block -> value.
+// For example, config of {5: "A", 10: "B", 20: "C"}
+// means that the config value is "A" for blocks 5–9,
+// "B" for blocks 10–19, and "C" for block 20 and above.
+// For blocks 0–4 an empty string will be returned.
+func ConfigValueLookup[T any](field map[uint64]T, number uint64) T {
+	keys := common.SortedKeys(field)
+	if number < keys[0] {
+		return generics.Zero[T]()
+	}
+	for i := 0; i < len(keys)-1; i++ {
+		if number >= keys[i] && number < keys[i+1] {
+			return field[keys[i]]
+		}
+	}
+	return field[keys[len(keys)-1]]
 }
