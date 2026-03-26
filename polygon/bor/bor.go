@@ -64,6 +64,8 @@ import (
 
 const inmemorySignatures = 4096 // Number of recent block signatures to keep in memory
 
+const maxAllowedFutureBlockTimeSeconds = uint64(30)
+
 // Bor protocol constants.
 var (
 	// Default number of blocks after which to checkpoint and reset the pending votes
@@ -227,7 +229,21 @@ func ValidateHeaderTime(
 	config *borcfg.BorConfig,
 	signaturesCache *lru.ARCCache[common.Hash, common.Address],
 ) error {
-	if config.IsBhilai(header.Number.Uint64()) {
+	if config.IsGiugliano(header.Number.Uint64()) {
+		// Parent time check (announcement must come at or after parent time)
+		if parent != nil && uint64(now.Unix()) < parent.Time {
+			return fmt.Errorf("%w: announcement before parent time: parent=%s, now=%s",
+				consensus.ErrFutureBlock,
+				time.Unix(int64(parent.Time), 0), now)
+		}
+		// 30-second future cap
+		if header.Time > uint64(now.Unix())+maxAllowedFutureBlockTimeSeconds {
+			return fmt.Errorf("%w: expected: %s(%s), got: %s",
+				consensus.ErrFutureBlock,
+				time.Unix(now.Unix()+int64(maxAllowedFutureBlockTimeSeconds), 0), now,
+				time.Unix(int64(header.Time), 0))
+		}
+	} else if config.IsBhilai(header.Number.Uint64()) {
 		// Don't waste time checking blocks from the future but allow a buffer of block time for
 		// early block announcements. Note that this is a loose check and would allow early blocks
 		// from non-primary producer. Such blocks will be rejected later when we know the succession
@@ -256,8 +272,9 @@ func ValidateHeaderTime(
 		return err
 	}
 
-	// Post Bhilai HF, reject blocks from non-primary producers if they're earlier than the expected time
-	if config.IsBhilai(header.Number.Uint64()) && succession != 0 {
+	// Post Bhilai HF (pre-Giugliano), reject blocks from non-primary producers if earlier than expected
+	// Giugliano lifted this restriction — all producers may announce early within the 30s cap.
+	if config.IsBhilai(header.Number.Uint64()) && !config.IsGiugliano(header.Number.Uint64()) && succession != 0 {
 		if header.Time > uint64(now.Unix()) {
 			return fmt.Errorf("%w: expected: %s(%s), got: %s", consensus.ErrFutureBlock, time.Unix(now.Unix(), 0), now, time.Unix(int64(header.Time), 0))
 		}
@@ -461,19 +478,39 @@ func (c *Bor) verifyHeader(chain consensus.ChainHeaderReader, header *types.Head
 	now := time.Now().Unix()
 
 	// Don't waste time checking blocks from the future
-	// Allow early blocks if Bhilai HF is enabled
-	if c.config.IsBhilai(number) {
-		// Don't waste time checking blocks from the future but allow a buffer of block time for
-		// early block announcements. Note that this is a loose check and would allow early blocks
-		// from non-primary producer. Such blocks will be rejected later when we know the succession
-		// number of the signer in the current sprint.
+	// Allow early blocks with increasing buffers per HF
+	if c.config.IsGiugliano(number) {
+		// Giugliano: blocks may be announced early; cap at 30s future and require
+		// announcement time to be at or after parent block time.
+		var parent *types.Header
+		if len(parents) > 0 {
+			parent = parents[len(parents)-1]
+		} else {
+			parent = chain.GetHeader(header.ParentHash, number-1)
+		}
+		if parent != nil && uint64(now) < parent.Time {
+			return fmt.Errorf("%w: announcement before parent time: parent=%s, now=%s",
+				consensus.ErrFutureBlock,
+				time.Unix(int64(parent.Time), 0),
+				time.Unix(now, 0))
+		}
+		if header.Time > uint64(now)+maxAllowedFutureBlockTimeSeconds {
+			return fmt.Errorf("%w: expected: %s, got: %s",
+				consensus.ErrFutureBlock,
+				time.Unix(now+int64(maxAllowedFutureBlockTimeSeconds), 0),
+				time.Unix(int64(header.Time), 0))
+		}
+	} else if c.config.IsBhilai(number) {
+		// Bhilai: allow one block period buffer for early announcements (primary producer only;
+		// non-primary producers are rejected later after succession is known).
 		if header.Time > uint64(now)+c.config.CalculatePeriod(number) {
-			return fmt.Errorf("%w: expected: %s, got: %s", consensus.ErrFutureBlock, time.Unix(now, 0), time.Unix(int64(header.Time), 0))
+			return fmt.Errorf("%w: expected: %s, got: %s", consensus.ErrFutureBlock,
+				time.Unix(now, 0), time.Unix(int64(header.Time), 0))
 		}
 	} else {
-		// Don't waste time checking blocks from the future
 		if header.Time > uint64(now) {
-			return fmt.Errorf("%w: expected: %s, got: %s", consensus.ErrFutureBlock, time.Unix(now, 0), time.Unix(int64(header.Time), 0))
+			return fmt.Errorf("%w: expected: %s, got: %s", consensus.ErrFutureBlock,
+				time.Unix(now, 0), time.Unix(int64(header.Time), 0))
 		}
 	}
 
@@ -580,6 +617,12 @@ func (c *Bor) verifyCascadingFields(chain consensus.ChainHeaderReader, header *t
 		return errInvalidTimestamp
 	}
 
+	if c.config.IsGiugliano(number) {
+		if err := verifyGiuglianoExtraData(header); err != nil {
+			return err
+		}
+	}
+
 	return ValidateHeaderGas(header, parent, chain.Config())
 }
 
@@ -612,6 +655,28 @@ func ValidateHeaderGas(header *types.Header, parent *types.Header, chainConfig *
 		return err
 	}
 
+	return nil
+}
+
+// verifyGiuglianoExtraData checks that post-Giugliano blocks contain GasTarget
+// and BaseFeeChangeDenominator in the block's extra data.
+func verifyGiuglianoExtraData(header *types.Header) error {
+	if len(header.Extra) < types.ExtraVanityLength+types.ExtraSealLength {
+		return fmt.Errorf("header extra too short for Giugliano validation")
+	}
+
+	var blockExtraData BlockExtraData
+	if err := rlp.DecodeBytes(
+		header.Extra[types.ExtraVanityLength:len(header.Extra)-types.ExtraSealLength],
+		&blockExtraData,
+	); err != nil {
+		return fmt.Errorf("failed to decode block extra data: %w", err)
+	}
+
+	if blockExtraData.GasTarget == nil || blockExtraData.BaseFeeChangeDenominator == nil {
+		return fmt.Errorf("post-Giugliano block %d missing GasTarget or BaseFeeChangeDenominator in extra data",
+			header.Number.Uint64())
+	}
 	return nil
 }
 
@@ -721,6 +786,9 @@ func (c *Bor) Prepare(chain consensus.ChainHeaderReader, header *types.Header, _
 				ValidatorBytes: tempValidatorBytes,
 				TxDependencies: nil,
 			}
+			// Note: post-Giugliano, block producers embed GasTarget and BaseFeeChangeDenominator
+			// in BlockExtraData. Since erigon does not produce blocks, we don't populate those
+			// fields here. They are decoded and validated from imported blocks instead.
 
 			blockExtraDataBytes, err := rlp.EncodeToBytes(blockExtraData)
 			if err != nil {
@@ -739,6 +807,9 @@ func (c *Bor) Prepare(chain consensus.ChainHeaderReader, header *types.Header, _
 			ValidatorBytes: nil,
 			TxDependencies: nil,
 		}
+		// Note: post-Giugliano, block producers embed GasTarget and BaseFeeChangeDenominator
+		// in BlockExtraData. Since erigon does not produce blocks, we don't populate those
+		// fields here. They are decoded and validated from imported blocks instead.
 
 		blockExtraDataBytes, err := rlp.EncodeToBytes(blockExtraData)
 		if err != nil {
@@ -1431,6 +1502,12 @@ type BlockExtraData struct {
 	// length of TxDependencies[i] -> k (k = a whole number)
 	// k elements in TxDependencies[i] -> transaction indexes on which transaction i is dependent on
 	TxDependencies [][]int
+
+	// GasTarget is the target gas for the block, embedded post-Giugliano
+	GasTarget *uint64 `rlp:"optional"`
+
+	// BaseFeeChangeDenominator is the denominator used in base fee calculation, embedded post-Giugliano
+	BaseFeeChangeDenominator *uint64 `rlp:"optional"`
 }
 
 func GetValidatorBytes(h *types.Header, config *borcfg.BorConfig) []byte {
