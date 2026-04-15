@@ -26,6 +26,7 @@ import (
 	"github.com/erigontech/erigon/common"
 	"github.com/erigontech/erigon/common/log/v3"
 	"github.com/erigontech/erigon/db/kv"
+	"github.com/erigontech/erigon/db/kv/kvcfg"
 	"github.com/erigontech/erigon/db/kv/order"
 	"github.com/erigontech/erigon/db/kv/rawdbv3"
 	"github.com/erigontech/erigon/db/kv/stream"
@@ -38,6 +39,19 @@ import (
 	"github.com/erigontech/erigon/rpc"
 	"github.com/erigontech/erigon/rpc/filters"
 	"github.com/erigontech/erigon/rpc/rpchelper"
+)
+
+var (
+	errInvalidBlockRange    = "invalid block range params"
+	errBlockRangeIntoFuture = "block range extends beyond current head block"
+	errBlockHashWithRange   = "can't specify fromBlock/toBlock with blockHash"
+	errExceedMaxTopics      = "exceed max topics"
+	errExceedBlockRange     = "exceed maximum block range"
+)
+
+const (
+	// The maximum number of topic criteria allowed, vm.LOG4 - vm.LOG0
+	maxTopics = 4
 )
 
 // getReceipts - checking in-mem cache, or else fallback to db, or else fallback to re-exec of block to re-gen receipts
@@ -77,7 +91,15 @@ func (api *APIImpl) GetLogs(ctx context.Context, crit filters.FilterCriteria) (t
 	}
 	defer tx.Rollback()
 
+	if len(crit.Topics) > maxTopics {
+		return nil, &rpc.CustomError{Message: errExceedMaxTopics, Code: rpc.ErrCodeInvalidParams}
+	}
+
 	if crit.BlockHash != nil {
+		if crit.FromBlock != nil || crit.ToBlock != nil {
+			return nil, &rpc.CustomError{Message: errBlockHashWithRange, Code: rpc.ErrCodeInvalidParams}
+		}
+
 		block, err := api.blockByHashWithSenders(ctx, tx, *crit.BlockHash)
 		if err != nil {
 			return nil, err
@@ -110,7 +132,7 @@ func (api *APIImpl) GetLogs(ctx context.Context, crit filters.FilterCriteria) (t
 			}
 
 			if begin > latest {
-				return types.RPCLogs{}, nil
+				return nil, &rpc.CustomError{Message: errBlockRangeIntoFuture, Code: rpc.ErrCodeInvalidParams}
 			}
 		}
 		end = latest
@@ -125,11 +147,18 @@ func (api *APIImpl) GetLogs(ctx context.Context, crit filters.FilterCriteria) (t
 					return nil, err
 				}
 			}
+
+			if end > latest {
+				return nil, &rpc.CustomError{Message: errBlockRangeIntoFuture, Code: rpc.ErrCodeInvalidParams}
+			}
 		}
 	}
 
 	if end < begin {
-		return nil, fmt.Errorf("end (%d) < begin (%d)", end, begin)
+		return nil, &rpc.CustomError{Message: errInvalidBlockRange, Code: rpc.ErrCodeInvalidParams}
+	}
+	if api.rangeLimit != 0 && (end-begin) > uint64(api.rangeLimit) {
+		return nil, &rpc.CustomError{Message: fmt.Sprintf("%s: %d", errExceedBlockRange, api.rangeLimit), Code: rpc.ErrCodeInvalidParams}
 	}
 	if end > roaring.MaxUint32 {
 		latest, err := rpchelper.GetLatestBlockNumber(tx)
@@ -168,6 +197,27 @@ func (api *APIImpl) GetLogs(ctx context.Context, crit filters.FilterCriteria) (t
 	return rpcLogs, nil
 }
 
+// assertReceiptsAvailable corner cases:
+//   - `--persist.receipts`: means all receipts available (even in `--prune.mode=minimal` mode)
+//   - `--prune.mode=minimal` (and `full`) can serve receipts as much as "state history" available (by re-executing blocks)
+//
+// returns `state.PrunedError` if not available for given `fromTxNum`
+func assertReceiptsAvailable(fromTxNum uint64, tx kv.TemporalTx) error {
+	persistReceipts, err := kvcfg.PersistReceipts.Enabled(tx)
+	if err != nil {
+		return err
+	}
+	if persistReceipts {
+		return nil
+	}
+	r := state.NewHistoryReaderV3()
+	r.SetTx(tx)
+	if fromTxNum < r.StateHistoryStartFrom() {
+		return state.PrunedError
+	}
+	return nil
+}
+
 func applyFiltersV3(txNumsReader rawdbv3.TxNumsReader, tx kv.TemporalTx, begin, end uint64, crit filters.FilterCriteria, asc order.By) (out stream.U64, err error) {
 	//[from,to)
 	var fromTxNum, toTxNum uint64
@@ -176,10 +226,8 @@ func applyFiltersV3(txNumsReader rawdbv3.TxNumsReader, tx kv.TemporalTx, begin, 
 		if err != nil {
 			return out, err
 		}
-		r := state.NewHistoryReaderV3()
-		r.SetTx(tx)
-		if fromTxNum < r.StateHistoryStartFrom() {
-			return out, state.PrunedError
+		if err := assertReceiptsAvailable(fromTxNum, tx); err != nil {
+			return out, err
 		}
 	}
 
@@ -524,7 +572,7 @@ func (api *APIImpl) GetBlockReceipts(ctx context.Context, numberOrHash rpc.Block
 		return nil, err
 	}
 	defer tx.Rollback()
-	blockNum, blockHash, _, err := rpchelper.GetBlockNumber(ctx, numberOrHash, tx, api._blockReader, api.filters)
+	blockNum, blockHash, _, err := rpchelper.GetCanonicalBlockNumber(ctx, numberOrHash, tx, api._blockReader, api.filters)
 	if err != nil {
 		bnh, _ := numberOrHash.Hash()
 		if errors.Is(err, rpchelper.BlockNotFoundErr{Hash: bnh}) {

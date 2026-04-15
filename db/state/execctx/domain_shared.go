@@ -367,11 +367,11 @@ func (sd *SharedDomains) DomainPut(domain kv.Domain, roTx kv.TemporalTx, k, v []
 		}
 	}
 	switch domain {
-	case kv.CodeDomain:
-		if bytes.Equal(prevVal, v) {
+	case kv.CodeDomain, kv.AccountsDomain, kv.StorageDomain, kv.CommitmentDomain:
+		if bytes.Equal(prevVal, v) { // If insert unchanged values: Domain tables will be fine, but History will contain duplicate events (and it will make history invalid)
 			return nil
 		}
-	case kv.StorageDomain, kv.AccountsDomain, kv.CommitmentDomain, kv.RCacheDomain:
+	case kv.RCacheDomain:
 		//noop
 	default:
 		if bytes.Equal(prevVal, v) {
@@ -478,5 +478,5 @@ func (sd *SharedDomains) SeekCommitment(ctx context.Context, tx kv.TemporalTx) (
 }
 
 func (sd *SharedDomains) ComputeCommitment(ctx context.Context, tx kv.TemporalTx, saveStateAfter bool, blockNum, txNum uint64, logPrefix string, commitProgress chan *commitment.CommitProgress) (rootHash []byte, err error) {
-	return sd.sdCtx.ComputeCommitment(ctx, tx, saveStateAfter, blockNum, sd.txNum, logPrefix, commitProgress)
+	return sd.sdCtx.ComputeCommitment(ctx, tx, saveStateAfter, blockNum, txNum, logPrefix, commitProgress)
 }

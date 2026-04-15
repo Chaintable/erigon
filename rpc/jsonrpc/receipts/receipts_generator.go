@@ -27,6 +27,7 @@ import (
 	"github.com/erigontech/erigon/execution/types"
 	"github.com/erigontech/erigon/execution/vm"
 	"github.com/erigontech/erigon/execution/vm/evmtypes"
+	"github.com/erigontech/erigon/rpc/rpchelper"
 	"github.com/erigontech/erigon/rpc/transactions"
 )
 
@@ -107,6 +108,7 @@ func (g *Generator) GetCachedReceipt(ctx context.Context, hash common.Hash) (*ty
 }
 
 var rpcDisableRCache = dbg.EnvBool("RPC_DISABLE_RCACHE", false)
+var rpcDisableRLRU = dbg.EnvBool("RPC_DISABLE_RLRU", false)
 
 func (g *Generator) PrepareEnv(ctx context.Context, header *types.Header, cfg *chain.Config, tx kv.TemporalTx, txIndex int) (*ReceiptEnv, error) {
 	txNumsReader := g.blockReader.TxnumReader(ctx)
@@ -140,11 +142,17 @@ func (g *Generator) PrepareEnv(ctx context.Context, header *types.Header, cfg *c
 }
 
 func (g *Generator) addToCacheReceipts(header *types.Header, receipts types.Receipts) {
+	if rpcDisableRLRU {
+		return
+	}
 	//g.receiptsCache.Add(header.Hash(), receipts.Copy()) // .Copy() helps pprof to attribute memory to cache - instead of evm (where it was allocated). but 5% perf
 	g.receiptsCache.Add(header.Hash(), receipts)
 }
 
 func (g *Generator) addToCacheReceipt(hash common.Hash, receipt *types.Receipt) {
+	if rpcDisableRLRU {
+		return
+	}
 	//g.receiptCache.Add(hash, receipt.Copy()) // .Copy() helps pprof to attribute memory to cache - instead of evm (where it was allocated). but 5% perf
 	g.receiptCache.Add(hash, receipt)
 }
@@ -211,6 +219,11 @@ func (g *Generator) GetReceipt(ctx context.Context, cfg *chain.Config, tx kv.Tem
 	}
 
 	var err error
+	err = rpchelper.CheckBlockExecuted(tx, blockNum)
+	if err != nil {
+		return nil, err
+	}
+
 	var evm *vm.EVM
 	var genEnv *ReceiptEnv
 
@@ -395,6 +408,11 @@ func (g *Generator) GetReceipts(ctx context.Context, cfg *chain.Config, tx kv.Te
 		return receipts, nil
 	}
 
+	err := rpchelper.CheckBlockExecuted(tx, block.NumberU64())
+	if err != nil {
+		return nil, err
+	}
+
 	// Check if we have commitment history: this is required to know if state root will be computed or left zero for historical state.
 	commitmentHistory, _, err := rawdb.ReadDBCommitmentHistoryEnabled(tx)
 	if err != nil {
@@ -504,7 +522,7 @@ func (g *Generator) GetReceipts(ctx context.Context, cfg *chain.Config, tx kv.Te
 		}
 		receipts[i] = receipt
 
-		if dbg.AssertEnabled && receiptsFromDB != nil {
+		if dbg.AssertEnabled && receiptsFromDB != nil && i < len(receiptsFromDB) {
 			g.assertEqualReceipts(receipt, receiptsFromDB[i])
 		}
 	}
@@ -524,10 +542,14 @@ func (g *Generator) assertEqualReceipts(fromExecution, fromDB *types.Receipt) {
 
 	generated := fromExecution.Copy()
 	if generated.TransactionIndex != fromDB.TransactionIndex {
-		panic(fmt.Sprintf("assert: %d, %d", generated.TransactionIndex, fromDB.TransactionIndex))
+		panic(fmt.Sprintf("assert: txn index mismatch: %d, %d", generated.TransactionIndex, fromDB.TransactionIndex))
 	}
 	if generated.FirstLogIndexWithinBlock != fromDB.FirstLogIndexWithinBlock {
-		panic(fmt.Sprintf("assert: %d, %d", generated.FirstLogIndexWithinBlock, fromDB.FirstLogIndexWithinBlock))
+		panic(fmt.Sprintf("assert: first log index mismatch: %d, %d", generated.FirstLogIndexWithinBlock, fromDB.FirstLogIndexWithinBlock))
+	}
+	if len(generated.Logs) != len(fromDB.Logs) {
+		panic(fmt.Sprintf("assert: logs length mismatch: generated=%d, fromDB=%d, bn=%d, txnIdx=%d",
+			len(generated.Logs), len(fromDB.Logs), generated.BlockNumber.Uint64(), generated.TransactionIndex))
 	}
 
 	for i := range generated.Logs {
