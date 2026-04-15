@@ -1263,6 +1263,72 @@ func makeBlobTxn() TxnSlot {
 	return blobTxn
 }
 
+func makeWrappedBlobTxnRlpWithCellProofs(t *testing.T, chainID *uint256.Int, blobCount int) []byte {
+	t.Helper()
+
+	require := require.New(t)
+	tipCap := uint256.NewInt(2 * common.GWei)
+	feeCap := uint256.NewInt(30 * common.GWei)
+	maxFeePerBlobGas := uint256.NewInt(500_000)
+
+	wrapper := &types.BlobTxWrapper{
+		Tx: types.BlobTx{
+			DynamicFeeTransaction: types.DynamicFeeTransaction{
+				CommonTx: types.CommonTx{
+					Nonce:    0,
+					To:       &common.Address{1},
+					GasLimit: 1_000_000,
+					Value:    uint256.NewInt(0),
+					Data:     []byte{0x01},
+				},
+				ChainID: chainID,
+				TipCap:  tipCap,
+				FeeCap:  feeCap,
+			},
+			MaxFeePerBlobGas: maxFeePerBlobGas,
+		},
+		WrapperVersion: 1,
+		Commitments:    make(types.BlobKzgs, blobCount),
+		Blobs:          make(types.Blobs, blobCount),
+		Proofs:         make(types.KZGProofs, 0, blobCount*int(params.CellsPerExtBlob)),
+	}
+
+	kzgCtx := kzg.Ctx()
+	for i := 0; i < blobCount; i++ {
+		for j := range wrapper.Blobs[i] {
+			wrapper.Blobs[i][j] = byte(i + 1)
+		}
+		commitment, err := kzgCtx.BlobToKZGCommitment((*goethkzg.Blob)(&wrapper.Blobs[i]), 0)
+		require.NoError(err)
+		_, cellProofs, err := kzgCtx.ComputeCellsAndKZGProofs((*goethkzg.Blob)(&wrapper.Blobs[i]), 4)
+		require.NoError(err)
+
+		copy(wrapper.Commitments[i][:], commitment[:])
+		for _, proof := range cellProofs {
+			var proofBytes types.KZGProof
+			copy(proofBytes[:], proof[:])
+			wrapper.Proofs = append(wrapper.Proofs, proofBytes)
+		}
+
+		wrapper.Tx.BlobVersionedHashes = append(wrapper.Tx.BlobVersionedHashes, common.Hash(kzg.KZGToVersionedHash(commitment)))
+	}
+
+	key, err := crypto.GenerateKey()
+	require.NoError(err)
+	signedTx, err := types.SignTx(wrapper, *types.LatestSignerForChainID(chainID.ToBig()), key)
+	require.NoError(err)
+	dt := &wrapper.Tx.DynamicFeeTransaction
+	v, r, s := signedTx.RawSignatureValues()
+	dt.V.Set(v)
+	dt.R.Set(r)
+	dt.S.Set(s)
+
+	buf := bytes.NewBuffer(nil)
+	require.NoError(wrapper.MarshalBinaryWrapped(buf))
+
+	return buf.Bytes()
+}
+
 func TestDropRemoteAtNoGossip(t *testing.T) {
 	assert, require := assert.New(t), require.New(t)
 	ch := make(chan Announcements, 100)
@@ -1457,6 +1523,135 @@ func TestBlobSlots(t *testing.T) {
 	for _, reason := range reasons {
 		assert.Equal(txpoolcfg.BlobPoolOverflow, reason, reason.String())
 	}
+}
+
+// TestOsakaProofShapeMismatchDiscardsCompletely verifies that when Osaka activates,
+// pre-Osaka-shape blob transactions are fully discarded by best() — not just removed
+// from the Pending sub-pool. This ensures totalBlobsInPool and byHash are cleaned up,
+// so new Osaka-shaped blob transactions can be admitted.
+func TestOsakaProofShapeMismatchDiscardsCompletely(t *testing.T) {
+	if testing.Short() {
+		t.Skip("slow test")
+	}
+	require := require.New(t)
+
+	ch := make(chan Announcements, 5)
+	coreDB := temporaltest.NewTestDB(t, datadir.New(t.TempDir()))
+	db := memdb.NewTestPoolDB(t)
+	cfg := txpoolcfg.DefaultConfig
+	cfg.TotalBlobPoolLimit = 2 // tight limit: one 2-blob txn fills it
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	sendersCache := kvcache.New(kvcache.DefaultCoherentConfig)
+	pool, err := New(ctx, ch, db, coreDB, cfg, sendersCache, testforks.Forks["Cancun"], nil, nil, func() {}, nil, nil, log.New(), WithFeeCalculator(nil))
+	require.NoError(err)
+
+	// Fund one account
+	var addr [20]byte
+	addr[0] = 1
+	h1 := gointerfaces.ConvertHashToH256([32]byte{})
+	change := &remoteproto.StateChangeBatch{
+		StateVersionId:       0,
+		PendingBlockBaseFee:  200_000,
+		BlockGasLimit:        math.MaxUint64,
+		PendingBlobFeePerGas: 100_000,
+		ChangeBatch: []*remoteproto.StateChange{
+			{BlockHeight: 0, BlockHash: h1},
+		},
+	}
+	acc := accounts3.Account{
+		Nonce:       0,
+		Balance:     *uint256.NewInt(1 * common.Ether),
+		CodeHash:    common.Hash{},
+		Incarnation: 1,
+	}
+	v := accounts3.SerialiseV3(&acc)
+	change.ChangeBatch[0].Changes = append(change.ChangeBatch[0].Changes, &remoteproto.AccountChange{
+		Action:  remoteproto.Action_UPSERT,
+		Address: gointerfaces.ConvertAddressToH160(addr),
+		Data:    v,
+	})
+
+	tx, err := db.BeginRw(ctx)
+	require.NoError(err)
+	defer tx.Rollback()
+	err = pool.OnNewBlock(ctx, change, TxnSlots{}, TxnSlots{}, TxnSlots{})
+	require.NoError(err)
+
+	// Step 1: Add a pre-Osaka-shape blob txn (2 blobs, 2 proofs — one per blob).
+	blobTxn := makeBlobTxn()
+	blobTxn.IDHash[0] = 33
+	blobTxn.Nonce = 0
+	{
+		var txnSlots TxnSlots
+		txnSlots.Append(&blobTxn, addr[:], true)
+		reasons, err := pool.AddLocalTxns(ctx, txnSlots)
+		require.NoError(err)
+		require.Equal(txpoolcfg.Success, reasons[0], reasons[0].String())
+	}
+
+	// Sanity: pool has 2 blobs and 1 pending txn.
+	require.Equal(uint64(2), pool.totalBlobsInPool.Load())
+	require.Equal(1, pool.pending.Len())
+
+	// Step 2: Simulate Osaka activation.
+	pool.isPostOsaka.Store(true)
+
+	// Step 3: Trigger best() via PeekBest — it will detect the proof-shape mismatch
+	// and should fully discard the pre-Osaka txn.
+	var txnsRlp TxnsRlp
+	_, err = pool.PeekBest(ctx, 10, &txnsRlp, 0, math.MaxUint64, math.MaxUint64, math.MaxInt)
+	require.NoError(err)
+
+	// Step 4: Verify the pre-Osaka txn was fully discarded.
+	require.Equal(0, pool.pending.Len(), "txn must be removed from pending")
+	require.Equal(uint64(0), pool.totalBlobsInPool.Load(), "blob counter must be decremented to 0")
+	_, inByHash := pool.byHash[string(blobTxn.IDHash[:])]
+	require.False(inByHash, "txn must be removed from byHash")
+
+	// Step 5: A valid Osaka-shaped blob txn must now be admittable (not rejected
+	// with BlobPoolOverflow), proving the counters were properly cleaned up.
+	chainID := uint256.MustFromBig(testforks.Forks["Cancun"].ChainID)
+	osakaRlp := makeWrappedBlobTxnRlpWithCellProofs(t, chainID, 2)
+	parseCtx := NewTxnParseContext(*chainID)
+	parseCtx.WithSender(false)
+	var osakaSlot TxnSlot
+	_, err = parseCtx.ParseTransaction(osakaRlp, 0, &osakaSlot, nil, false, true, nil)
+	require.NoError(err)
+	osakaSlot.IDHash[0] = 34
+	{
+		var txnSlots TxnSlots
+		txnSlots.Append(&osakaSlot, addr[:], true)
+		reasons, err := pool.AddLocalTxns(ctx, txnSlots)
+		require.NoError(err)
+		require.Equal(txpoolcfg.Success, reasons[0], reasons[0].String())
+	}
+}
+
+func TestWrappedSixBlobTxnExceedsRlpLimit(t *testing.T) {
+	require := require.New(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	ch := make(chan Announcements, 1)
+	coreDB := temporaltest.NewTestDB(t, datadir.New(t.TempDir()))
+	db := memdb.NewTestPoolDB(t)
+	cfg := txpoolcfg.DefaultConfig
+	sendersCache := kvcache.New(kvcache.DefaultCoherentConfig)
+	pool, err := New(ctx, ch, db, coreDB, cfg, sendersCache, testforks.Forks["Osaka"], nil, nil, func() {}, nil, nil, log.New(), WithFeeCalculator(nil))
+	require.NoError(err)
+
+	chainID := uint256.MustFromBig(testforks.Forks["Osaka"].ChainID)
+	rawTxn := makeWrappedBlobTxnRlpWithCellProofs(t, chainID, params.MaxBlobsPerTxn)
+
+	parseCtx := NewTxnParseContext(*chainID)
+	parseCtx.WithSender(false)
+	parseCtx.ValidateRLP(pool.ValidateSerializedTxn)
+
+	var slot TxnSlot
+	_, err = parseCtx.ParseTransaction(rawTxn, 0, &slot, nil, false, true, nil)
+	require.NoError(err)
 }
 
 func TestGetBlobsV1(t *testing.T) {
@@ -1716,4 +1911,168 @@ func BenchmarkProcessRemoteTxns(b *testing.B) {
 	// Log final pool statistics after processing all transactions
 	pending, baseFee, queued := pool.CountContent()
 	b.Logf("Final pool stats - pending: %d, baseFee: %d, queued: %d", pending, baseFee, queued)
+}
+
+// TestZombieQueuedEviction verifies that queued transactions whose nonce is so far ahead of
+// the sender's on-chain nonce that they can never become pending are evicted from the pool.
+// This covers Bug #2: "zombie" queued txns on Gnosis Chain (e.g. on-chain nonce=281 but
+// queued nonce=16814, a gap of 16,533 that can never be filled).
+func TestZombieQueuedEviction(t *testing.T) {
+	assert, require := assert.New(t), require.New(t)
+	ch := make(chan Announcements, 100)
+	coreDB := temporaltest.NewTestDB(t, datadir.New(t.TempDir()))
+	db := memdb.NewTestPoolDB(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	cfg := txpoolcfg.DefaultConfig
+	cfg.MaxNonceGap = 64 // explicit, same as default
+	sendersCache := kvcache.New(kvcache.DefaultCoherentConfig)
+	pool, err := New(ctx, ch, db, coreDB, cfg, sendersCache, chain.TestChainConfig, nil, nil, func() {}, nil, nil, log.New(), WithFeeCalculator(nil))
+	require.NoError(err)
+	require.NotNil(pool)
+
+	pendingBaseFee := uint64(200_000)
+	h1 := gointerfaces.ConvertHashToH256([32]byte{})
+	var senderAddr [20]byte
+	senderAddr[0] = 0x42
+
+	// Set sender's on-chain nonce = 5
+	acc := accounts3.Account{
+		Nonce:       5,
+		Balance:     *uint256.NewInt(1 * common.Ether),
+		CodeHash:    common.Hash{},
+		Incarnation: 0,
+	}
+	v := accounts3.SerialiseV3(&acc)
+	change := &remoteproto.StateChangeBatch{
+		StateVersionId:      0,
+		PendingBlockBaseFee: pendingBaseFee,
+		BlockGasLimit:       1_000_000,
+		ChangeBatch: []*remoteproto.StateChange{
+			{
+				BlockHeight: 0,
+				BlockHash:   h1,
+				Changes: []*remoteproto.AccountChange{
+					{
+						Action:  remoteproto.Action_UPSERT,
+						Address: gointerfaces.ConvertAddressToH160(senderAddr),
+						Data:    v,
+					},
+				},
+			},
+		},
+	}
+	require.NoError(pool.OnNewBlock(ctx, change, TxnSlots{}, TxnSlots{}, TxnSlots{}))
+
+	t.Run("zombie tx with impossible nonce gap is evicted", func(t *testing.T) {
+		// nonce = 5 + 64 + 1 = 70, gap=65 > MaxNonceGap(64)
+		zombieNonce := uint64(5 + cfg.MaxNonceGap + 1)
+		var txnSlots TxnSlots
+		slot := &TxnSlot{
+			Tip:    *uint256.NewInt(300_000),
+			FeeCap: *uint256.NewInt(300_000),
+			Gas:    100_000,
+			Nonce:  zombieNonce,
+		}
+		slot.IDHash[0] = 0xAA
+		txnSlots.Append(slot, senderAddr[:], true)
+
+		reasons, err := pool.AddLocalTxns(ctx, txnSlots)
+		require.NoError(err)
+		require.Len(reasons, 1)
+		assert.Equal(txpoolcfg.NonceTooDistant, reasons[0],
+			"zombie tx (nonce gap %d > MaxNonceGap %d) should be evicted with NonceTooDistant",
+			zombieNonce-5, cfg.MaxNonceGap)
+
+		_, _, queued := pool.CountContent()
+		assert.Equal(0, queued, "queued pool should be empty after zombie eviction")
+	})
+
+	t.Run("tx at exactly MaxNonceGap boundary is kept", func(t *testing.T) {
+		// nonce = 5 + 64 = 69, gap=64 == MaxNonceGap (NOT evicted)
+		boundaryNonce := uint64(5 + cfg.MaxNonceGap)
+		var txnSlots TxnSlots
+		slot := &TxnSlot{
+			Tip:    *uint256.NewInt(300_000),
+			FeeCap: *uint256.NewInt(300_000),
+			Gas:    100_000,
+			Nonce:  boundaryNonce,
+		}
+		slot.IDHash[0] = 0xBB
+		txnSlots.Append(slot, senderAddr[:], true)
+
+		reasons, err := pool.AddLocalTxns(ctx, txnSlots)
+		require.NoError(err)
+		require.Len(reasons, 1)
+		// gap = boundaryNonce - noGapsNonce. noGapsNonce=5 (no consecutive txns).
+		// 64 is NOT > 64, so the tx should be kept (in queued due to nonce gap).
+		assert.Equal(txpoolcfg.Success, reasons[0],
+			"tx at exactly MaxNonceGap boundary (gap=%d) should be accepted", cfg.MaxNonceGap)
+	})
+
+	t.Run("consecutive txns beyond MaxNonceGap are kept", func(t *testing.T) {
+		// If there are consecutive txns 5, 6, 7, ..., 5+MaxNonceGap+5, they should all be kept
+		// because the gap from noGapsNonce is always 0 for consecutive txns.
+		var txnSlots TxnSlots
+		baseNonce := uint64(5)
+		// Clear the pool first by using a fresh pool
+		ch2 := make(chan Announcements, 100)
+		coreDB2 := temporaltest.NewTestDB(t, datadir.New(t.TempDir()))
+		db2 := memdb.NewTestPoolDB(t)
+		cfg2 := txpoolcfg.DefaultConfig
+		cfg2.MaxNonceGap = 10 // small gap for this test
+		pool2, err := New(ctx, ch2, db2, coreDB2, cfg2, kvcache.New(kvcache.DefaultCoherentConfig),
+			chain.TestChainConfig, nil, nil, func() {}, nil, nil, log.New(), WithFeeCalculator(nil))
+		require.NoError(err)
+
+		acc2 := accounts3.Account{
+			Nonce:    baseNonce,
+			Balance:  *uint256.NewInt(10 * common.Ether),
+			CodeHash: common.Hash{},
+		}
+		v2 := accounts3.SerialiseV3(&acc2)
+		var addr2 [20]byte
+		addr2[0] = 0x99
+		change2 := &remoteproto.StateChangeBatch{
+			StateVersionId:      0,
+			PendingBlockBaseFee: pendingBaseFee,
+			BlockGasLimit:       1_000_000,
+			ChangeBatch: []*remoteproto.StateChange{
+				{
+					BlockHeight: 0,
+					BlockHash:   gointerfaces.ConvertHashToH256([32]byte{1}),
+					Changes: []*remoteproto.AccountChange{
+						{Action: remoteproto.Action_UPSERT, Address: gointerfaces.ConvertAddressToH160(addr2), Data: v2},
+					},
+				},
+			},
+		}
+		require.NoError(pool2.OnNewBlock(ctx, change2, TxnSlots{}, TxnSlots{}, TxnSlots{}))
+
+		// Add consecutive txns: nonces 5, 6, 7, ..., 5+MaxNonceGap+5 = 20
+		count := int(cfg2.MaxNonceGap + 5 + 1)
+		for i := 0; i < count; i++ {
+			txnSlots.Txns = nil
+			txnSlots.Senders = txnSlots.Senders[:0]
+			txnSlots.IsLocal = txnSlots.IsLocal[:0]
+			slot := &TxnSlot{
+				Tip:    *uint256.NewInt(300_000),
+				FeeCap: *uint256.NewInt(300_000),
+				Gas:    100_000,
+				Nonce:  baseNonce + uint64(i),
+			}
+			slot.IDHash[0] = uint8(0xC0 + i)
+			txnSlots.Append(slot, addr2[:], true)
+			reasons, err := pool2.AddLocalTxns(ctx, txnSlots)
+			require.NoError(err)
+			assert.Equal(txpoolcfg.Success, reasons[0],
+				"consecutive tx nonce=%d should not be evicted (gap from noGapsNonce is 0)", baseNonce+uint64(i))
+		}
+		// All consecutive txns (no nonce gaps) should be accepted and promoted to pending.
+		// The key check is that NONE were evicted with NonceTooDistant — verified above per-tx.
+		pending2, _, queued2 := pool2.CountContent()
+		assert.Equal(0, queued2, "no consecutive txns should be zombie-evicted (queued should be drained to pending)")
+		assert.Equal(count, pending2, "all consecutive txns should be pending (no gaps, sufficient balance)")
+	})
 }

@@ -348,10 +348,11 @@ var snapshotCommand = cli.Command{
 				log.Info("[integrity] snapshots are publishable")
 				return nil
 			},
-			Description: "run slow validation of files. use --check to run single",
+			Description: "run slow validation of files. use --check to run multiple/single",
 			Flags: joinFlags([]cli.Flag{
 				&utils.DataDirFlag,
-				&cli.StringFlag{Name: "check", Usage: fmt.Sprintf("one of: %s", integrity.AllChecks)},
+				&cli.StringFlag{Name: "check", Usage: fmt.Sprintf("comma separated list from: %s", integrity.AllChecks)},
+				&cli.StringFlag{Name: "skip-check", Usage: fmt.Sprintf("comma separated list from: %s", integrity.AllChecks)},
 				&cli.BoolFlag{Name: "failFast", Value: true, Usage: "to stop after 1st problem or print WARN log and continue check"},
 				&cli.Uint64Flag{Name: "fromStep", Value: 0, Usage: "skip files before given step"},
 			}),
@@ -608,7 +609,7 @@ func DeleteStateSnapshots(dirs datadir.Dirs, removeLatest, promptUserBeforeDelet
 	}
 
 	// Step 2: Process each candidate file (already parsed)
-	doesRmCommitment := len(domainNames) != 0 || slices.Contains(domainNames, kv.CommitmentDomain.String())
+	doesRmCommitment := len(domainNames) == 0 || slices.Contains(domainNames, kv.CommitmentDomain.String())
 	for _, candidate := range candidateFiles {
 		res := candidate.fileInfo
 
@@ -905,6 +906,26 @@ func doIntegrity(cliCtx *cli.Context) error {
 		requestedChecks = integrity.AllChecks
 	}
 
+	skipChecks := cliCtx.String("skip-check")
+	if len(skipChecks) > 0 {
+		var finalChecks []integrity.Check
+		for skipCheck := range strings.SplitSeq(skipChecks, ",") {
+			found := false
+			for _, chk := range requestedChecks {
+				if chk == integrity.Check(skipCheck) {
+					found = true
+					logger.Info("[integrity] skipping check", "check", chk)
+					break
+				}
+			}
+			if !found {
+				finalChecks = append(finalChecks, integrity.Check(skipCheck))
+			}
+		}
+
+		requestedChecks = finalChecks
+	}
+
 	failFast := cliCtx.Bool("failFast")
 	fromStep := cliCtx.Uint64("fromStep")
 	dirs := datadir.New(cliCtx.String(utils.DataDirFlag.Name))
@@ -1112,44 +1133,47 @@ func checkIfBlockSnapshotsPublishable(snapDir string) error {
 		sum += res.To - res.From
 		headerSegName := info.Name()
 		headerSegVer := res.Version
-		if !headerSegVer.Eq(verMap["headers"]["seg"].Current) {
-			return fmt.Errorf("expected version %s, filename: %s", verMap["header"]["seg"].Current.String(), info.Name())
-		}
-		idxHeaderName := strings.Replace(headerSegName, ".seg", ".idx", 1)
-		headerIdxVer := verMap["headers"]["idx"].Current
-		idxHeaderName = strings.Replace(idxHeaderName, headerSegVer.String(), headerIdxVer.String(), 1)
-		if _, err := os.Stat(filepath.Join(snapDir, idxHeaderName)); err != nil {
-			return fmt.Errorf("missing index file %s", idxHeaderName)
+
+		if !verMap["headers"]["seg"].Supports(headerSegVer) {
+			return fmt.Errorf("expected version %s, filename: %s", verMap["headers"]["seg"].Current.String(), info.Name())
 		}
 		// check that all files exist
 		for _, snapType := range []string{"headers", "transactions", "bodies"} {
 			segName := strings.Replace(headerSegName, "headers", snapType, 1)
 			segVer := verMap[snapType]["seg"].Current
 			segName = strings.Replace(segName, headerSegVer.String(), segVer.String(), 1)
-			// check that the file exist
-			if exists, err := dir2.FileExist(filepath.Join(snapDir, segName)); err != nil {
+			segNameMasked, err := version.ReplaceVersionWithMask(segName)
+			if err != nil {
 				return err
-			} else if !exists {
-				return fmt.Errorf("missing file %s", segName)
+			}
+			segName, ver, ok, err := version.FindFilesWithVersionsByPattern(filepath.Join(snapDir, segNameMasked))
+			if err != nil {
+				return fmt.Errorf("finding %s: %w", segNameMasked, err)
+			}
+			if !ok {
+				return fmt.Errorf("missing file-%s", segNameMasked)
+			}
+			if !verMap[snapType]["seg"].Supports(ver) {
+				return fmt.Errorf("expected version %s, filename: %s", verMap[snapType]["seg"].Current.String(), segName)
 			}
 			// check that the index file exist
 			idxName := strings.Replace(segName, ".seg", ".idx", 1)
-			idxVer := verMap[snapType]["idx"].Current
-			idxName = strings.Replace(idxName, segVer.String(), idxVer.String(), 1)
-			if exists, err := dir2.FileExist(filepath.Join(snapDir, idxName)); err != nil {
+			idxNameMasked, err := version.ReplaceVersionWithMask(idxName)
+			if err != nil {
 				return err
-			} else if !exists {
-				return fmt.Errorf("missing index file %s", idxName)
+			}
+			if err := version.CheckIsThereFileWithSupportedVersion(idxNameMasked, verMap[snapType]["idx"].MinSupported); err != nil {
+				return fmt.Errorf("index file %s: %w", idxName, err)
 			}
 			if snapType == "transactions" {
 				// check that the tx index file exist
 				txIdxName := strings.Replace(segName, "transactions.seg", "transactions-to-block.idx", 1)
-				txIdxVer := verMap["transactions-to-block"]["idx"].Current
-				txIdxName = strings.Replace(txIdxName, segVer.String(), txIdxVer.String(), 1)
-				if exists, err := dir2.FileExist(filepath.Join(snapDir, txIdxName)); err != nil {
+				txIdxNameMasked, err := version.ReplaceVersionWithMask(txIdxName)
+				if err != nil {
 					return err
-				} else if !exists {
-					return fmt.Errorf("missing tx index file %s", txIdxName)
+				}
+				if err := version.CheckIsThereFileWithSupportedVersion(txIdxNameMasked, verMap["transactions-to-block"]["idx"].MinSupported); err != nil {
+					return fmt.Errorf("index file %s: %w", txIdxName, err)
 				}
 			}
 		}

@@ -83,8 +83,6 @@ type EngineServer struct {
 	printPectraBanner bool
 }
 
-const DefaultFcuTimeout = 1 * time.Second
-
 func NewEngineServer(
 	logger log.Logger,
 	config *chain.Config,
@@ -96,9 +94,6 @@ func NewEngineServer(
 	txPool txpoolproto.TxpoolClient,
 	fcuTimeout time.Duration,
 ) *EngineServer {
-	if fcuTimeout == 0 {
-		fcuTimeout = DefaultFcuTimeout
-	}
 	chainRW := eth1_chain_reader.NewChainReaderEth1(config, executionService, uint64(fcuTimeout.Milliseconds()))
 	srv := &EngineServer{
 		logger:            logger,
@@ -137,7 +132,7 @@ func (e *EngineServer) Start(
 			return nil
 		})
 	}
-	base := jsonrpc.NewBaseApi(filters, stateCache, blockReader, httpConfig.WithDatadir, httpConfig.EvmCallTimeout, engineReader, httpConfig.Dirs, nil)
+	base := jsonrpc.NewBaseApi(filters, stateCache, blockReader, httpConfig.WithDatadir, httpConfig.EvmCallTimeout, engineReader, httpConfig.Dirs, nil, httpConfig.BlockRangeLimit)
 	ethImpl := jsonrpc.NewEthAPI(base, db, eth, e.txpool, mining, httpConfig.Gascap, httpConfig.Feecap, httpConfig.ReturnDataLimit, httpConfig.AllowUnprotectedTxs, httpConfig.MaxGetProofRewindBlockCount, httpConfig.WebsocketSubscribeLogsChannelSize, e.logger)
 
 	apiList := []rpc.API{
