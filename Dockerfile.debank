@@ -29,7 +29,7 @@ COPY --from=builder /go/src/github.com/ledgerwatch/erigon/build/bin /app/
 
 # Install libsilkworm_capi.so to system library path
 RUN if [ -f /app/libsilkworm_capi.so ]; then \
-        install -m a=r -v /app/libsilkworm_capi.so /lib/x86_64-linux-gnu/ && \
+        install -m a=r -v /app/libsilkworm_capi.so /lib/$(uname -m)-linux-gnu/ && \
         rm /app/libsilkworm_capi.so; \
     fi
 
