@@ -1,8 +1,6 @@
 # syntax = docker/dockerfile:1.2
 FROM docker.io/library/golang:1.24-bookworm as builder
 
-ARG ACCESS_TOKEN
-
 RUN apt-get update && apt-get install -y build-essential git bash ca-certificates libstdc++6
 
 WORKDIR /go/src/github.com/ledgerwatch/erigon
