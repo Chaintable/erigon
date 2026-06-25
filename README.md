@@ -1,11 +1,30 @@
+# Chaintable write node
+
+> Fork of [erigontech/erigon](https://github.com/erigontech/erigon), with Chaintable pipeline patches.
+
+## Architecture
+
+This repo runs the chain's execution layer with the [Chaintable pipeline](https://github.com/Chaintable/pipeline) tracer embedded. The tracer extracts block data — block headers, transactions, call traces, receipts, events, and state diffs — and ships it to **S3 + Kafka** (see pipeline's [architecture](https://github.com/Chaintable/pipeline/blob/main/docs/architecture.md)). Two consumption paths:
+
+- **Block headers + state diffs** → Kafka + S3 → [leafage-evm](https://github.com/Chaintable/leafage-evm): a lightweight EVM executor serving state queries (`eth_call`, `eth_estimateGas`, …), no P2P sync, no tx storage (see its [architecture](https://github.com/Chaintable/leafage-evm#architecture)).
+- **Block files** (transactions · call traces · receipts · events) → S3 → Chaintable's transaction/trace indexing pipeline.
+
+```
+Chaintable write node (this repo · producer, embeds pipeline tracer)
+        │
+        ├─ block headers + state diffs ──────────────────→ Kafka + S3 ─→ leafage-evm (EVM state queries)
+        │
+        └─ block files (tx · trace · receipts · events) ──→ S3 ─→ Chaintable indexing pipeline (tx/trace data)
+```
+
+---
+
 # Erigon
 
 [![Docs](https://img.shields.io/badge/docs-up-green)](https://docs.erigon.tech/)
 [![Blog](https://img.shields.io/badge/blog-up-green)](https://erigon.tech/blog/)
 [![Twitter](https://img.shields.io/twitter/follow/ErigonEth?style=social)](https://x.com/ErigonEth)
 [![Discord](https://img.shields.io/badge/Discord-Join-5865F2?style=flat&logo=discord&logoColor=white)](https://dsc.gg/erigon)
-[![Build status](https://github.com/erigontech/erigon/actions/workflows/ci.yml/badge.svg)](https://github.com/erigontech/erigon/actions/workflows/ci.yml)
-[![Coverage](https://sonarcloud.io/api/project_badges/measure?project=erigontech_erigon&metric=coverage)](https://sonarcloud.io/summary/new_code?id=erigontech_erigon)
 
 Erigon is an implementation of Ethereum (execution layer with embeddable consensus layer), on the efficiency
 frontier.
@@ -103,12 +122,12 @@ Usage
 
 ### Getting Started
 
-[Release Notes and Binaries](https://github.com/erigontech/erigon/releases)
+[Release Notes and Binaries](https://github.com/Chaintable/erigon/releases) (CI also publishes container images to Chaintable's public ECR)
 
 Build latest release (this will be suitable for most users just wanting to run a node):
 
 ```sh
-git clone --branch release/<x.xx> --single-branch https://github.com/erigontech/erigon.git
+git clone --single-branch --branch main https://github.com/Chaintable/erigon.git
 cd erigon
 make erigon
 ./build/bin/erigon
@@ -284,7 +303,7 @@ If you would like to give Erigon a try: a good option is to start syncing one of
 It syncs much quicker, and does not take so much disk space:
 
 ```sh
-git clone https://github.com/erigontech/erigon.git
+git clone https://github.com/Chaintable/erigon.git
 cd erigon
 make erigon
 ./build/bin/erigon --datadir=<your_datadir> --chain=hoodi --prune.mode=full
