@@ -25,6 +25,8 @@ Chaintable write node (this repo · producer, embeds pipeline tracer)
 [![Blog](https://img.shields.io/badge/blog-up-green)](https://erigon.tech/blog/)
 [![Twitter](https://img.shields.io/twitter/follow/ErigonEth?style=social)](https://x.com/ErigonEth)
 [![Discord](https://img.shields.io/badge/Discord-Join-5865F2?style=flat&logo=discord&logoColor=white)](https://dsc.gg/erigon)
+[![Build status](https://github.com/erigontech/erigon/actions/workflows/ci.yml/badge.svg)](https://github.com/erigontech/erigon/actions/workflows/ci.yml)
+[![Coverage](https://sonarcloud.io/api/project_badges/measure?project=erigontech_erigon&metric=coverage)](https://sonarcloud.io/summary/new_code?id=erigontech_erigon)
 
 Erigon is an implementation of Ethereum (execution layer with embeddable consensus layer), on the efficiency
 frontier.
@@ -122,12 +124,12 @@ Usage
 
 ### Getting Started
 
-[Release Notes and Binaries](https://github.com/Chaintable/erigon/releases) (CI also publishes container images to Chaintable's public ECR)
+[Release Notes and Binaries](https://github.com/erigontech/erigon/releases)
 
 Build latest release (this will be suitable for most users just wanting to run a node):
 
 ```sh
-git clone --single-branch --branch main https://github.com/Chaintable/erigon.git
+git clone --branch release/<x.xx> --single-branch https://github.com/Chaintable/erigon
 cd erigon
 make erigon
 ./build/bin/erigon
@@ -303,7 +305,7 @@ If you would like to give Erigon a try: a good option is to start syncing one of
 It syncs much quicker, and does not take so much disk space:
 
 ```sh
-git clone https://github.com/Chaintable/erigon.git
+git clone https://github.com/Chaintable/erigon
 cd erigon
 make erigon
 ./build/bin/erigon --datadir=<your_datadir> --chain=hoodi --prune.mode=full
