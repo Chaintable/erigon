@@ -41,7 +41,7 @@ jobs:
           swap-storage: false
 
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set revision
         run: echo "REVISION=$(git rev-parse --short=8 HEAD)" >> $GITHUB_ENV
@@ -82,7 +82,7 @@ jobs:
       id-token: write
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set revision
         run: echo "REVISION=$(git rev-parse --short=8 HEAD)" >> $GITHUB_ENV
