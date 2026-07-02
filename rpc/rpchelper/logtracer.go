@@ -4,8 +4,10 @@ import (
 	"github.com/holiman/uint256"
 
 	"github.com/erigontech/erigon/common"
+	"github.com/erigontech/erigon/common/hexutil"
 	"github.com/erigontech/erigon/execution/tracing"
 	"github.com/erigontech/erigon/execution/types"
+	"github.com/erigontech/erigon/execution/types/accounts"
 	"github.com/erigontech/erigon/execution/vm"
 )
 
@@ -59,7 +61,7 @@ func (t *LogTracer) Hooks() *tracing.Hooks {
 	}
 }
 
-func (t *LogTracer) onEnter(depth int, typ byte, from common.Address, to common.Address, precompile bool, input []byte, gas uint64, value uint256.Int, code []byte) {
+func (t *LogTracer) onEnter(depth int, typ byte, from accounts.Address, to accounts.Address, precompile bool, input []byte, gas uint64, value uint256.Int, code []byte) {
 	t.logs = append(t.logs, make([]*types.Log, 0))
 	if vm.OpCode(typ) != vm.DELEGATECALL && !value.IsZero() {
 		t.captureTransfer(from, to, &value)
@@ -101,25 +103,28 @@ func (t *LogTracer) captureLog(address common.Address, topics []common.Hash, dat
 		Address:     address,
 		Topics:      topics,
 		Data:        data,
-		BlockNumber: t.blockNumber,
+		BlockNumber: hexutil.Uint64(t.blockNumber),
 		BlockHash:   t.blockHash,
 		TxHash:      t.txHash,
-		TxIndex:     t.txIdx,
-		Index:       uint(t.count),
+		TxIndex:     hexutil.Uint(t.txIdx),
+		Index:       hexutil.Uint(t.count),
 	})
 	t.count++
 }
 
-func (t *LogTracer) captureTransfer(from, to common.Address, value *uint256.Int) {
+func (t *LogTracer) captureTransfer(from, to accounts.Address, value *uint256.Int) {
 	if !t.traceTransfers {
 		return
 	}
+	fromValue := from.Value()
+	toValue := to.Value()
 	topics := []common.Hash{
 		transferTopic,
-		common.BytesToHash(from.Bytes()),
-		common.BytesToHash(to.Bytes()),
+		common.BytesToHash(fromValue[:]),
+		common.BytesToHash(toValue[:]),
 	}
-	t.captureLog(transferAddress, topics, common.BigToHash(value.ToBig()).Bytes())
+	valueHash := common.BigToHash(value.ToBig())
+	t.captureLog(transferAddress, topics, valueHash[:])
 }
 
 // Reset prepares the LogTracer for the next transaction.

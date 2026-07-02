@@ -32,14 +32,18 @@ import (
 	"github.com/erigontech/erigon/execution/abi/bind"
 	"github.com/erigontech/erigon/execution/abi/bind/backends"
 	"github.com/erigontech/erigon/execution/chain"
+	"github.com/erigontech/erigon/execution/execmodule/execmoduletester"
 	"github.com/erigontech/erigon/execution/state"
 	"github.com/erigontech/erigon/execution/tests/blockgen"
 	"github.com/erigontech/erigon/execution/tests/contracts"
-	"github.com/erigontech/erigon/execution/tests/mock"
 	"github.com/erigontech/erigon/execution/types"
+	"github.com/erigontech/erigon/execution/types/accounts"
 )
 
 func TestInsertIncorrectStateRootDifferentAccounts(t *testing.T) {
+	if testing.Short() {
+		t.Skip("slow test")
+	}
 	data := getGenesis()
 	from := data.addresses[0]
 	fromKey := data.keys[0]
@@ -92,7 +96,7 @@ func TestInsertIncorrectStateRootDifferentAccounts(t *testing.T) {
 	defer tx.Rollback()
 
 	st := state.New(m.NewStateReader(tx))
-	exist, err := st.Exist(to)
+	exist, err := st.Exist(accounts.InternAddress(to))
 	if err != nil {
 		t.Error(err)
 	}
@@ -100,21 +104,21 @@ func TestInsertIncorrectStateRootDifferentAccounts(t *testing.T) {
 		t.Error("expected account to exist")
 	}
 
-	balance, err := st.GetBalance(from)
+	balance, err := st.GetBalance(accounts.InternAddress(from))
 	if err != nil {
 		t.Error(err)
 	}
 	if balance.Uint64() != 1000000000 {
 		t.Fatalf("got %v, expected %v", balance, 1000000000)
 	}
-	balance, err = st.GetBalance(data.addresses[1])
+	balance, err = st.GetBalance(accounts.InternAddress(data.addresses[1]))
 	if err != nil {
 		t.Error(err)
 	}
 	if balance.Uint64() != 999995000 {
 		t.Fatalf("got %v, expected %v", balance, 999995000)
 	}
-	balance, err = st.GetBalance(to)
+	balance, err = st.GetBalance(accounts.InternAddress(to))
 	if err != nil {
 		t.Error(err)
 	}
@@ -124,6 +128,9 @@ func TestInsertIncorrectStateRootDifferentAccounts(t *testing.T) {
 }
 
 func TestInsertIncorrectStateRootSameAccount(t *testing.T) {
+	if testing.Short() {
+		t.Skip("slow test")
+	}
 	data := getGenesis()
 	from := data.addresses[0]
 	fromKey := data.keys[0]
@@ -176,7 +183,7 @@ func TestInsertIncorrectStateRootSameAccount(t *testing.T) {
 	defer tx.Rollback()
 
 	st := state.New(m.NewStateReader(tx))
-	exist, err := st.Exist(to)
+	exist, err := st.Exist(accounts.InternAddress(to))
 	if err != nil {
 		t.Error(err)
 	}
@@ -184,14 +191,14 @@ func TestInsertIncorrectStateRootSameAccount(t *testing.T) {
 		t.Error("expected account to exist")
 	}
 
-	balance, err := st.GetBalance(from)
+	balance, err := st.GetBalance(accounts.InternAddress(from))
 	if err != nil {
 		t.Error(err)
 	}
 	if balance.Uint64() != 999995000 {
 		t.Fatalf("got %v, expected %v", balance, 999995000)
 	}
-	balance, err = st.GetBalance(to)
+	balance, err = st.GetBalance(accounts.InternAddress(to))
 	if err != nil {
 		t.Error(err)
 	}
@@ -250,7 +257,7 @@ func TestInsertIncorrectStateRootSameAccountSameAmount(t *testing.T) {
 	defer tx.Rollback()
 
 	st := state.New(m.NewStateReader(tx))
-	exist, err := st.Exist(to)
+	exist, err := st.Exist(accounts.InternAddress(to))
 	if err != nil {
 		t.Error(err)
 	}
@@ -258,14 +265,14 @@ func TestInsertIncorrectStateRootSameAccountSameAmount(t *testing.T) {
 		t.Error("expected account to exist")
 	}
 
-	balance, err := st.GetBalance(from)
+	balance, err := st.GetBalance(accounts.InternAddress(from))
 	if err != nil {
 		t.Error(err)
 	}
 	if balance.Uint64() != 999999000 {
 		t.Fatalf("got %v, expected %v", balance, 999999000)
 	}
-	balance, err = st.GetBalance(to)
+	balance, err = st.GetBalance(accounts.InternAddress(to))
 	if err != nil {
 		t.Error(err)
 	}
@@ -324,7 +331,7 @@ func TestInsertIncorrectStateRootAllFundsRoot(t *testing.T) {
 	defer tx.Rollback()
 
 	st := state.New(m.NewStateReader(tx))
-	exist, err := st.Exist(to)
+	exist, err := st.Exist(accounts.InternAddress(to))
 	if err != nil {
 		t.Error(err)
 	}
@@ -332,14 +339,14 @@ func TestInsertIncorrectStateRootAllFundsRoot(t *testing.T) {
 		t.Error("expected account to exist")
 	}
 
-	balance, err := st.GetBalance(from)
+	balance, err := st.GetBalance(accounts.InternAddress(from))
 	if err != nil {
 		t.Error(err)
 	}
 	if balance.Uint64() != 2000 {
 		t.Fatalf("got %v, expected %v", balance, 2000)
 	}
-	balance, err = st.GetBalance(to)
+	balance, err = st.GetBalance(accounts.InternAddress(to))
 	if err != nil {
 		t.Error(err)
 	}
@@ -398,7 +405,7 @@ func TestInsertIncorrectStateRootAllFunds(t *testing.T) {
 	defer tx.Rollback()
 
 	st := state.New(m.NewStateReader(tx))
-	exist, err := st.Exist(to)
+	exist, err := st.Exist(accounts.InternAddress(to))
 	if err != nil {
 		t.Error(err)
 	}
@@ -406,14 +413,14 @@ func TestInsertIncorrectStateRootAllFunds(t *testing.T) {
 		t.Error("expected account to exist")
 	}
 
-	balance, err := st.GetBalance(from)
+	balance, err := st.GetBalance(accounts.InternAddress(from))
 	if err != nil {
 		t.Error(err)
 	}
 	if balance.Uint64() != 2000 {
 		t.Fatalf("got %v, expected %v", balance, 2000)
 	}
-	balance, err = st.GetBalance(to)
+	balance, err = st.GetBalance(accounts.InternAddress(to))
 	if err != nil {
 		t.Error(err)
 	}
@@ -451,14 +458,14 @@ func TestAccountDeployIncorrectRoot(t *testing.T) {
 	}
 	err = m.DB.ViewTemporal(context.Background(), func(tx kv.TemporalTx) error {
 		st := state.New(m.NewStateReader(tx))
-		exist, err := st.Exist(from)
+		exist, err := st.Exist(accounts.InternAddress(from))
 		if err != nil {
 			return err
 		}
 		if !exist {
 			t.Error("expected account to exist")
 		}
-		exist, err = st.Exist(contractAddress)
+		exist, err = st.Exist(accounts.InternAddress(contractAddress))
 		if err != nil {
 			return err
 		}
@@ -481,7 +488,7 @@ func TestAccountDeployIncorrectRoot(t *testing.T) {
 
 	err = m.DB.ViewTemporal(context.Background(), func(tx kv.TemporalTx) error {
 		st := state.New(m.NewStateReader(tx))
-		exist, err := st.Exist(from)
+		exist, err := st.Exist(accounts.InternAddress(from))
 		if err != nil {
 			return err
 		}
@@ -489,7 +496,7 @@ func TestAccountDeployIncorrectRoot(t *testing.T) {
 			t.Error("expected account to exist")
 		}
 
-		exist, err = st.Exist(contractAddress)
+		exist, err = st.Exist(accounts.InternAddress(contractAddress))
 		if err != nil {
 			return err
 		}
@@ -507,7 +514,7 @@ func TestAccountDeployIncorrectRoot(t *testing.T) {
 
 	err = m.DB.ViewTemporal(context.Background(), func(tx kv.TemporalTx) error {
 		st := state.New(m.NewStateReader(tx))
-		exist, err := st.Exist(from)
+		exist, err := st.Exist(accounts.InternAddress(from))
 		if err != nil {
 			return err
 		}
@@ -515,7 +522,7 @@ func TestAccountDeployIncorrectRoot(t *testing.T) {
 			t.Error("expected account to exist")
 		}
 
-		exist, err = st.Exist(contractAddress)
+		exist, err = st.Exist(accounts.InternAddress(contractAddress))
 		if err != nil {
 			return err
 		}
@@ -561,7 +568,7 @@ func TestAccountCreateIncorrectRoot(t *testing.T) {
 
 	err = m.DB.ViewTemporal(context.Background(), func(tx kv.TemporalTx) error {
 		st := state.New(m.NewStateReader(tx))
-		exist, err := st.Exist(from)
+		exist, err := st.Exist(accounts.InternAddress(from))
 		if err != nil {
 			return err
 		}
@@ -569,7 +576,7 @@ func TestAccountCreateIncorrectRoot(t *testing.T) {
 			t.Error("expected account to exist")
 		}
 
-		exist, err = st.Exist(contractAddress)
+		exist, err = st.Exist(accounts.InternAddress(contractAddress))
 		if err != nil {
 			return err
 		}
@@ -587,7 +594,7 @@ func TestAccountCreateIncorrectRoot(t *testing.T) {
 	}
 	err = m.DB.ViewTemporal(context.Background(), func(tx kv.TemporalTx) error {
 		st := state.New(m.NewStateReader(tx))
-		exist, err := st.Exist(from)
+		exist, err := st.Exist(accounts.InternAddress(from))
 		if err != nil {
 			return err
 		}
@@ -595,7 +602,7 @@ func TestAccountCreateIncorrectRoot(t *testing.T) {
 			t.Error("expected account to exist")
 		}
 
-		exist, err = st.Exist(contractAddress)
+		exist, err = st.Exist(accounts.InternAddress(contractAddress))
 		if err != nil {
 			return err
 		}
@@ -661,7 +668,7 @@ func TestAccountUpdateIncorrectRoot(t *testing.T) {
 
 	err = m.DB.ViewTemporal(context.Background(), func(tx kv.TemporalTx) error {
 		st := state.New(m.NewStateReader(tx))
-		exist, err := st.Exist(from)
+		exist, err := st.Exist(accounts.InternAddress(from))
 		if err != nil {
 			return err
 		}
@@ -669,7 +676,7 @@ func TestAccountUpdateIncorrectRoot(t *testing.T) {
 			t.Error("expected account to exist")
 		}
 
-		exist, err = st.Exist(contractAddress)
+		exist, err = st.Exist(accounts.InternAddress(contractAddress))
 		if err != nil {
 			return err
 		}
@@ -688,7 +695,7 @@ func TestAccountUpdateIncorrectRoot(t *testing.T) {
 
 	err = m.DB.ViewTemporal(context.Background(), func(tx kv.TemporalTx) error {
 		st := state.New(m.NewStateReader(tx))
-		exist, err := st.Exist(from)
+		exist, err := st.Exist(accounts.InternAddress(from))
 		if err != nil {
 			return err
 		}
@@ -696,7 +703,7 @@ func TestAccountUpdateIncorrectRoot(t *testing.T) {
 			t.Error("expected account to exist")
 		}
 
-		exist, err = st.Exist(contractAddress)
+		exist, err = st.Exist(accounts.InternAddress(contractAddress))
 		if err != nil {
 			return err
 		}
@@ -729,6 +736,9 @@ func TestAccountUpdateIncorrectRoot(t *testing.T) {
 }
 
 func TestAccountDeleteIncorrectRoot(t *testing.T) {
+	if testing.Short() {
+		t.Skip("slow test")
+	}
 	data := getGenesis()
 	from := data.addresses[0]
 	fromKey := data.keys[0]
@@ -766,7 +776,7 @@ func TestAccountDeleteIncorrectRoot(t *testing.T) {
 
 	err = m.DB.ViewTemporal(context.Background(), func(tx kv.TemporalTx) error {
 		st := state.New(m.NewStateReader(tx))
-		exist, err := st.Exist(from)
+		exist, err := st.Exist(accounts.InternAddress(from))
 		if err != nil {
 			return err
 		}
@@ -774,7 +784,7 @@ func TestAccountDeleteIncorrectRoot(t *testing.T) {
 			t.Error("expected account to exist")
 		}
 
-		exist, err = st.Exist(contractAddress)
+		exist, err = st.Exist(accounts.InternAddress(contractAddress))
 		if err != nil {
 			return err
 		}
@@ -792,7 +802,7 @@ func TestAccountDeleteIncorrectRoot(t *testing.T) {
 
 	err = m.DB.ViewTemporal(context.Background(), func(tx kv.TemporalTx) error {
 		st := state.New(m.NewStateReader(tx))
-		exist, err := st.Exist(from)
+		exist, err := st.Exist(accounts.InternAddress(from))
 		if err != nil {
 			return err
 		}
@@ -800,7 +810,7 @@ func TestAccountDeleteIncorrectRoot(t *testing.T) {
 			t.Error("expected account to exist")
 		}
 
-		exist, err = st.Exist(contractAddress)
+		exist, err = st.Exist(accounts.InternAddress(contractAddress))
 		if err != nil {
 			return err
 		}
@@ -855,7 +865,7 @@ func getGenesis(funds ...*big.Int) initialData {
 	for _, key := range keys {
 		addr := crypto.PubkeyToAddress(key.PublicKey)
 		addresses = append(addresses, addr)
-		to, err := bind.NewKeyedTransactorWithChainID(key, big.NewInt(1))
+		to, err := bind.NewKeyedTransactorWithChainID(key, uint256.NewInt(1))
 		if err != nil {
 			panic(err)
 		}
@@ -870,12 +880,12 @@ func getGenesis(funds ...*big.Int) initialData {
 		transactOpts: transactOpts,
 		genesisSpec: &types.Genesis{
 			Config: &chain.Config{
-				ChainID:               big.NewInt(1),
-				HomesteadBlock:        new(big.Int),
-				TangerineWhistleBlock: new(big.Int),
-				SpuriousDragonBlock:   big.NewInt(1),
-				ByzantiumBlock:        big.NewInt(1),
-				ConstantinopleBlock:   big.NewInt(1),
+				ChainID:               uint256.NewInt(1),
+				HomesteadBlock:        new(uint64),
+				TangerineWhistleBlock: new(uint64),
+				SpuriousDragonBlock:   common.NewUint64(1),
+				ByzantiumBlock:        common.NewUint64(1),
+				ConstantinopleBlock:   common.NewUint64(1),
 			},
 			Alloc: allocs,
 		},
@@ -887,9 +897,9 @@ type txn struct {
 	key  *ecdsa.PrivateKey
 }
 
-func GenerateBlocks(t *testing.T, gspec *types.Genesis, txs map[int]txn) (*mock.MockSentry, *blockgen.ChainPack, error) {
+func GenerateBlocks(t *testing.T, gspec *types.Genesis, txs map[int]txn) (*execmoduletester.ExecModuleTester, *blockgen.ChainPack, error) {
 	key, _ := crypto.HexToECDSA("b71c71a67e1177ad4e901695e1b4b9ee17ae16c6668d313eac2f96dbcda3f291")
-	m := mock.MockWithGenesis(t, gspec, key, false)
+	m := execmoduletester.New(t, execmoduletester.WithGenesisSpec(gspec), execmoduletester.WithKey(key))
 
 	contractBackend := backends.NewSimulatedBackendWithConfig(t, gspec.Alloc, gspec.Config, gspec.GasLimit)
 
@@ -948,7 +958,7 @@ func getBlockDeployTestContractTx(transactOpts *bind.TransactOpts, contractAddre
 	}
 }
 
-func getBlockTestContractTx(transactOpts *bind.TransactOpts, contractCall interface{}, newBalance ...*big.Int) blockTx {
+func getBlockTestContractTx(transactOpts *bind.TransactOpts, contractCall any, newBalance ...*big.Int) blockTx {
 	return func(_ *blockgen.BlockGen, backend bind.ContractBackend) (types.Transaction, bool) {
 		var (
 			tx  types.Transaction

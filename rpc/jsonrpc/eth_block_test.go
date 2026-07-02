@@ -18,34 +18,34 @@ package jsonrpc
 
 import (
 	"context"
-	"math/big"
 	"testing"
 
+	"github.com/holiman/uint256"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/erigontech/erigon/cmd/rpcdaemon/rpcdaemontest"
 	"github.com/erigontech/erigon/common"
 	"github.com/erigontech/erigon/common/hexutil"
-	"github.com/erigontech/erigon/common/log/v3"
 	"github.com/erigontech/erigon/db/kv/kvcache"
+	"github.com/erigontech/erigon/db/kv/prune"
 	"github.com/erigontech/erigon/db/rawdb"
+	"github.com/erigontech/erigon/execution/execmodule/execmoduletester"
 	"github.com/erigontech/erigon/execution/rlp"
-	"github.com/erigontech/erigon/execution/tests/mock"
+	"github.com/erigontech/erigon/execution/state"
+	"github.com/erigontech/erigon/execution/tests/blockgen"
 	"github.com/erigontech/erigon/execution/types"
-	"github.com/erigontech/erigon/node/ethconfig"
 	"github.com/erigontech/erigon/node/gointerfaces/txpoolproto"
 	"github.com/erigontech/erigon/rpc"
-	"github.com/erigontech/erigon/rpc/rpccfg"
 	"github.com/erigontech/erigon/rpc/rpchelper"
 )
 
 // Gets the latest block number with the latest tag
 func TestGetBlockByNumberWithLatestTag(t *testing.T) {
-	m, _, _ := rpcdaemontest.CreateTestSentry(t)
-	api := NewEthAPI(newBaseApiForTest(m), m.DB, nil, nil, nil, 5000000, ethconfig.Defaults.RPCTxFeeCap, 100_000, false, 100_000, 128, log.New())
+	m, _, _ := rpcdaemontest.CreateTestExecModule(t)
+	api := newEthApiForTest(newBaseApiForTest(m), m.DB, nil, nil)
 	b, err := api.GetBlockByNumber(context.Background(), rpc.LatestBlockNumber, false)
-	expected := common.HexToHash("0x5883164d4100b95e1d8e931b8b9574586a1dea7507941e6ad3c1e3a2591485fd")
+	expected := common.HexToHash("0x9c47d5780744fa24ccdb1543a9b715e53431d5560b9e460b8b7a68f7c58310ae")
 	if err != nil {
 		t.Errorf("error getting block number with latest tag: %s", err)
 	}
@@ -53,7 +53,7 @@ func TestGetBlockByNumberWithLatestTag(t *testing.T) {
 }
 
 func TestGetBlockByNumberWithLatestTag_WithHeadHashInDb(t *testing.T) {
-	m, _, _ := rpcdaemontest.CreateTestSentry(t)
+	m, _, _ := rpcdaemontest.CreateTestExecModule(t)
 	ctx := context.Background()
 	tx, err := m.DB.BeginRw(ctx)
 	require.NoError(t, err)
@@ -73,7 +73,7 @@ func TestGetBlockByNumberWithLatestTag_WithHeadHashInDb(t *testing.T) {
 	}
 	tx.Commit()
 
-	api := NewEthAPI(newBaseApiForTest(m), m.DB, nil, nil, nil, 5000000, ethconfig.Defaults.RPCTxFeeCap, 100_000, false, 100_000, 128, log.New())
+	api := newEthApiForTest(newBaseApiForTest(m), m.DB, nil, nil)
 	block, err := api.GetBlockByNumber(ctx, rpc.LatestBlockNumber, false)
 	if err != nil {
 		t.Errorf("error retrieving block by number: %s", err)
@@ -83,16 +83,16 @@ func TestGetBlockByNumberWithLatestTag_WithHeadHashInDb(t *testing.T) {
 }
 
 func TestGetBlockByNumberWithPendingTag(t *testing.T) {
-	m := mock.MockWithTxPool(t)
+	m := execmoduletester.New(t, execmoduletester.WithTxPool())
 	stateCache := kvcache.New(kvcache.DefaultCoherentConfig)
 
 	ctx, conn := rpcdaemontest.CreateTestGrpcConn(t, m)
 	txPool := txpoolproto.NewTxpoolClient(conn)
-	ff := rpchelper.New(ctx, rpchelper.DefaultFiltersConfig, nil, txPool, txpoolproto.NewMiningClient(conn), func() {}, m.Log)
+	ff := rpchelper.New(ctx, rpchelper.DefaultFiltersConfig, nil, txPool, txpoolproto.NewMiningClient(conn), func() {}, m.Log, nil)
 
 	expected := 1
 	header := &types.Header{
-		Number: big.NewInt(int64(expected)),
+		Number: *uint256.NewInt(uint64(expected)),
 	}
 
 	rlpBlock, err := rlp.EncodeToBytes(types.NewBlockWithHeader(header))
@@ -103,25 +103,31 @@ func TestGetBlockByNumberWithPendingTag(t *testing.T) {
 		RplBlock: rlpBlock,
 	})
 
-	api := NewEthAPI(NewBaseApi(ff, stateCache, m.BlockReader, false, rpccfg.DefaultEvmCallTimeout, m.Engine, m.Dirs, nil, 0), m.DB, nil, nil, nil, 5000000, ethconfig.Defaults.RPCTxFeeCap, 100_000, false, 100_000, 128, log.New())
+	api := newEthApiForTest(newBaseApiWithFiltersForTest(ff, stateCache, m), m.DB, nil, nil)
 	b, err := api.GetBlockByNumber(context.Background(), rpc.PendingBlockNumber, false)
 	if err != nil {
 		t.Errorf("error getting block number with pending tag: %s", err)
 	}
-	assert.Equal(t, (*hexutil.Big)(big.NewInt(int64(expected))), b["number"])
+	expectedNum := (*hexutil.Big)(uint256.NewInt(uint64(expected)).ToBig())
+	assert.Equal(t, expectedNum, b["number"])
 }
 
 func TestGetBlockByNumber_WithFinalizedTag_NoFinalizedBlockInDb(t *testing.T) {
-	m, _, _ := rpcdaemontest.CreateTestSentry(t)
+	m, _, _ := rpcdaemontest.CreateTestExecModule(t)
 	ctx := context.Background()
-	api := NewEthAPI(newBaseApiForTest(m), m.DB, nil, nil, nil, 5000000, ethconfig.Defaults.RPCTxFeeCap, 100_000, false, 100_000, 128, log.New())
-	if _, err := api.GetBlockByNumber(ctx, rpc.FinalizedBlockNumber, false); err != nil {
-		assert.ErrorIs(t, rpchelper.UnknownBlockError, err)
+	api := newEthApiForTest(newBaseApiForTest(m), m.DB, nil, nil)
+	_, err := api.GetBlockByNumber(ctx, rpc.FinalizedBlockNumber, false)
+	if err != nil {
+		var customErr *rpc.CustomError
+		if assert.ErrorAs(t, err, &customErr) {
+			assert.Equal(t, rpchelper.UnknownBlockCode, customErr.Code)
+			assert.Contains(t, customErr.Message, "finalized")
+		}
 	}
 }
 
 func TestGetBlockByNumber_WithFinalizedTag_WithFinalizedBlockInDb(t *testing.T) {
-	m, _, _ := rpcdaemontest.CreateTestSentry(t)
+	m, _, _ := rpcdaemontest.CreateTestExecModule(t)
 	ctx := context.Background()
 	tx, err := m.DB.BeginRw(ctx)
 	require.NoError(t, err)
@@ -141,7 +147,7 @@ func TestGetBlockByNumber_WithFinalizedTag_WithFinalizedBlockInDb(t *testing.T) 
 	}
 	tx.Commit()
 
-	api := NewEthAPI(newBaseApiForTest(m), m.DB, nil, nil, nil, 5000000, ethconfig.Defaults.RPCTxFeeCap, 100_000, false, 100_000, 128, log.New())
+	api := newEthApiForTest(newBaseApiForTest(m), m.DB, nil, nil)
 	block, err := api.GetBlockByNumber(ctx, rpc.FinalizedBlockNumber, false)
 	if err != nil {
 		t.Errorf("error retrieving block by number: %s", err)
@@ -151,16 +157,21 @@ func TestGetBlockByNumber_WithFinalizedTag_WithFinalizedBlockInDb(t *testing.T) 
 }
 
 func TestGetBlockByNumber_WithSafeTag_NoSafeBlockInDb(t *testing.T) {
-	m, _, _ := rpcdaemontest.CreateTestSentry(t)
+	m, _, _ := rpcdaemontest.CreateTestExecModule(t)
 	ctx := context.Background()
-	api := NewEthAPI(newBaseApiForTest(m), m.DB, nil, nil, nil, 5000000, ethconfig.Defaults.RPCTxFeeCap, 100_000, false, 100_000, 128, log.New())
-	if _, err := api.GetBlockByNumber(ctx, rpc.SafeBlockNumber, false); err != nil {
-		assert.ErrorIs(t, rpchelper.UnknownBlockError, err)
+	api := newEthApiForTest(newBaseApiForTest(m), m.DB, nil, nil)
+	_, err := api.GetBlockByNumber(ctx, rpc.SafeBlockNumber, false)
+	if err != nil {
+		var customErr *rpc.CustomError
+		if assert.ErrorAs(t, err, &customErr) {
+			assert.Equal(t, rpchelper.UnknownBlockCode, customErr.Code)
+			assert.Contains(t, customErr.Message, "safe")
+		}
 	}
 }
 
 func TestGetBlockByNumber_WithSafeTag_WithSafeBlockInDb(t *testing.T) {
-	m, _, _ := rpcdaemontest.CreateTestSentry(t)
+	m, _, _ := rpcdaemontest.CreateTestExecModule(t)
 	ctx := context.Background()
 	tx, err := m.DB.BeginRw(ctx)
 	require.NoError(t, err)
@@ -180,7 +191,7 @@ func TestGetBlockByNumber_WithSafeTag_WithSafeBlockInDb(t *testing.T) {
 	}
 	tx.Commit()
 
-	api := NewEthAPI(newBaseApiForTest(m), m.DB, nil, nil, nil, 5000000, ethconfig.Defaults.RPCTxFeeCap, 100_000, false, 100_000, 128, log.New())
+	api := newEthApiForTest(newBaseApiForTest(m), m.DB, nil, nil)
 	block, err := api.GetBlockByNumber(ctx, rpc.SafeBlockNumber, false)
 	if err != nil {
 		t.Errorf("error retrieving block by number: %s", err)
@@ -190,10 +201,10 @@ func TestGetBlockByNumber_WithSafeTag_WithSafeBlockInDb(t *testing.T) {
 }
 
 func TestGetBlockTransactionCountByHash(t *testing.T) {
-	m, _, _ := rpcdaemontest.CreateTestSentry(t)
+	m, _, _ := rpcdaemontest.CreateTestExecModule(t)
 	ctx := context.Background()
 
-	api := NewEthAPI(newBaseApiForTest(m), m.DB, nil, nil, nil, 5000000, ethconfig.Defaults.RPCTxFeeCap, 100_000, false, 100_000, 128, log.New())
+	api := newEthApiForTest(newBaseApiForTest(m), m.DB, nil, nil)
 	blockHash := common.HexToHash("0x6804117de2f3e6ee32953e78ced1db7b20214e0d8c745a03b8fecf7cc8ee76ef")
 
 	tx, err := m.DB.BeginRw(ctx)
@@ -223,9 +234,9 @@ func TestGetBlockTransactionCountByHash(t *testing.T) {
 }
 
 func TestGetBlockTransactionCountByHash_ZeroTx(t *testing.T) {
-	m, _, _ := rpcdaemontest.CreateTestSentry(t)
+	m, _, _ := rpcdaemontest.CreateTestExecModule(t)
 	ctx := context.Background()
-	api := NewEthAPI(newBaseApiForTest(m), m.DB, nil, nil, nil, 5000000, ethconfig.Defaults.RPCTxFeeCap, 100_000, false, 100_000, 128, log.New())
+	api := newEthApiForTest(newBaseApiForTest(m), m.DB, nil, nil)
 	blockHash := common.HexToHash("0x5883164d4100b95e1d8e931b8b9574586a1dea7507941e6ad3c1e3a2591485fd")
 
 	tx, err := m.DB.BeginRw(ctx)
@@ -255,9 +266,9 @@ func TestGetBlockTransactionCountByHash_ZeroTx(t *testing.T) {
 }
 
 func TestGetBlockTransactionCountByNumber(t *testing.T) {
-	m, _, _ := rpcdaemontest.CreateTestSentry(t)
+	m, _, _ := rpcdaemontest.CreateTestExecModule(t)
 	ctx := context.Background()
-	api := NewEthAPI(newBaseApiForTest(m), m.DB, nil, nil, nil, 5000000, ethconfig.Defaults.RPCTxFeeCap, 100_000, false, 100_000, 128, log.New())
+	api := newEthApiForTest(newBaseApiForTest(m), m.DB, nil, nil)
 	blockHash := common.HexToHash("0x6804117de2f3e6ee32953e78ced1db7b20214e0d8c745a03b8fecf7cc8ee76ef")
 
 	tx, err := m.DB.BeginRw(ctx)
@@ -287,9 +298,9 @@ func TestGetBlockTransactionCountByNumber(t *testing.T) {
 }
 
 func TestGetBlockTransactionCountByNumber_ZeroTx(t *testing.T) {
-	m, _, _ := rpcdaemontest.CreateTestSentry(t)
+	m, _, _ := rpcdaemontest.CreateTestExecModule(t)
 	ctx := context.Background()
-	api := NewEthAPI(newBaseApiForTest(m), m.DB, nil, nil, nil, 5000000, ethconfig.Defaults.RPCTxFeeCap, 100_000, false, 100_000, 128, log.New())
+	api := newEthApiForTest(newBaseApiForTest(m), m.DB, nil, nil)
 
 	blockHash := common.HexToHash("0x5883164d4100b95e1d8e931b8b9574586a1dea7507941e6ad3c1e3a2591485fd")
 
@@ -317,4 +328,70 @@ func TestGetBlockTransactionCountByNumber_ZeroTx(t *testing.T) {
 	}
 
 	assert.Equal(t, expectedAmount, *txCount)
+}
+
+func TestGetBlockByNumber_BlockPruneGating(t *testing.T) {
+	if testing.Short() {
+		t.Skip("slow test")
+	}
+	t.Parallel()
+
+	const chainSize = 20
+	const pruneDistance = uint64(10)
+
+	setup := func(t *testing.T, pm prune.Mode) *APIImpl {
+		t.Helper()
+		m := execmoduletester.New(t, execmoduletester.WithPruneMode(pm))
+		c, err := blockgen.GenerateChain(m.ChainConfig, m.Genesis, m.Engine, m.DB, chainSize, func(_ int, _ *blockgen.BlockGen) {})
+		require.NoError(t, err)
+		require.NoError(t, m.InsertChain(c))
+
+		ctx := t.Context()
+		tx, err := m.DB.BeginTemporalRw(ctx)
+		require.NoError(t, err)
+		defer tx.Rollback()
+		_, err = prune.EnsureNotChanged(tx, pm)
+		require.NoError(t, err)
+		require.NoError(t, tx.Commit())
+
+		return newEthApiForTest(newBaseApiForTest(m), m.DB, nil, nil)
+	}
+
+	legacyFull := prune.Mode{
+		Initialised: true,
+		History:     prune.Distance(pruneDistance),
+		Blocks:      prune.KeepPostMergeBlocksPruneMode,
+	}
+	minimalMode := prune.Mode{
+		Initialised: true,
+		History:     prune.Distance(pruneDistance),
+		Blocks:      prune.Distance(pruneDistance),
+	}
+
+	// In full mode, block bodies are in snapshots and KeepPostMergeBlocksPruneMode means no block-body
+	// gate — GetBlockByNumber must succeed even for blocks older than the state-history window.
+	t.Run("full_mode_old_block_accessible", func(t *testing.T) {
+		t.Parallel()
+		api := setup(t, legacyFull)
+		b, err := api.GetBlockByNumber(t.Context(), rpc.BlockNumber(0), false)
+		require.NoError(t, err)
+		require.NotNil(t, b)
+	})
+
+	// In minimal mode, Blocks=Distance(pruneDistance) gates access: block 0 < head-pruneDistance.
+	t.Run("minimal_mode_old_block_pruned", func(t *testing.T) {
+		t.Parallel()
+		api := setup(t, minimalMode)
+		_, err := api.GetBlockByNumber(t.Context(), rpc.BlockNumber(0), false)
+		require.ErrorIs(t, err, state.PrunedError)
+	})
+
+	// Recent blocks (within the prune window) must always be accessible.
+	t.Run("minimal_mode_recent_block_accessible", func(t *testing.T) {
+		t.Parallel()
+		api := setup(t, minimalMode)
+		b, err := api.GetBlockByNumber(t.Context(), rpc.BlockNumber(chainSize), false)
+		require.NoError(t, err)
+		require.NotNil(t, b)
+	})
 }

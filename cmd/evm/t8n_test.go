@@ -50,6 +50,16 @@ func TestMain(m *testing.M) {
 	os.Exit(m.Run())
 }
 
+// erigonLogLine matches the "[LVL] [MM-DD|HH:MM:SS.mmm] ..." prefix that erigon's
+// logger emits. Such diagnostic lines (e.g. the dbg package's "[env]" notices,
+// logged at startup when ERIGON_* vars are set — as CI does) are not part of a
+// command's data output, so they must be ignored when matching against goldens.
+var erigonLogLine = regexp.MustCompile(`(?m)^\[[A-Z]{3,5}\] \[\d{2}-\d{2}\|\d{2}:\d{2}:\d{2}.*\n?`)
+
+func withoutLogLines(b []byte) []byte {
+	return erigonLogLine.ReplaceAll(b, nil)
+}
+
 type testT8n struct {
 	*cmdtest.TestCmd
 }
@@ -64,16 +74,13 @@ type t8nInput struct {
 func (args *t8nInput) get(base string) []string {
 	var out []string
 	if opt := args.inAlloc; opt != "" {
-		out = append(out, "--input.alloc")
-		out = append(out, fmt.Sprintf("%v/%v", base, opt))
+		out = append(out, "--input.alloc", fmt.Sprintf("%v/%v", base, opt))
 	}
 	if opt := args.inTxs; opt != "" {
-		out = append(out, "--input.txs")
-		out = append(out, fmt.Sprintf("%v/%v", base, opt))
+		out = append(out, "--input.txs", fmt.Sprintf("%v/%v", base, opt))
 	}
 	if opt := args.inEnv; opt != "" {
-		out = append(out, "--input.env")
-		out = append(out, fmt.Sprintf("%v/%v", base, opt))
+		out = append(out, "--input.env", fmt.Sprintf("%v/%v", base, opt))
 	}
 	if opt := args.stFork; opt != "" {
 		out = append(out, "--state.fork", opt)
@@ -107,7 +114,6 @@ func (args *t8nOutput) get() (out []string) {
 }
 
 func TestT8n(t *testing.T) {
-	t.Skip("unstable")
 	tt := new(testT8n)
 	tt.TestCmd = cmdtest.NewTestCmd(t, tt)
 	for i, tc := range []struct {
@@ -240,7 +246,7 @@ func TestT8n(t *testing.T) {
 			if err != nil {
 				t.Fatalf("test %d: could not read expected output: %v", i, err)
 			}
-			have := tt.Output()
+			have := withoutLogLines(tt.Output())
 			ok, err := cmpJson(have, want)
 			switch {
 			case err != nil:
@@ -257,7 +263,6 @@ func TestT8n(t *testing.T) {
 }
 
 func TestEvmRun(t *testing.T) {
-	t.Skip("todo: https://github.com/erigontech/erigon/issues/16150")
 	if testing.Short() {
 		t.Skip("too slow for testing.Short")
 	}
@@ -321,6 +326,7 @@ func checkExpectedOutput(t *testing.T, output []byte, expectationFilePath string
 			t.Fatalf("test %d: could not compile regular expression: %v", i, err)
 		}
 
+		output = withoutLogLines(output)
 		if !re.Match(output) {
 			t.Fatalf("test %d, output wrong, have \n%v\nwant\n%v\n", i, string(output), string(want))
 		}
@@ -329,7 +335,7 @@ func checkExpectedOutput(t *testing.T, output []byte, expectationFilePath string
 
 // cmpJson compares the JSON in two byte slices.
 func cmpJson(a, b []byte) (bool, error) {
-	var j, j2 interface{}
+	var j, j2 any
 	if err := json.Unmarshal(a, &j); err != nil {
 		return false, err
 	}

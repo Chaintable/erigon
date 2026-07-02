@@ -20,7 +20,7 @@
 package logger
 
 import (
-	"sort"
+	"slices"
 
 	"github.com/erigontech/erigon/common"
 	"github.com/erigontech/erigon/common/crypto"
@@ -28,6 +28,7 @@ import (
 	"github.com/erigontech/erigon/execution/tracing"
 	"github.com/erigontech/erigon/execution/tracing/tracers"
 	"github.com/erigontech/erigon/execution/types"
+	"github.com/erigontech/erigon/execution/types/accounts"
 	"github.com/erigontech/erigon/execution/vm"
 )
 
@@ -130,8 +131,8 @@ func (al accessList) accessListSorted() types.AccessList {
 		for slot, pos := range storage.slots {
 			storageKeys[pos] = slot
 		}
-		sort.Slice(storageKeys, func(i, j int) bool {
-			return storageKeys[i].Cmp(storageKeys[j]) < 0
+		slices.SortFunc(storageKeys, func(a, b common.Hash) int {
+			return a.Cmp(b)
 		})
 		acl = append(acl, types.AccessTuple{
 			Address:     addr,
@@ -163,9 +164,10 @@ func NewAccessListTracer(acl types.AccessList, exclude map[common.Address]struct
 	}
 	list := newAccessList()
 	for _, al := range acl {
-		if _, ok := excl[al.Address]; !ok {
-			list.addAddress(al.Address)
+		if _, ok := excl[al.Address]; ok {
+			continue
 		}
+		list.addAddress(al.Address)
 		for _, slot := range al.StorageKeys {
 			list.addSlot(al.Address, slot)
 		}
@@ -193,9 +195,9 @@ func (a *AccessListTracer) OnOpcode(pc uint64, opcode byte, gas, cost uint64, sc
 		addr := scope.Address()
 
 		slot := common.Hash(stackData[stackLen-1].Bytes32())
-		a.list.addSlot(addr, slot)
-		if _, ok := a.createdContracts[addr]; !ok {
-			a.usedBeforeCreation[addr] = struct{}{}
+		a.list.addSlot(addr.Value(), slot)
+		if _, ok := a.createdContracts[addr.Value()]; !ok {
+			a.usedBeforeCreation[addr.Value()] = struct{}{}
 		}
 	}
 	if (op == vm.EXTCODECOPY || op == vm.EXTCODEHASH || op == vm.EXTCODESIZE || op == vm.BALANCE || op == vm.SELFDESTRUCT) && stackLen >= 1 {
@@ -220,7 +222,7 @@ func (a *AccessListTracer) OnOpcode(pc uint64, opcode byte, gas, cost uint64, sc
 		// contract address for CREATE can only be generated with state
 		if a.state != nil {
 			nonce, _ := a.state.GetNonce(scope.Address())
-			addr := types.CreateAddress(scope.Address(), nonce)
+			addr := types.CreateAddress(scope.Address().Value(), nonce)
 			if _, ok := a.excl[addr]; !ok {
 				a.createdContracts[addr] = struct{}{}
 			}
@@ -234,9 +236,9 @@ func (a *AccessListTracer) OnOpcode(pc uint64, opcode byte, gas, cost uint64, sc
 			// t.Stop(fmt.Errorf("failed to copy CREATE2 in prestate tracer input err: %s", err))
 			return
 		}
-		inithash := crypto.Keccak256(init)
+		inithash := accounts.InternCodeHash(crypto.HashData(init))
 		salt := stackData[stackLen-4]
-		addr := types.CreateAddress2(scope.Address(), salt.Bytes32(), inithash)
+		addr := types.CreateAddress2(scope.Address().Value(), salt.Bytes32(), inithash)
 		if _, ok := a.excl[addr]; !ok {
 			a.createdContracts[addr] = struct{}{}
 		}

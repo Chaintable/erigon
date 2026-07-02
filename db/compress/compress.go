@@ -2,26 +2,18 @@ package compress
 
 import (
 	"fmt"
+	"slices"
 	"sync"
 
 	"github.com/klauspost/compress/zstd"
 )
-
-// growslice ensures b has the wanted length by either expanding it to its capacity
-// or allocating a new slice if b has insufficient capacity.
-func growslice(b []byte, wantLength int) []byte {
-	if cap(b) >= wantLength {
-		return b[:wantLength]
-	}
-	return make([]byte, wantLength)
-}
 
 var (
 	// Decoder side: saw 2x higher throughput (parallel RPC with much decoding if use `zstdDecPool` (sync.Pool) vs single `zstd.NewReader`. So, keep pool for decoders.
 	// Encoder side: saw high mem use when using pool of encoders. And probably we don't need high-throughput on writes (they are usually in background). So, keep 1 encoder - it inside using GOMAXPROCS concurrency limit (see zstd.WithDecoderConcurrency).
 	zstdEnc, _  = zstd.NewWriter(nil, zstd.WithEncoderCRC(false), zstd.WithZeroFrames(true))
 	zstdDecPool = sync.Pool{
-		New: func() interface{} {
+		New: func() any {
 			dec, _ := zstd.NewReader(nil, zstd.IgnoreChecksum(true))
 			return dec
 		},
@@ -40,7 +32,7 @@ func EncodeZstdIfNeed(buf, v []byte, enabled bool) (outBuf []byte, compressed []
 		return buf, v
 	}
 	bound := len(v) + len(v)/255 + 16
-	buf = growslice(buf, bound)
+	buf = slices.Grow(buf[:0], bound)[:bound]
 
 	// EncodeAll uses buf[:0] to reuse the backing array
 	buf = zstdEnc.EncodeAll(v, buf[:0])
@@ -53,14 +45,14 @@ func DecodeZstdIfNeed(buf, v []byte, enabled bool) ([]byte, []byte, error) {
 	if !enabled {
 		return buf, v, nil
 	}
-	buf = growslice(buf, len(v))
+	buf = slices.Grow(buf[:0], len(v))[:len(v)]
 
 	dec := zstdDecPool.Get().(*zstd.Decoder)
 	defer putDec(dec)
 
 	out, err := dec.DecodeAll(v, buf[:0])
 	if err != nil {
-		return buf, nil, fmt.Errorf("snappy.decode3: %w", err)
+		return buf, nil, fmt.Errorf("zstd.decode: %w", err)
 	}
 	return out, out, nil
 }

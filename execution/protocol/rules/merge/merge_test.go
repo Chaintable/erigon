@@ -17,9 +17,9 @@
 package merge
 
 import (
-	"math/big"
 	"testing"
 
+	"github.com/holiman/uint256"
 	"github.com/stretchr/testify/assert"
 
 	"github.com/erigontech/erigon/common"
@@ -28,10 +28,10 @@ import (
 	"github.com/erigontech/erigon/execution/chain"
 	chainspec "github.com/erigontech/erigon/execution/chain/spec"
 	"github.com/erigontech/erigon/execution/protocol/rules"
-	"github.com/erigontech/erigon/execution/protocol/rules/misc"
 	"github.com/erigontech/erigon/execution/state"
 	"github.com/erigontech/erigon/execution/tracing"
 	"github.com/erigontech/erigon/execution/types"
+	"github.com/erigontech/erigon/execution/types/accounts"
 )
 
 type readerMock struct{}
@@ -64,7 +64,7 @@ func (r readerMock) GetHeaderByHash(common.Hash) *types.Header {
 	return nil
 }
 
-func (r readerMock) GetTd(common.Hash, uint64) *big.Int {
+func (r readerMock) GetTd(common.Hash, uint64) *uint256.Int {
 	return nil
 }
 
@@ -77,7 +77,7 @@ func (r readerMock) FrozenBorBlocks(align bool) uint64 { return 0 }
 // and nonce so we are gonna test those
 func TestVerifyHeaderDifficulty(t *testing.T) {
 	header := &types.Header{
-		Difficulty: big.NewInt(1),
+		Difficulty: *common.Num1,
 		Time:       1,
 	}
 
@@ -99,7 +99,7 @@ func TestVerifyHeaderDifficulty(t *testing.T) {
 func TestVerifyHeaderNonce(t *testing.T) {
 	header := &types.Header{
 		Nonce:      types.BlockNonce{1, 0, 0, 0, 0, 0, 0, 0},
-		Difficulty: big.NewInt(0),
+		Difficulty: *common.Num0,
 		Time:       1,
 	}
 
@@ -121,12 +121,12 @@ func TestVerifyHeaderNonce(t *testing.T) {
 func TestNullParentBeaconBlockRootDoesNotPanic(t *testing.T) {
 	chainConfig := chainspec.Mainnet.Config
 	header := &types.Header{ // fake PoS header *after* Cancun fork
-		Difficulty: misc.ProofOfStakeDifficulty,
-		Time:       chainConfig.CancunTime.Uint64() + 1,
+		Difficulty: *ProofOfStakeDifficulty,
+		Time:       *chainConfig.CancunTime + 1,
 	}
 	logger := log.New()
 	chainReader := consensuschain.NewReader(chainConfig, nil, nil, logger) // tx and blockReader don't care
-	systemCallCustom := func(contract common.Address, data []byte, ibs *state.IntraBlockState, header *types.Header, constCall bool) ([]byte, error) {
+	systemCallCustom := func(contract accounts.Address, data []byte, ibs *state.IntraBlockState, header *types.Header, constCall bool) ([]byte, error) {
 		return nil, nil
 	}
 	var intraBlockState state.IntraBlockState // don't care

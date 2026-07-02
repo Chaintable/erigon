@@ -18,7 +18,7 @@ package tests
 
 import (
 	"fmt"
-	"math/big"
+	"net"
 	"testing"
 	"time"
 
@@ -52,8 +52,19 @@ var (
 //
 // This test sends transaction to node1 RPC which means they are local for node1
 // P2P helper is binded to node1 port, that's why we measure performance of local txs processing
+func skipIfNodeUnreachable(t *testing.T, addrs ...string) {
+	t.Helper()
+	for _, addr := range addrs {
+		conn, err := net.DialTimeout("tcp", addr, 300*time.Millisecond)
+		if err != nil {
+			t.Skipf("requires a running node at %s: %v", addr, err)
+		}
+		_ = conn.Close()
+	}
+}
+
 func TestSimpleLocalTxThroughputBenchmark(t *testing.T) {
-	t.Skip()
+	skipIfNodeUnreachable(t, rpcAddressNode1)
 
 	txToSendCount := 15000
 	measureAtEvery := 1000
@@ -79,12 +90,12 @@ func TestSimpleLocalTxThroughputBenchmark(t *testing.T) {
 						Nonce:    uint64(i),
 						GasLimit: 21000,
 						To:       &addr2,
-						Value:    uint256.NewInt(100),
+						Value:    *uint256.NewInt(100),
 						Data:     nil,
 					},
-					GasPrice: uint256.NewInt(1),
+					GasPrice: *uint256.NewInt(1),
 				},
-				*types.LatestSignerForChainID(big.NewInt(1337)),
+				*types.LatestSignerForChainID(uint256.NewInt(1337)),
 				pkey1,
 			)
 			require.NoError(t, err)
@@ -130,7 +141,7 @@ func TestSimpleLocalTxThroughputBenchmark(t *testing.T) {
 // This test sends transaction to node1 RPC which means they are local for node1
 // P2P helper is binded to node1 port, that's why we measure performance of local txs processing
 func TestSimpleLocalTxLatencyBenchmark(t *testing.T) {
-	t.Skip()
+	skipIfNodeUnreachable(t, rpcAddressNode1)
 
 	txToSendCount := 1000
 
@@ -153,12 +164,12 @@ func TestSimpleLocalTxLatencyBenchmark(t *testing.T) {
 					Nonce:    uint64(i),
 					GasLimit: 21000,
 					To:       &addr2,
-					Value:    uint256.NewInt(100),
+					Value:    *uint256.NewInt(100),
 					Data:     nil,
 				},
-				GasPrice: uint256.NewInt(1),
+				GasPrice: *uint256.NewInt(1),
 			},
-			*types.LatestSignerForChainID(big.NewInt(1337)),
+			*types.LatestSignerForChainID(uint256.NewInt(1337)),
 			pkey1,
 		)
 		require.NoError(t, err)
@@ -194,7 +205,7 @@ func TestSimpleLocalTxLatencyBenchmark(t *testing.T) {
 // This test sends transaction to node2 RPC which means they are remote for node1 and local for node2
 // P2P helper is binded to node1 port, that's why we measure performance of remote txs processing
 func TestSimpleRemoteTxThroughputBenchmark(t *testing.T) {
-	t.Skip()
+	skipIfNodeUnreachable(t, rpcAddressNode1, rpcAddressNode2)
 
 	nonce := 0
 
@@ -222,12 +233,12 @@ func TestSimpleRemoteTxThroughputBenchmark(t *testing.T) {
 						Nonce:    uint64(nonce + i),
 						GasLimit: 21000,
 						To:       &addr2,
-						Value:    uint256.NewInt(100),
+						Value:    *uint256.NewInt(100),
 						Data:     nil,
 					},
-					GasPrice: uint256.NewInt(1),
+					GasPrice: *uint256.NewInt(1),
 				},
-				*types.LatestSignerForChainID(big.NewInt(1337)),
+				*types.LatestSignerForChainID(uint256.NewInt(1337)),
 				pkey1,
 			)
 			require.NoError(t, err)
@@ -282,7 +293,7 @@ func TestSimpleRemoteTxThroughputBenchmark(t *testing.T) {
 // This test sends transaction to node2 RPC which means they are remote for node1 and local for node2
 // P2P helper is binded to node1 port, that's why we measure performance of remote txs processing
 func TestSimpleRemoteTxLatencyBenchmark(t *testing.T) {
-	t.Skip()
+	skipIfNodeUnreachable(t, rpcAddressNode1, rpcAddressNode2)
 
 	txToSendCount := 100
 
@@ -305,12 +316,12 @@ func TestSimpleRemoteTxLatencyBenchmark(t *testing.T) {
 					Nonce:    uint64(i),
 					GasLimit: 21000,
 					To:       &addr2,
-					Value:    uint256.NewInt(100),
+					Value:    *uint256.NewInt(100),
 					Data:     nil,
 				},
-				GasPrice: uint256.NewInt(1),
+				GasPrice: *uint256.NewInt(1),
 			},
-			*types.LatestSignerForChainID(big.NewInt(1337)),
+			*types.LatestSignerForChainID(uint256.NewInt(1337)),
 			pkey1,
 		)
 		require.NoError(t, err)

@@ -32,7 +32,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/spf13/afero"
 	"google.golang.org/grpc"
 
 	"github.com/erigontech/erigon/cl/antiquary"
@@ -92,11 +91,6 @@ type chainCfg struct {
 	Chain string `help:"chain" default:"mainnet"`
 }
 
-func (c *chainCfg) configs() (beaconConfig *clparams.BeaconChainConfig, err error) {
-	_, beaconConfig, _, err = clparams.GetConfigsByNetworkName(c.Chain)
-	return
-}
-
 type outputFolder struct {
 	Datadir string `help:"datadir" default:"~/.local/share/erigon" type:"existingdir"`
 }
@@ -122,10 +116,6 @@ func (w *withSentinel) connectSentinel() (sentinelproto.SentinelClient, error) {
 		return nil, err
 	}
 	return sentinelproto.NewSentinelClient(gconn), nil
-}
-
-func openFs(fsName string, path string) (afero.Fs, error) {
-	return afero.NewBasePathFs(afero.NewBasePathFs(afero.NewOsFs(), fsName), path), nil
 }
 
 type Chain struct {
@@ -186,7 +176,7 @@ func (c *Chain) Run(ctx *Context) error {
 		return err
 	}
 
-	downloader := network.NewBackwardBeaconDownloader(ctx, beacon, nil, nil, db)
+	downloader := network.NewBackwardBeaconDownloader(ctx, beacon, nil, nil, db, beaconConfig)
 	cfg := stages.StageHistoryReconstruction(downloader, antiquary.NewAntiquary(ctx, nil, nil, nil, nil, dirs, nil, nil, nil, nil, nil, nil, nil, false, false, false, false, nil), csn, db, nil, beaconConfig, clparams.CaplinConfig{}, true, bRoot, bs.Slot(), "/tmp", 300*time.Millisecond, nil, nil, blobStorage, log.Root(), nil, nil)
 	return stages.SpawnStageHistoryDownload(cfg, ctx, log.Root())
 }
@@ -206,9 +196,6 @@ func retrieveAndSanitizeBlockFromRemoteEndpoint(ctx context.Context, beaconConfi
 	}
 
 	req.Header.Set("Accept", "application/octet-stream")
-	if err != nil {
-		return nil, fmt.Errorf("checkpoint sync request failed %s", err)
-	}
 	r, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return nil, err
@@ -381,7 +368,7 @@ func (c *ChainEndpoint) Run(ctx *Context) error {
 		if err := beacon_indicies.WriteBeaconBlockAndIndicies(ctx, tx, currentBlock, true); err != nil {
 			return false, err
 		}
-		if c.Blobs && currentBlock.Block.Body.BlobKzgCommitments.Len() > 0 {
+		if c.Blobs && currentBlock.Block.Body.GetBlobKzgCommitments() != nil && currentBlock.Block.Body.GetBlobKzgCommitments().Len() > 0 {
 			ids, err := network.BlobsIdentifiersFromBlocks([]*cltypes.SignedBeaconBlock{currentBlock}, beaconConfig)
 			if err != nil {
 				// Return an error if blob identifiers could not be retrieved
@@ -419,20 +406,23 @@ func (c *ChainEndpoint) Run(ctx *Context) error {
 				return false, err
 			}
 			if c.Blobs {
-				blindedBlock, err := snr.ReadBlindedBlockBySlot(ctx, tx, *slot)
+				block, err := snr.ReadBeaconBlockBodyBySlot(ctx, tx, *slot)
 				if err != nil {
 					return false, err
 				}
-				if blindedBlock == nil {
+				if block == nil {
 					break
 				}
 
-				blindedBlockRoot, err := blindedBlock.Block.HashSSZ()
+				blindedBlockRoot, err := block.Block.HashSSZ()
 				if err != nil {
 					return false, err
 				}
 				// check if we have all the blobs
-				kzgCommitments := blindedBlock.Block.Body.BlobKzgCommitments.Len()
+				kzgCommitments := 0
+				if c := block.Block.Body.GetBlobKzgCommitments(); c != nil {
+					kzgCommitments = c.Len()
+				}
 				kzgCommitmentsInDB, err := blobDB.KzgCommitmentsCount(ctx, blindedBlockRoot)
 				if err != nil {
 					return false, err
@@ -556,7 +546,7 @@ func (c *CheckSnapshots) Run(ctx *Context) error {
 		return err
 	}
 
-	genesisHeader, _, _, err := csn.ReadHeader(0)
+	genesisHeader, _, _, err := csn.ReadHeader(0, nil)
 	if err != nil {
 		return err
 	}
@@ -575,7 +565,7 @@ func (c *CheckSnapshots) Run(ctx *Context) error {
 			return fmt.Errorf("snapshot %d has invalid slot", i)
 		}
 		// Checking of snapshots is a chain contiguity problem
-		currentHeader, _, _, err := csn.ReadHeader(i)
+		currentHeader, _, _, err := csn.ReadHeader(i, nil)
 		if err != nil {
 			return err
 		}
@@ -822,7 +812,7 @@ type ArchiveSanitizer struct {
 }
 
 func getHead(beaconApiURL string) (uint64, error) {
-	headResponse := map[string]interface{}{}
+	headResponse := map[string]any{}
 	req, err := http.NewRequest("GET", beaconApiURL+"/eth/v2/debug/beacon/heads", nil)
 	if err != nil {
 		return 0, err
@@ -836,11 +826,11 @@ func getHead(beaconApiURL string) (uint64, error) {
 	if err := json.NewDecoder(resp.Body).Decode(&headResponse); err != nil {
 		return 0, err
 	}
-	data := headResponse["data"].([]interface{})
+	data := headResponse["data"].([]any)
 	if len(data) == 0 {
 		return 0, errors.New("no head found")
 	}
-	head := data[0].(map[string]interface{})
+	head := data[0].(map[string]any)
 	slotStr, ok := head["slot"].(string)
 	if !ok {
 		return 0, errors.New("no slot found")
@@ -853,7 +843,7 @@ func getHead(beaconApiURL string) (uint64, error) {
 }
 
 func getStateRootAtSlot(beaconApiURL string, slot uint64) (common.Hash, error) {
-	response := map[string]interface{}{}
+	response := map[string]any{}
 	req, err := http.NewRequest("GET", fmt.Sprintf("%s/eth/v1/beacon/states/%d/root", beaconApiURL, slot), nil)
 	if err != nil {
 		return common.Hash{}, err
@@ -870,7 +860,7 @@ func getStateRootAtSlot(beaconApiURL string, slot uint64) (common.Hash, error) {
 	if err := json.NewDecoder(resp.Body).Decode(&response); err != nil {
 		return common.Hash{}, err
 	}
-	data := response["data"].(map[string]interface{})
+	data := response["data"].(map[string]any)
 	if len(data) == 0 {
 		return common.Hash{}, errors.New("no head found")
 	}
@@ -887,9 +877,6 @@ func getBeaconState(ctx context.Context, beaconConfig *clparams.BeaconChainConfi
 	}
 
 	req.Header.Set("Accept", "application/octet-stream")
-	if err != nil {
-		return nil, fmt.Errorf("checkpoint sync request failed %s", err)
-	}
 	r, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return nil, err
@@ -1082,7 +1069,7 @@ func (b *BlobArchiveStoreCheck) Run(ctx *Context) error {
 	}
 	defer tx.Rollback()
 	for i := b.FromSlot; i >= targetSlot; i-- {
-		blk, err := snr.ReadBlindedBlockBySlot(ctx, tx, i)
+		blk, err := snr.ReadBeaconBlockBodyBySlot(ctx, tx, i)
 		if err != nil {
 			return err
 		}
@@ -1104,11 +1091,15 @@ func (b *BlobArchiveStoreCheck) Run(ctx *Context) error {
 		if err != nil {
 			return err
 		}
-		if haveBlobs != uint32(blk.Block.Body.BlobKzgCommitments.Len()) {
+		wantBlobs := 0
+		if c := blk.Block.Body.GetBlobKzgCommitments(); c != nil {
+			wantBlobs = c.Len()
+		}
+		if haveBlobs != uint32(wantBlobs) {
 			if err := blobStorage.RemoveBlobSidecars(ctx, i, blockRoot); err != nil {
 				return err
 			}
-			log.Warn("Slot", "slot", i, "have", haveBlobs, "want", blk.Block.Body.BlobKzgCommitments.Len())
+			log.Warn("Slot", "slot", i, "have", haveBlobs, "want", wantBlobs)
 		}
 	}
 	log.Info("Blob archive store check passed")
@@ -1263,18 +1254,22 @@ func (c *CheckBlobsSnapshotsCount) Run(ctx *Context) error {
 			return err
 		}
 
-		bBlock, err := snr.ReadBlindedBlockBySlot(ctx, tx, i)
+		bBlock, err := snr.ReadBeaconBlockBodyBySlot(ctx, tx, i)
 		if err != nil {
 			return err
 		}
 		if bBlock == nil {
 			continue
 		}
-		if len(sds) != bBlock.Block.Body.BlobKzgCommitments.Len() {
+		wantCommitments := 0
+		if c := bBlock.Block.Body.GetBlobKzgCommitments(); c != nil {
+			wantCommitments = c.Len()
+		}
+		if len(sds) != wantCommitments {
 			if !c.CheckNeedRegen {
-				return fmt.Errorf("slot %d: blob count mismatch, have %d, want %d", i, len(sds), bBlock.Block.Body.BlobKzgCommitments.Len())
+				return fmt.Errorf("slot %d: blob count mismatch, have %d, want %d", i, len(sds), wantCommitments)
 			}
-			log.Warn("Slot", "slot", i, "have", len(sds), "want", bBlock.Block.Body.BlobKzgCommitments.Len())
+			log.Warn("Slot", "slot", i, "have", len(sds), "want", wantCommitments)
 			slotsToRegen[i] = struct{}{}
 		}
 		if i%2000 == 0 {
@@ -1507,7 +1502,7 @@ func (m *MakeDepositArgs) Run(ctx *Context) error {
 	privateKey := privateKeyBls.Bytes()
 
 	// Print all the details in json format
-	depositDetails := map[string]interface{}{
+	depositDetails := map[string]any{
 		"deposit":           deposit,
 		"deposit_tree_root": common.Hash(depositTreeRoot),
 		"private_key":       "0x" + common.Bytes2Hex(privateKey),

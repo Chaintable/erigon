@@ -1,4 +1,4 @@
-// Copyright 2024 The Erigon Authors
+// Copyright 2026 The Erigon Authors
 // This file is part of Erigon.
 //
 // Erigon is free software: you can redistribute it and/or modify
@@ -17,417 +17,100 @@
 package vm
 
 import (
-	"fmt"
+	"math"
 	"testing"
-
-	"github.com/holiman/uint256"
-	"github.com/stretchr/testify/require"
-	"pgregory.net/rapid"
-
-	"github.com/erigontech/erigon/common"
-	"github.com/erigontech/erigon/execution/chain"
-	"github.com/erigontech/erigon/execution/vm/evmtypes"
 )
 
-func TestEVMWithNoBaseFeeAndNoTxGasPrice(t *testing.T) {
+// TestDeriveFrameRegularGasUsed covers the EIP-8037 cases where the formula
+// Regular = (inputTotal − gasRemainingTotal) − stateGasUsed must hold,
+// including the refund-heavy case where stateGas grows above the input
+// because inline state-gas refunds (creditStateGasRefund) credit the
+// frame's local reservoir.
+func TestDeriveFrameRegularGasUsed(t *testing.T) {
 	t.Parallel()
-	vmConfig := Config{NoBaseFee: true}
-	evm := NewEVM(evmtypes.BlockContext{}, evmtypes.TxContext{}, nil, chain.TestChainConfig, vmConfig)
-	require.NotNil(t, evm)
-}
 
-func TestInterpreterReadonly(t *testing.T) {
-	t.Parallel()
-	c := NewJumpDestCache(128)
-	rapid.Check(t, func(t *rapid.T) {
-		env := NewEVM(evmtypes.BlockContext{}, evmtypes.TxContext{}, nil, chain.TestChainConfig, Config{})
-
-		isEVMSliceTest := rapid.SliceOfN(rapid.Bool(), 1, -1).Draw(t, "tevm")
-		readOnlySliceTest := rapid.SliceOfN(rapid.Bool(), len(isEVMSliceTest), len(isEVMSliceTest)).Draw(t, "readonly")
-
-		isEVMCalled := make([]bool, len(isEVMSliceTest))
-		readOnlies := make([]*readOnlyState, len(readOnlySliceTest))
-		currentIdx := new(int)
-		*currentIdx = -1
-
-		evmInterpreter := &testVM{
-			readonlyGetSetter: env.interpreter.(*EVMInterpreter),
-
-			recordedReadOnlies:  &readOnlies,
-			recordedIsEVMCalled: &isEVMCalled,
-
-			env:               env,
-			isEVMSliceTest:    isEVMSliceTest,
-			readOnlySliceTest: readOnlySliceTest,
-			currentIdx:        currentIdx,
-		}
-
-		env.interpreter = evmInterpreter
-
-		dummyContract := NewContract(
-			common.Address{},
-			common.Address{},
-			common.Address{},
-			uint256.Int{},
-			c,
-		)
-
-		newTestSequential(env, currentIdx, readOnlySliceTest, isEVMSliceTest).Run(dummyContract, nil, false)
-
-		var gotReadonly bool
-		var firstReadOnly int
-
-		// properties-invariants
-
-		if len(readOnlies) != len(readOnlySliceTest) {
-			t.Fatalf("expected static calls the same stack length as generated. got %d, expected %d", len(readOnlies), len(readOnlySliceTest))
-		}
-
-		if len(isEVMCalled) != len(isEVMSliceTest) {
-			t.Fatalf("expected VM calls the same stack length as generated. got %d, expected %d", len(isEVMCalled), len(isEVMSliceTest))
-		}
-
-		if *currentIdx != len(readOnlies) {
-			t.Fatalf("expected VM calls the same amount of calls as generated calls. got %d, expected %d", *currentIdx, len(readOnlies))
-		}
-
-		for i, readOnly := range readOnlies {
-
-			if readOnly.outer != readOnlySliceTest[i] {
-				t.Fatalf("outer readOnly appeared in %d index, got readOnly %t, expected %t",
-					i, readOnly.outer, readOnlySliceTest[i])
-			}
-
-			if i > 0 {
-				if readOnly.before != readOnlies[i-1].in {
-					t.Fatalf("before readOnly appeared in %d index, got readOnly %t, expected %t",
-						i, readOnly.before, readOnlies[i-1].in)
-				}
-			}
-
-			if readOnly.in && !gotReadonly {
-				gotReadonly = true
-				firstReadOnly = i
-			}
-
-			if gotReadonly {
-				if !readOnly.in {
-					t.Fatalf("readOnly appeared in %d index, got non-readOnly in %d: %v",
-						firstReadOnly, i, trace(isEVMCalled, readOnlies))
-				}
-
-				switch {
-				case i < firstReadOnly:
-					if readOnly.after != false {
-						t.Fatalf("after readOnly appeared in %d index(first readonly %d, case <firstReadOnly), got readOnly %t, expected %t",
-							i, firstReadOnly, readOnly.after, false)
-					}
-				case i == firstReadOnly:
-					if readOnly.after != false {
-						t.Fatalf("after readOnly appeared in %d index(first readonly %d, case ==firstReadOnly), got readOnly %t, expected %t",
-							i, firstReadOnly, readOnly.after, false)
-					}
-				case i > firstReadOnly:
-					if readOnly.after != true {
-						t.Fatalf("after readOnly appeared in %d index(first readonly %d, case >firstReadOnly), got readOnly %t, expected %t",
-							i, firstReadOnly, readOnly.after, true)
-					}
-				}
-			} else {
-				if readOnly.after != false {
-					t.Fatalf("after readOnly didn't appear. %d index, got readOnly %t, expected %t",
-						i, readOnly.after, false)
-				}
-			}
-		}
-	})
-}
-
-func TestReadonlyBasicCases(t *testing.T) {
-	t.Parallel()
-	c := NewJumpDestCache(128)
+	const sgps = 64 * 1530 // params.StateGasPerStorageSet
 
 	cases := []struct {
-		testName          string
-		readonlySliceTest []bool
-
-		expectedReadonlySlice []readOnlyState
+		name              string
+		inputTotal        uint64
+		gasRemainingTotal uint64
+		stateGasUsed      int64
+		want              uint64
 	}{
 		{
-			"simple non-readonly",
-			[]bool{false},
-
-			[]readOnlyState{
-				{
-					false,
-					false,
-					false,
-					false,
-				},
-			},
+			// Plain frame: 50 regular ops, 30 state charge from a 100-unit
+			// reservoir, no spillover.
+			//   input = 1000 R + 100 S = 1100
+			//   leftover = 950 R + 70 S = 1020
+			//   stateGasUsed = 30
+			name:              "charges_only_no_spillover",
+			inputTotal:        1100,
+			gasRemainingTotal: 1020,
+			stateGasUsed:      30,
+			want:              50,
 		},
 		{
-			"simple readonly",
-			[]bool{true},
-
-			[]readOnlyState{
-				{
-					true,
-					true,
-					true,
-					false,
-				},
-			},
-		},
-
-		{
-			"2 calls non-readonly",
-			[]bool{false, false},
-
-			[]readOnlyState{
-				{
-					false,
-					false,
-					false,
-					false,
-				},
-				{
-					false,
-					false,
-					false,
-					false,
-				},
-			},
-		},
-
-		{
-			"2 calls true,false",
-			[]bool{true, false},
-
-			[]readOnlyState{
-				{
-					true,
-					true,
-					true,
-					false,
-				},
-				{
-					true,
-					true,
-					true,
-					true,
-				},
-			},
+			// Spillover: 50 regular ops + state charge 200 against a 100-unit
+			// reservoir, 100 spills into regular gas.
+			//   input = 1000 R + 100 S = 1100
+			//   leftover = 850 R + 0 S = 850
+			//   stateGasUsed = 200 (full charge, regardless of spillover)
+			// Want 50 (RegularUsedDirect only — the spilled portion is
+			// already represented in stateGasUsed).
+			name:              "with_spillover",
+			inputTotal:        1100,
+			gasRemainingTotal: 850,
+			stateGasUsed:      200,
+			want:              50,
 		},
 		{
-			"2 calls false,true",
-			[]bool{false, true},
-
-			[]readOnlyState{
-				{
-					false,
-					false,
-					false,
-					false,
-				},
-				{
-					true,
-					true,
-					true,
-					false,
-				},
-			},
+			// Refunds exceed the frame's own charges — typical for a
+			// DELEGATECALL/CALLCODE callee that clears a slot an ancestor
+			// set. The refund (sgps) credits the local reservoir directly,
+			// pushing gasRemainingTotal above inputTotal.
+			//   input = 100 R + 50 S = 150
+			//   refund sgps grows leftover state to 50 + sgps
+			//   10 regular ops → leftover regular = 90
+			//   stateGasUsed = -sgps
+			// Want 10 (the regular ops). A guarded uint64 subtraction would
+			// see gasRemainingTotal > inputTotal and (wrongly) return 0.
+			name:              "refunds_exceed_charges_intermediate_frame",
+			inputTotal:        150,
+			gasRemainingTotal: 90 + 50 + sgps,
+			stateGasUsed:      -sgps,
+			want:              10,
 		},
 		{
-			"2 calls readonly",
-			[]bool{true, true},
-
-			[]readOnlyState{
-				{
-					true,
-					true,
-					true,
-					true,
-				},
-				{
-					true,
-					true,
-					true,
-					true,
-				},
-			},
+			// Pure refund frame, no regular work. Verifies signed cancellation
+			// across the entire delta.
+			name:              "refunds_only_no_regular_ops",
+			inputTotal:        150,
+			gasRemainingTotal: 150 + sgps,
+			stateGasUsed:      -sgps,
+			want:              0,
+		},
+		{
+			// Gas totals are unsigned reservoir balances and are free to
+			// occupy the full uint64 range. The helper must stay correct
+			// when those totals sit above 2^63 — a naive int64 promotion
+			// would flip the sign and break the arithmetic.
+			name:              "huge_gas_totals_uint64_safe",
+			inputTotal:        math.MaxUint64,
+			gasRemainingTotal: math.MaxUint64 - 12345,
+			stateGasUsed:      300,
+			want:              12345 - 300,
 		},
 	}
 
-	type evmsParamsTest struct {
-		emvs   []bool
-		suffix string
-	}
-
-	evmsTest := make([]evmsParamsTest, len(cases))
-
-	// fill all possible isEVM combinations
-	for i, testCase := range cases {
-		isEVMSliceTest := make([]bool, len(testCase.readonlySliceTest))
-
-		copy(isEVMSliceTest, testCase.readonlySliceTest)
-		evmsTest[i].emvs = isEVMSliceTest
-
-		suffix := "-isEVMSliceTest"
-		for _, evmParam := range testCase.readonlySliceTest {
-			if evmParam {
-				suffix += "-true"
-			} else {
-				suffix += "-false"
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got := deriveFrameRegularGasUsed(tc.inputTotal, tc.gasRemainingTotal, tc.stateGasUsed)
+			if got != tc.want {
+				t.Fatalf("deriveFrameRegularGasUsed(input=%d, leftover=%d, state=%d) = %d, want %d",
+					tc.inputTotal, tc.gasRemainingTotal, tc.stateGasUsed, got, tc.want)
 			}
-		}
-
-		evmsTest[i].suffix = suffix
+		})
 	}
-
-	for _, testCase := range cases {
-		for _, evmsParams := range evmsTest {
-
-			testcase := testCase
-			evmsTestcase := evmsParams
-
-			if len(testcase.readonlySliceTest) != len(evmsTestcase.emvs) {
-				continue
-			}
-
-			t.Run(testcase.testName+evmsTestcase.suffix, func(t *testing.T) {
-				t.Parallel()
-				readonlySliceTest := testcase.readonlySliceTest
-
-				env := NewEVM(evmtypes.BlockContext{}, evmtypes.TxContext{}, nil, chain.TestChainConfig, Config{})
-
-				readonliesGot := make([]*readOnlyState, len(testcase.readonlySliceTest))
-				isEVMGot := make([]bool, len(evmsTestcase.emvs))
-
-				currentIdx := new(int)
-				*currentIdx = -1
-
-				evmInterpreter := &testVM{
-					readonlyGetSetter: env.interpreter.(*EVMInterpreter),
-
-					recordedReadOnlies:  &readonliesGot,
-					recordedIsEVMCalled: &isEVMGot,
-
-					env:               env,
-					isEVMSliceTest:    evmsTestcase.emvs,
-					readOnlySliceTest: testcase.readonlySliceTest,
-					currentIdx:        currentIdx,
-				}
-
-				env.interpreter = evmInterpreter
-
-				dummyContract := NewContract(
-					common.Address{},
-					common.Address{},
-					common.Address{},
-					uint256.Int{},
-					c,
-				)
-
-				newTestSequential(env, currentIdx, readonlySliceTest, evmsTestcase.emvs).Run(dummyContract, nil, false)
-
-				if len(readonliesGot) != len(readonlySliceTest) {
-					t.Fatalf("expected static calls the same stack length as generated. got %d, expected %d - %v", len(readonliesGot), len(readonlySliceTest), readonlySliceTest)
-				}
-
-				if len(isEVMGot) != len(evmsTestcase.emvs) {
-					t.Fatalf("expected VM calls the same stack length as generated. got %d, expected %d - %v, readonly %v", len(isEVMGot), len(evmsTestcase.emvs), evmsTestcase.emvs, readonlySliceTest)
-				}
-
-				if *currentIdx != len(readonlySliceTest) {
-					t.Fatalf("expected VM calls the same amount of calls as generated calls. got %d, expected %d", *currentIdx, len(readonlySliceTest))
-				}
-
-				var gotReadonly bool
-				var firstReadOnly int
-
-				for callIndex, readOnly := range readonliesGot {
-					if readOnly.outer != readonlySliceTest[callIndex] {
-						t.Fatalf("outer readOnly appeared in %d index, got readOnly %t, expected %t. Test EVMs %v; test readonly %v",
-							callIndex, readOnly.outer, readonlySliceTest[callIndex], evmsTestcase.emvs, readonlySliceTest)
-					}
-
-					if callIndex > 0 {
-						if readOnly.before != readonliesGot[callIndex-1].in {
-							t.Fatalf("before readOnly appeared in %d index, got readOnly %t, expected %t. Test EVMs %v; test readonly %v",
-								callIndex, readOnly.before, readonliesGot[callIndex-1].in, evmsTestcase.emvs, readonlySliceTest)
-						}
-					}
-
-					if readOnly.in && !gotReadonly {
-						gotReadonly = true
-						firstReadOnly = callIndex
-					}
-
-					if gotReadonly {
-						if !readOnly.in {
-							t.Fatalf("readOnly appeared in %d index, got non-readOnly in %d: %v. Test EVMs %v; test readonly %v",
-								firstReadOnly, callIndex, trace(isEVMGot, readonliesGot), evmsTestcase.emvs, readonlySliceTest)
-						}
-
-						switch {
-						case callIndex < firstReadOnly:
-							if readOnly.after != false {
-								t.Fatalf("after readOnly appeared in %d index(first readonly %d, case <firstReadOnly), got readOnly %t, expected %t. Test EVMs %v; test readonly %v",
-									callIndex, firstReadOnly, readOnly.after, false, evmsTestcase.emvs, readonlySliceTest)
-							}
-						case callIndex == firstReadOnly:
-							if readOnly.after != false {
-								t.Fatalf("after readOnly appeared in %d index(first readonly %d, case ==firstReadOnly), got readOnly %t, expected %t. Test EVMs %v; test readonly %v",
-									callIndex, firstReadOnly, readOnly.after, false, evmsTestcase.emvs, readonlySliceTest)
-							}
-						case callIndex > firstReadOnly:
-							if readOnly.after != true {
-								t.Fatalf("after readOnly appeared in %d index(first readonly %d, case >firstReadOnly), got readOnly %t, expected %t. Test EVMs %v; test readonly %v",
-									callIndex, firstReadOnly, readOnly.after, true, evmsTestcase.emvs, readonlySliceTest)
-							}
-						}
-					} else {
-						if readOnly.after != false {
-							t.Fatalf("after readOnly didn't appear. %d index, got readOnly %t, expected %t. Test EVMs %v; test readonly %v",
-								callIndex, readOnly.after, false, evmsTestcase.emvs, readonlySliceTest)
-						}
-					}
-				}
-			})
-		}
-	}
-}
-
-type testSequential struct {
-	env         *EVM
-	currentIdx  *int
-	readOnlys   []bool
-	isEVMCalled []bool
-}
-
-func newTestSequential(env *EVM, currentIdx *int, readonlies []bool, isEVMCalled []bool) *testSequential {
-	return &testSequential{env, currentIdx, readonlies, isEVMCalled}
-}
-
-func (st *testSequential) Run(_ *Contract, _ []byte, _ bool) ([]byte, uint64, error) {
-	*st.currentIdx++
-	c := NewJumpDestCache(16)
-	nextContract := *NewContract(
-		common.Address{},
-		common.Address{},
-		common.Address{},
-		uint256.Int{},
-		c,
-	)
-
-	return st.env.interpreter.Run(nextContract, 0, nil, st.readOnlys[*st.currentIdx])
-}
-
-func trace(isEVMSlice []bool, readOnlySlice []*readOnlyState) string {
-	res := "trace:\n"
-	for i := 0; i < len(isEVMSlice); i++ {
-		res += fmt.Sprintf("%d: EVM %t, readonly %t\n", i, isEVMSlice[i], readOnlySlice[i].in)
-	}
-	return res
 }

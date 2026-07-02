@@ -24,6 +24,7 @@ import (
 	"crypto/ecdsa"
 	"fmt"
 	"math/big"
+	"os"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -33,29 +34,32 @@ import (
 	g "github.com/anacrolix/generics"
 	"github.com/anacrolix/missinggo/v2/panicif"
 	"github.com/c2h5oh/datasize"
+	"github.com/holiman/uint256"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
 	"github.com/urfave/cli/v2"
 	"golang.org/x/time/rate"
 
 	"github.com/erigontech/erigon/cl/clparams"
+	"github.com/erigontech/erigon/cl/clparams/devgenesis"
 	"github.com/erigontech/erigon/cmd/downloader/downloadernat"
 	"github.com/erigontech/erigon/cmd/utils/flags"
 	"github.com/erigontech/erigon/common"
 	libkzg "github.com/erigontech/erigon/common/crypto/kzg"
+	"github.com/erigontech/erigon/common/dbg"
 	"github.com/erigontech/erigon/common/log/v3"
-	"github.com/erigontech/erigon/common/metrics"
 	"github.com/erigontech/erigon/db/config3"
 	"github.com/erigontech/erigon/db/datadir"
 	"github.com/erigontech/erigon/db/downloader/downloadercfg"
 	"github.com/erigontech/erigon/db/snapcfg"
-	"github.com/erigontech/erigon/db/state/statecfg"
 	"github.com/erigontech/erigon/db/version"
+	"github.com/erigontech/erigon/diagnostics/metrics"
 	"github.com/erigontech/erigon/execution/builder/buildercfg"
 	"github.com/erigontech/erigon/execution/chain/networkname"
 	chainspec "github.com/erigontech/erigon/execution/chain/spec"
 	"github.com/erigontech/erigon/execution/protocol/params"
 	"github.com/erigontech/erigon/execution/protocol/rules/ethash/ethashcfg"
+	"github.com/erigontech/erigon/execution/state/genesiswrite"
 	"github.com/erigontech/erigon/execution/types"
 	"github.com/erigontech/erigon/node/direct"
 	"github.com/erigontech/erigon/node/ethconfig"
@@ -100,9 +104,20 @@ var (
 		Usage:   "Download historical Receipts. If disabled: using state-history to re-exec transactions and generate Receipts - all RPC: eth_getLogs, eth_getBlockReceipts will work (just higher latency)",
 		Value:   ethconfig.Defaults.PersistReceiptsCacheV2,
 	}
-	DeveloperPeriodFlag = cli.IntFlag{
-		Name:  "dev.period",
-		Usage: "Block period to use in developer mode (0 = mine only if transaction pending)",
+	DevValidatorSeedFlag = cli.StringFlag{
+		Name:  "dev-validator-seed",
+		Usage: "Deterministic BLS key seed for embedded dev validator (enables PoS dev mode)",
+		Value: "devnet",
+	}
+	DevValidatorCountFlag = cli.IntFlag{
+		Name:  "dev-validator-count",
+		Usage: "Number of validators for PoS dev mode",
+		Value: 64,
+	}
+	DevSlotTimeFlag = cli.IntFlag{
+		Name:  "dev.slot-time",
+		Usage: "Slot duration in seconds for PoS dev mode (minimum: 2)",
+		Value: 6,
 	}
 	ChainFlag = cli.StringFlag{
 		Name:  "chain",
@@ -119,13 +134,13 @@ var (
 		Name:  "whitelist",
 		Usage: "Comma separated block number-to-hash mappings to enforce (<number>=<hash>)",
 	}
-	OverrideOsakaFlag = flags.BigFlag{
+	OverrideOsakaFlag = cli.Uint64Flag{
 		Name:  "override.osaka",
 		Usage: "Manually specify the Osaka fork time, overriding the bundled setting",
 	}
-	OverrideBalancerFlag = flags.BigFlag{
-		Name:  "override.balancer",
-		Usage: "Manually specify the Balancer fork time, overriding the bundled setting",
+	OverrideAmsterdamFlag = cli.Uint64Flag{
+		Name:  "override.amsterdam",
+		Usage: "Manually specify the Amsterdam fork time, overriding the bundled setting",
 	}
 	KeepStoredChainConfigFlag = cli.BoolFlag{
 		Name:  "keep.stored.chain.config",
@@ -224,8 +239,13 @@ var (
 		Usage: "How often transactions should be committed to the storage",
 		Value: txpoolcfg.DefaultConfig.CommitEvery,
 	}
+	TxPoolQueuedDormancyFlag = cli.DurationFlag{
+		Name:  "txpool.queued.dormancy",
+		Usage: "Evict queued transactions from senders with no on-chain state changes for this duration (e.g. 3h, 2h30m; 0 to disable)",
+		Value: txpoolcfg.DefaultConfig.QueuedDormancyDuration,
+	}
 
-	// Miner settings
+	// Block builder/proposer settings
 	ProposingDisableFlag = cli.BoolFlag{
 		Name:  "proposer.disable",
 		Usage: "Disables PoS proposer",
@@ -242,6 +262,10 @@ var (
 	MinerExtraDataFlag = cli.StringFlag{
 		Name:  "miner.extradata",
 		Usage: "Block extra data set by the miner (default = client version)",
+	}
+	BuilderMaxBlobsFlag = cli.Uint64Flag{
+		Name:  "builder.maxblobs",
+		Usage: "Cap the number of blob transactions included in a built block",
 	}
 
 	VMEnableDebugFlag = cli.BoolFlag{
@@ -355,7 +379,7 @@ var (
 	}
 	RpcBatchConcurrencyFlag = cli.UintFlag{
 		Name:  "rpc.batch.concurrency",
-		Usage: "Does limit amount of goroutines to process 1 batch request. Means 1 bach request can't overload server. 1 batch still can have unlimited amount of request",
+		Usage: "Does limit amount of goroutines to process 1 batch request. Means 1 batch request can't overload server. 1 batch still can have unlimited amount of request",
 		Value: 2,
 	}
 	RpcStreamingDisableFlag = cli.BoolFlag{
@@ -372,11 +396,6 @@ var (
 		Usage: "Maximum number of bytes returned from eth_call or similar invocations",
 		Value: 100_000,
 	}
-	RpcBlockRangeLimit = cli.IntFlag{
-		Name:  "rpc.blockrange.limit",
-		Usage: "Maximum block range (end - begin) allowed for range queries (0 = unlimited)",
-		Value: 0,
-	}
 	HTTPTraceFlag = cli.BoolFlag{
 		Name:  "http.trace",
 		Usage: "Print all HTTP requests to logs with INFO level",
@@ -384,12 +403,22 @@ var (
 	HTTPDebugSingleFlag = cli.BoolFlag{
 		Name:    "http.dbg.single",
 		Aliases: []string{"rpc.dbg.single"},
-		Usage:   "Allow pass HTTP header 'dbg: true' to printt more detailed logs - how this request was executed",
+		Usage:   "Allow pass HTTP header 'dbg: true' to print more detailed logs - how this request was executed",
 	}
 	DBReadConcurrencyFlag = cli.IntFlag{
 		Name:  "db.read.concurrency",
 		Usage: "Does limit amount of parallel db reads. Default: equal to GOMAXPROCS (or number of CPU)",
 		Value: min(max(10, runtime.GOMAXPROCS(-1)*64), 9_000),
+	}
+	RpcMaxConcurrentRequestsFlag = cli.IntFlag{
+		Name:  "rpc.max.concurrency",
+		Usage: "Maximum number of concurrent HTTP RPC requests (HTTP admission control). 0 = use db.read.concurrency, -1 = unlimited (no admission control)",
+		Value: 0,
+	}
+	WsMaxConnectionsFlag = cli.IntFlag{
+		Name:  "ws.max.connections",
+		Usage: "Maximum number of concurrent WebSocket connections. 0 = unlimited",
+		Value: 0,
 	}
 	RpcAccessListFlag = cli.StringFlag{
 		Name:  "rpc.accessList",
@@ -401,9 +430,33 @@ var (
 		Usage: "Sets a cap on gas that can be used in eth_call/estimateGas",
 		Value: 50000000,
 	}
+	RpcBlockRangeLimit = cli.IntFlag{
+		Name:  "rpc.blockrange.limit",
+		Usage: "Maximum block range (end - begin) allowed for range queries (0 = unlimited)",
+		Value: 1_000,
+	}
+	RpcGetLogsMaxResults = cli.IntFlag{
+		Name:  "rpc.logs.maxresults",
+		Usage: "Maximum number of logs returned by eth_getLogs, erigon_getLogs, erigon_getLatestLogs (0 = unlimited)",
+		Value: 20_000,
+	}
 	RpcTraceCompatFlag = cli.BoolFlag{
 		Name:  "trace.compat",
 		Usage: "Bug for bug compatibility with OE for trace_ routines",
+	}
+	RpcGethCompatFlag = cli.BoolFlag{
+		Name:  "rpc.gethcompat",
+		Usage: "Enables Geth-compatible storage iteration order for debug_storageRangeAt (sorted by keccak256 hash). Disabled by default for performance.",
+	}
+	RpcTxSyncDefaultTimeoutFlag = cli.DurationFlag{
+		Name:  "rpc.txsync.defaulttimeout",
+		Usage: "Default timeout for eth_sendRawTransactionSync (default: 25 secs).",
+		Value: rpccfg.DefaultRpcTxSyncDefaultTimeout,
+	}
+	RpcTxSyncMaxTimeoutFlag = cli.DurationFlag{
+		Name:  "rpc.txsync.maxtimeout",
+		Usage: "Maximum allowed timeout for eth_sendRawTransactionSync (default: 1 min).",
+		Value: rpccfg.DefaultRpcTxSyncMaxTimeout,
 	}
 
 	TxpoolApiAddrFlag = cli.StringFlag{
@@ -496,12 +549,12 @@ var (
 	// Network Settings
 	MaxPeersFlag = cli.IntFlag{
 		Name:  "maxpeers",
-		Usage: "Maximum number of network peers per protocol version (network disabled if set to 0)",
+		Usage: "Maximum number of network peers (network disabled if set to 0)",
 		Value: nodecfg.DefaultConfig.P2P.MaxPeers,
 	}
 	MaxPendingPeersFlag = cli.IntFlag{
 		Name:  "maxpendpeers",
-		Usage: "Maximum number of TCP connections pending to become connected peers (per protocol version)",
+		Usage: "Maximum number of TCP connections pending to become connected peers",
 		Value: nodecfg.DefaultConfig.P2P.MaxPendingPeers,
 	}
 	ListenPortFlag = cli.IntFlag{
@@ -513,11 +566,6 @@ var (
 		Name:  "p2p.protocol",
 		Usage: "Version of eth p2p protocol",
 		Value: cli.NewUintSlice(nodecfg.DefaultConfig.P2P.ProtocolVersion...),
-	}
-	P2pProtocolAllowedPorts = cli.UintSliceFlag{
-		Name:  "p2p.allowed-ports",
-		Usage: "Allowed ports to pick for different eth p2p protocol versions as follows <porta>,<portb>,..,<porti>",
-		Value: cli.NewUintSlice(uint(ListenPortFlag.Value), 30304, 30305, 30306, 30307),
 	}
 	SentryAddrFlag = cli.StringFlag{
 		Name:  "sentry.api.addr",
@@ -612,10 +660,10 @@ var (
 		Usage: "Suggested gas price is the given percentile of a set of recent transaction gas prices",
 		Value: ethconfig.Defaults.GPO.Percentile,
 	}
-	GpoMaxGasPriceFlag = cli.Int64Flag{
+	GpoMaxGasPriceFlag = cli.Uint64Flag{
 		Name:  "gpo.maxprice",
 		Usage: "Maximum gas price will be recommended by gpo",
-		Value: ethconfig.Defaults.GPO.MaxPrice.Int64(),
+		Value: ethconfig.Defaults.GPO.MaxPrice.Uint64(),
 	}
 
 	// Metrics flags
@@ -639,27 +687,6 @@ var (
 		Value: metrics.DefaultConfig.Port,
 	}
 
-	CliqueSnapshotCheckpointIntervalFlag = cli.UintFlag{
-		Name:  "clique.checkpoint",
-		Usage: "Number of blocks after which to save the vote snapshot to the database",
-		Value: 10,
-	}
-	CliqueSnapshotInmemorySnapshotsFlag = cli.IntFlag{
-		Name:  "clique.snapshots",
-		Usage: "Number of recent vote snapshots to keep in memory",
-		Value: 1024,
-	}
-	CliqueSnapshotInmemorySignaturesFlag = cli.IntFlag{
-		Name:  "clique.signatures",
-		Usage: "Number of recent block signatures to keep in memory",
-		Value: 16384,
-	}
-	CliqueDataDirFlag = flags.DirectoryFlag{
-		Name:  "clique.datadir",
-		Usage: "Path to clique db folder",
-		Value: "",
-	}
-
 	SnapKeepBlocksFlag = cli.BoolFlag{
 		Name:  ethconfig.FlagSnapKeepBlocks,
 		Usage: "Keep ancient blocks in db (useful for debug)",
@@ -674,8 +701,16 @@ var (
 	}
 	SnapSkipStateSnapshotDownloadFlag = cli.BoolFlag{
 		Name:  "snap.skip-state-snapshot-download",
-		Usage: "Skip state download and start from genesis block",
+		Usage: "Skip state snapshot download and re-execute from genesis to build state. Unlike --prune.mode=blocks which downloads state snapshots then prunes history, this flag skips the download entirely.",
 		Value: false,
+	}
+	SnapP2PManifestFlag = cli.BoolFlag{
+		Name:  "snap.p2p-manifest",
+		Usage: "Discover snapshot manifest (chain.toml) from P2P peers via ENR instead of using centralized preverified.toml",
+	}
+	SnapChainTomlURLFlag = cli.StringFlag{
+		Name:  "snap.chaintoml-url",
+		Usage: "Fetch the preverified chain.toml directly from this URL instead of the default R2/GitHub CDN. A local preverified.toml in the datadir still takes precedence; delete it to re-fetch from the URL.",
 	}
 	SnapDownloadToBlockFlag = cli.Uint64Flag{
 		Name:    "snap.download.to.block",
@@ -705,11 +740,14 @@ var (
 		Value: "16mb",
 		Usage: "Bytes per second, example: 32mb. Set Inf for no limit.",
 	}
-	// Deprecated. Shouldn't do anything. TODO: Remove.
+	// Deprecated (v3.0): This flag no longer has any effect and will be removed in a future release.
+	// The downloader now manages concurrent downloads automatically based on available resources.
+	// Previously controlled the number of files to download in parallel, but this is now handled
+	// internally by the BitTorrent client's resource management.
 	TorrentDownloadSlotsFlag = cli.IntFlag{
 		Name:   "torrent.download.slots",
-		Value:  32,
-		Usage:  "Amount of files to download in parallel.",
+		Value:  32, // Keep default for backward compatibility
+		Usage:  "(DEPRECATED: No longer has any effect) Amount of files to download in parallel.",
 		Hidden: true,
 	}
 	// TODO: Currently unused.
@@ -759,7 +797,7 @@ var (
 	}
 	DbPageSizeFlag = cli.StringFlag{
 		Name:  "db.pagesize",
-		Usage: "DB is splitted to 'pages' of fixed size. Can't change DB creation. Must be power of 2 and '256b <= pagesize <= 64kb'. Default: equal to OperationSystem's pageSize. Bigger pageSize causing: 1. More writes to disk during commit 2. Smaller b-tree high 3. Less fragmentation 4. Less overhead on 'free-pages list' maintainance (a bit faster Put/Commit) 5. If expecting DB-size > 8Tb then set pageSize >= 8Kb",
+		Usage: "DB is split to 'pages' of fixed size. Can't change DB creation. Must be power of 2 and '256b <= pagesize <= 64kb'. Default: equal to OperationSystem's pageSize. Bigger pageSize causing: 1. More writes to disk during commit 2. Smaller b-tree high 3. Less fragmentation 4. Less overhead on 'free-pages list' maintenance (a bit faster Put/Commit) 5. If expecting DB-size > 8Tb then set pageSize >= 8Kb",
 		Value: ethconfig.DefaultChainDBPageSize.String(),
 	}
 	DbSizeLimitFlag = cli.StringFlag{
@@ -775,7 +813,7 @@ var (
 
 	HealthCheckFlag = cli.BoolFlag{
 		Name:  "healthcheck",
-		Usage: "Enabling grpc health check",
+		Usage: "Enable grpc health check",
 	}
 
 	WebSeedsFlag = cli.StringFlag{
@@ -837,6 +875,25 @@ var (
 		Name:  "caplin.enable-upnp",
 		Usage: "Enable NAT porting for Caplin",
 		Value: false,
+	}
+	CaplinLocalDiscoveryFlag = cli.BoolFlag{
+		Name:  "caplin.local-discovery",
+		Usage: "Enable to also attempt to find peers over private IPs. Turning this on may cause issues with hosts such as Hetzner",
+		Value: false,
+	}
+	CaplinNATFlag = cli.StringFlag{
+		Name: "caplin.nat",
+		Usage: `NAT port mapping for Caplin P2P. Sets the external IP advertised in the discv5 ENR and libp2p
+		multiaddrs while the socket still binds to --caplin.discovery.addr (typically 0.0.0.0).
+		Required when running inside Docker or behind NAT to allow incoming peer connections.
+		         ""               Default — no NAT, use bind address as-is
+		         "extip:1.2.3.4"  Explicit public IP (recommended for VPS/Docker with static IP)
+		         "stun"           Detect public IP via STUN (default server: stun.l.google.com:19302)
+		         "stun:<host>"    Detect public IP via STUN using a custom server
+		         "upnp"           Use UPnP to discover external IP and map ports (home routers)
+		         "pmp"            Use NAT-PMP with auto-detected gateway
+		         "pmp:192.168.0.1" Use NAT-PMP with explicit gateway`,
+		Value: "",
 	}
 	CaplinMaxInboundTrafficPerPeerFlag = cli.StringFlag{
 		Name:  "caplin.max-inbound-traffic-per-peer",
@@ -910,59 +967,6 @@ var (
 		Value: 25,
 	}
 
-	SilkwormExecutionFlag = cli.BoolFlag{
-		Name:  "silkworm.exec",
-		Usage: "Enable Silkworm block execution",
-	}
-	SilkwormRpcDaemonFlag = cli.BoolFlag{
-		Name:  "silkworm.rpc",
-		Usage: "Enable embedded Silkworm RPC service",
-	}
-	SilkwormSentryFlag = cli.BoolFlag{
-		Name:  "silkworm.sentry",
-		Usage: "Enable embedded Silkworm Sentry service",
-	}
-	SilkwormVerbosityFlag = cli.StringFlag{
-		Name:  "silkworm.verbosity",
-		Usage: "Set the log level for Silkworm console logs",
-		Value: log.LvlInfo.String(),
-	}
-	SilkwormNumContextsFlag = cli.UintFlag{
-		Name:  "silkworm.contexts",
-		Usage: "Number of I/O contexts used in embedded Silkworm RPC and Sentry services (zero means use default in Silkworm)",
-		Value: 0,
-	}
-	SilkwormRpcLogEnabledFlag = cli.BoolFlag{
-		Name:  "silkworm.rpc.log",
-		Usage: "Enable interface log for embedded Silkworm RPC service",
-		Value: false,
-	}
-	SilkwormRpcLogMaxFileSizeFlag = cli.UintFlag{
-		Name:  "silkworm.rpc.log.maxsize",
-		Usage: "Max interface log file size in MB for embedded Silkworm RPC service",
-		Value: 1,
-	}
-	SilkwormRpcLogMaxFilesFlag = cli.UintFlag{
-		Name:  "silkworm.rpc.log.maxfiles",
-		Usage: "Max interface log files for embedded Silkworm RPC service",
-		Value: 100,
-	}
-	SilkwormRpcLogDumpResponseFlag = cli.BoolFlag{
-		Name:  "silkworm.rpc.log.response",
-		Usage: "Dump responses in interface logs for embedded Silkworm RPC service",
-		Value: false,
-	}
-	SilkwormRpcNumWorkersFlag = cli.UintFlag{
-		Name:  "silkworm.rpc.workers",
-		Usage: "Number of worker threads used in embedded Silkworm RPC service (zero means use default in Silkworm)",
-		Value: 0,
-	}
-	SilkwormRpcJsonCompatibilityFlag = cli.BoolFlag{
-		Name:  "silkworm.rpc.compatibility",
-		Usage: "Preserve JSON-RPC compatibility using embedded Silkworm RPC service",
-		Value: true,
-	}
-
 	BeaconAPIFlag = cli.StringSliceFlag{
 		Name:  "beacon.api",
 		Usage: "Enable beacon API (available endpoints: beacon, builder, config, debug, events, node, validator, lighthouse)",
@@ -983,7 +987,7 @@ var (
 		Value: 31536000,
 	}
 	BeaconApiIdleTimeoutFlag = cli.Uint64Flag{
-		Name:  "beacon.api.ide.timeout",
+		Name:  "beacon.api.idle.timeout",
 		Usage: "Sets the seconds for a write time out in the beacon api",
 		Value: 25,
 	}
@@ -999,7 +1003,7 @@ var (
 	}
 	RPCSlowFlag = cli.DurationFlag{
 		Name:  "rpc.slow",
-		Usage: "Print in logs RPC requests slower than given threshold: 100ms, 1s, 1m. Exluded methods: " + strings.Join(rpccfg.SlowLogBlackList, ","),
+		Usage: "Print in logs RPC requests slower than given threshold: 100ms, 1s, 1m. Excluded methods: " + strings.Join(rpccfg.SlowLogBlackList, ","),
 		Value: 0,
 	}
 	CaplinArchiveBlocksFlag = cli.BoolFlag{
@@ -1019,13 +1023,18 @@ var (
 	}
 	CaplinImmediateBlobBackfillFlag = cli.BoolFlag{
 		Name:  "caplin.blobs-immediate-backfill",
-		Usage: "sets whether caplin should immediatelly backfill blobs (4096 epochs)",
+		Usage: "sets whether caplin should immediately backfill blobs (4096 epochs)",
 		Value: false,
 	}
 	CaplinDisableBlobPruningFlag = cli.BoolFlag{
 		Name:  "caplin.blobs-no-pruning",
 		Usage: "disable blob pruning in caplin",
 		Value: false,
+	}
+	CaplinColumnKeepSlotsFlag = cli.Uint64Flag{
+		Name:  "caplin.columns-keep-slots",
+		Usage: "number of slots to retain PeerDAS data column sidecars (default: MIN_EPOCHS_FOR_DATA_COLUMN_SIDECARS_REQUESTS * SLOTS_PER_EPOCH = 131072, ~18 days); increase for DA oracle or rollup nodes that need longer column history",
+		Value: 131072,
 	}
 	CaplinDisableCheckpointSyncFlag = cli.BoolFlag{
 		Name:  "caplin.checkpoint-sync.disable",
@@ -1121,16 +1130,64 @@ var (
 		Usage: "Enables background pruning post fcu",
 		Value: ethconfig.Defaults.FcuBackgroundPrune,
 	}
-	// ErigonDB geometry settings
-	ErigonDBStepSizeFlag = cli.Uint64Flag{
-		Name:  "erigondb.override.stepsize",
-		Usage: "Override the number of transactions per step; may lead to a corrupted database if used incorrectly",
-		Value: config3.DefaultStepSize,
+	FcuBackgroundCommitFlag = cli.BoolFlag{
+		Name:  "fcu.background.commit",
+		Usage: "Enables background flush and commit",
+		Value: ethconfig.Defaults.FcuBackgroundCommit,
 	}
-	ErigonDBStepsInFrozenFileFlag = cli.Uint64Flag{
-		Name:  "erigondb.override.stepsinfrozenfile",
-		Usage: "Override the number of steps in frozen snapshot files; may lead to a corrupted database if used incorrectly",
-		Value: config3.DefaultStepsInFrozenFile,
+	MCPDisableFlag = cli.BoolFlag{
+		Name:  "mcp.disable",
+		Usage: "Disables the embedded MCP server",
+		Value: false,
+	}
+	MCPAddrFlag = cli.StringFlag{
+		Name:  "mcp.addr",
+		Usage: "Address for MCP RPC server",
+		Value: "127.0.0.1",
+	}
+	MCPPortFlag = cli.UintFlag{
+		Name:  "mcp.port",
+		Usage: "Port for MCP RPC server",
+		Value: 8553,
+	}
+	ErigondbDomainStepsInFrozenFileFlag = cli.StringFlag{
+		Name:  "erigondb.domain.steps-in-frozen-file",
+		Usage: `Override erigondb.toml "steps_in_frozen_file" for the domain merge cap only (history/inverted-index merges are unaffected). Pass a positive integer to set an explicit cap, or "Inf" to leave the domain merge unbounded. Default: unset, meaning the domain uses the same cap as determined by erigondb.toml.`,
+	}
+	ExecBatchedIOFlag = cli.BoolFlag{
+		Name:  "exec.batched-io",
+		Usage: "Enable BAL-driven I/O and write-dependency optimisations: (1) read-ahead pre-warms the DB page cache with account/code/storage reads before block execution (READ_AHEAD=true), and (2) the parallel executor pre-populates the version map from BAL hints (IGNORE_BAL=false). Disable for cold-read or non-BAL scheduling performance measurements.",
+		Value: true,
+	}
+	ExecStateCacheFlag = cli.BoolFlag{
+		Name:  "exec.state-cache",
+		Usage: "Enable the executor domain-shared read cache (equivalent to USE_STATE_CACHE=true). Disable for cold-read performance measurements.",
+		Value: true,
+	}
+	ExecWorkersFlag = cli.IntFlag{
+		Name:  "exec.workers",
+		Usage: "Parallel executor worker count (equivalent to EXEC3_WORKERS). Default: half the number of CPU cores, other half reserved for snapshots build/merge/prune.",
+		Value: runtime.NumCPU() / 2,
+	}
+	ExecSerialFlag = cli.BoolFlag{
+		Name:  "exec.serial",
+		Usage: "Force serial execution by clamping the parallel executor to a single worker. Wins over --exec.workers and EXEC3_WORKERS — use to disable parallelism for diagnostics or like-for-like baseline comparisons.",
+		Value: false,
+	}
+	ExecNoMergeFlag = cli.BoolFlag{
+		Name:  "exec.no-merge",
+		Usage: "Disable state-aggregator file merges for Domain / History / Inverted-Index (equivalent to NO_MERGE=true). Diagnostic / perf-comparison use only.",
+		Value: false,
+	}
+	ExecNoPruneFlag = cli.BoolFlag{
+		Name:  "exec.no-prune",
+		Usage: "Disable all DB pruning: state-aggregator (Domain/InvertedIndex/forkable) plus stage-level pruning (Execution: ChangeSets3/BlockAccessList; TxLookup; WitnessProcessing; Snapshots: PruneAncientBlocks/canonical markers/retirement) (equivalent to NO_PRUNE=true). Diagnostic / perf-comparison use only.",
+		Value: false,
+	}
+	ExecNoBackgroundMaintenanceFlag = cli.BoolFlag{
+		Name:  "exec.no-background-maintenance",
+		Usage: "Suppress background state-aggregator (Domain/Hist/II + forkable) file build/merge and E2 block-snapshot retirement goroutines so execution is not perturbed by housekeeping work (legacy env var: NO_BACKGROUND_E3_BUILD=true). Diagnostic / focused-performance-testing use only — NOT an operational setting.",
+		Value: false,
 	}
 )
 
@@ -1171,7 +1228,7 @@ func setBootstrapNodes(ctx *cli.Context, cfg *p2p.Config) {
 		return
 	}
 
-	nodes, err := GetBootnodesFromFlags(ctx.String(BootnodesFlag.Name), ctx.String(ChainFlag.Name))
+	nodes, err := getBootnodesFromContext(ctx)
 	if err != nil {
 		Fatalf("Option %s: %v", BootnodesFlag.Name, err)
 	}
@@ -1185,12 +1242,47 @@ func setBootstrapNodesV5(ctx *cli.Context, cfg *p2p.Config) {
 		return
 	}
 
-	nodes, err := GetBootnodesFromFlags(ctx.String(BootnodesFlag.Name), ctx.String(ChainFlag.Name))
+	nodes, err := getBootnodesFromContext(ctx)
 	if err != nil {
 		Fatalf("Option %s: %v", BootnodesFlag.Name, err)
 	}
 
 	cfg.BootstrapNodesV5 = nodes
+}
+
+// resolveChainName returns the effective chain name from --chain and --networkid.
+// It is used for bootnodes, DNS discovery URLs, static peers, and the
+// chain-derived configuration in SetEthConfig (snapshot chain name,
+// chain-specific branches, etc.).
+//
+// It mirrors go-ethereum's behavior: when --networkid is explicitly set to a
+// non-mainnet value and --chain is not, the "mainnet" default on --chain
+// should not bleed into chain-derived config. If the networkid maps to a known
+// chain, that name is returned; otherwise an empty string is returned,
+// yielding no defaults.
+func resolveChainName(ctx *cli.Context) string {
+	chain := ctx.String(ChainFlag.Name)
+	if !ctx.IsSet(NetworkIdFlag.Name) || ctx.IsSet(ChainFlag.Name) {
+		return chain
+	}
+	networkID := ctx.Uint64(NetworkIdFlag.Name)
+	if networkID == 1 {
+		return chain
+	}
+	if chainName, ok := chainspec.NetworkNameByID[networkID]; ok {
+		return chainName
+	}
+	return ""
+}
+
+// getBootnodesFromContext resolves bootstrap nodes from the CLI context. An explicitly
+// set --bootnodes flag (even if empty) overrides chain defaults, matching go-ethereum's
+// behavior and allowing callers to run discovery with no bootstrap peers.
+func getBootnodesFromContext(ctx *cli.Context) ([]*enode.Node, error) {
+	if ctx.IsSet(BootnodesFlag.Name) {
+		return enode.ParseNodesFromURLs(common.CliString2Array(ctx.String(BootnodesFlag.Name)))
+	}
+	return GetBootnodesFromFlags("", resolveChainName(ctx))
 }
 
 // GetBootnodesFromFlags makes a list of bootnodes from command line flags.
@@ -1214,8 +1306,7 @@ func setStaticPeers(ctx *cli.Context, cfg *p2p.Config) {
 	if ctx.IsSet(StaticPeersFlag.Name) {
 		urls = common.CliString2Array(ctx.String(StaticPeersFlag.Name))
 	} else {
-		chain := ctx.String(ChainFlag.Name)
-		urls = chainspec.StaticPeerURLsOfChain(chain)
+		urls = chainspec.StaticPeerURLsOfChain(resolveChainName(ctx))
 	}
 
 	nodes, err := enode.ParseNodesFromURLs(urls)
@@ -1254,7 +1345,6 @@ func NewP2PConfig(
 	trustedPeers []string,
 	port uint,
 	protocol uint,
-	allowedPorts []uint,
 	metricsEnabled, witProtocol bool,
 ) (*p2p.Config, error) {
 	var enodeDBPath string
@@ -1263,6 +1353,8 @@ func NewP2PConfig(
 		enodeDBPath = filepath.Join(dirs.Nodes, "eth68")
 	case direct.ETH69:
 		enodeDBPath = filepath.Join(dirs.Nodes, "eth69")
+	case direct.ETH70:
+		enodeDBPath = filepath.Join(dirs.Nodes, "eth70")
 	default:
 		return nil, fmt.Errorf("unknown protocol: %v", protocol)
 	}
@@ -1281,7 +1373,6 @@ func NewP2PConfig(
 		PrivateKey:        serverKey,
 		Name:              nodeName,
 		NodeDatabase:      enodeDBPath,
-		AllowedPorts:      allowedPorts,
 		TmpDir:            dirs.Tmp,
 		MetricsEnabled:    metricsEnabled,
 		EnableWitProtocol: witProtocol,
@@ -1333,26 +1424,6 @@ func setListenAddress(ctx *cli.Context, cfg *p2p.Config) {
 	if ctx.IsSet(SentryAddrFlag.Name) {
 		cfg.SentryAddr = common.CliString2Array(ctx.String(SentryAddrFlag.Name))
 	}
-	// TODO cli lib doesn't store defaults for UintSlice properly so we have to get value directly
-	cfg.AllowedPorts = P2pProtocolAllowedPorts.Value.Value()
-	if ctx.IsSet(P2pProtocolAllowedPorts.Name) {
-		cfg.AllowedPorts = ctx.UintSlice(P2pProtocolAllowedPorts.Name)
-	}
-
-	if ctx.IsSet(ListenPortFlag.Name) {
-		// add non-default port to allowed port list
-		lp := ctx.Int(ListenPortFlag.Name)
-		found := false
-		for _, p := range cfg.AllowedPorts {
-			if int(p) == lp {
-				found = true
-				break
-			}
-		}
-		if !found {
-			cfg.AllowedPorts = append([]uint{uint(lp)}, cfg.AllowedPorts...)
-		}
-	}
 }
 
 // setNAT creates a port mapper from command line flags.
@@ -1375,13 +1446,13 @@ func setEtherbase(ctx *cli.Context, cfg *ethconfig.Config) {
 	if ctx.IsSet(MinerEtherbaseFlag.Name) {
 		etherbase = ctx.String(MinerEtherbaseFlag.Name)
 		if etherbase != "" {
-			cfg.Miner.Etherbase = common.HexToAddress(etherbase)
+			cfg.Builder.Etherbase = common.HexToAddress(etherbase)
 		}
 	}
 
 	if chainName := ctx.String(ChainFlag.Name); chainName == networkname.Dev || chainName == networkname.BorDevnet {
 		if etherbase == "" {
-			cfg.Miner.Etherbase = devnetEtherbase
+			cfg.Builder.Etherbase = devnetEtherbase
 		}
 	}
 }
@@ -1467,6 +1538,8 @@ func setDataDir(ctx *cli.Context, cfg *nodecfg.Config) error {
 		cfg.Dirs = datadir.New(paths.DataDirForNetwork(paths.DefaultDataDir(), ctx.String(ChainFlag.Name)))
 	}
 
+	cfg.Dirs.Log = logging.LogDirPath(ctx)
+
 	cfg.MdbxPageSize = flags.DBPageSizeFlagUnmarshal(ctx, DbPageSizeFlag.Name, DbPageSizeFlag.Usage)
 	if err := cfg.MdbxDBSizeLimit.UnmarshalText([]byte(ctx.String(DbSizeLimitFlag.Name))); err != nil {
 		return fmt.Errorf("failed to parse --%s: %w", DbSizeLimitFlag.Name, err)
@@ -1509,20 +1582,7 @@ func setGPO(ctx *cli.Context, cfg *gaspricecfg.Config) {
 		cfg.Percentile = ctx.Int(GpoPercentileFlag.Name)
 	}
 	if ctx.IsSet(GpoMaxGasPriceFlag.Name) {
-		cfg.MaxPrice = big.NewInt(ctx.Int64(GpoMaxGasPriceFlag.Name))
-	}
-}
-
-// nolint
-func setGPOCobra(f *pflag.FlagSet, cfg *gaspricecfg.Config) {
-	if v := f.Int(GpoBlocksFlag.Name, GpoBlocksFlag.Value, GpoBlocksFlag.Usage); v != nil {
-		cfg.Blocks = *v
-	}
-	if v := f.Int(GpoPercentileFlag.Name, GpoPercentileFlag.Value, GpoPercentileFlag.Usage); v != nil {
-		cfg.Percentile = *v
-	}
-	if v := f.Int64(GpoMaxGasPriceFlag.Name, GpoMaxGasPriceFlag.Value, GpoMaxGasPriceFlag.Usage); v != nil {
-		cfg.MaxPrice = big.NewInt(*v)
+		cfg.MaxPrice = uint256.NewInt(ctx.Uint64(GpoMaxGasPriceFlag.Name))
 	}
 }
 
@@ -1567,9 +1627,6 @@ func setTxPool(ctx *cli.Context, dbDir string, fullCfg *ethconfig.Config) {
 			cfg.TracedSenders[i] = string(sender[:])
 		}
 	}
-	if ctx.IsSet(TxPoolBlobPriceBumpFlag.Name) {
-		cfg.BlobPriceBump = ctx.Uint64(TxPoolBlobPriceBumpFlag.Name)
-	}
 	if ctx.IsSet(DbWriteMapFlag.Name) {
 		cfg.MdbxWriteMap = ctx.Bool(DbWriteMapFlag.Name)
 	}
@@ -1579,6 +1636,9 @@ func setTxPool(ctx *cli.Context, dbDir string, fullCfg *ethconfig.Config) {
 	cfg.AllowAA = ctx.Bool(AAFlag.Name)
 	cfg.LogEvery = 3 * time.Minute
 	cfg.CommitEvery = common.RandomizeDuration(ctx.Duration(TxPoolCommitEveryFlag.Name))
+	if ctx.IsSet(TxPoolQueuedDormancyFlag.Name) {
+		cfg.QueuedDormancyDuration = ctx.Duration(TxPoolQueuedDormancyFlag.Name)
+	}
 	cfg.DBDir = dbDir
 	fullCfg.TxPool = cfg
 }
@@ -1621,7 +1681,7 @@ func setEthash(ctx *cli.Context, datadir string, cfg *ethconfig.Config) {
 	}
 }
 
-func SetupMinerCobra(cmd *cobra.Command, cfg *buildercfg.MiningConfig) {
+func SetupMinerCobra(cmd *cobra.Command, cfg *buildercfg.BuilderConfig) {
 	flags := cmd.Flags()
 	var err error
 	extraDataStr, err := flags.GetString(MinerExtraDataFlag.Name)
@@ -1651,17 +1711,6 @@ func SetupMinerCobra(cmd *cobra.Command, cfg *buildercfg.MiningConfig) {
 	cfg.Etherbase = common.HexToAddress(etherbase)
 }
 
-func setClique(ctx *cli.Context, cfg *chainspec.ConsensusSnapshotConfig, datadir string) {
-	cfg.CheckpointInterval = ctx.Uint64(CliqueSnapshotCheckpointIntervalFlag.Name)
-	cfg.InmemorySnapshots = ctx.Int(CliqueSnapshotInmemorySnapshotsFlag.Name)
-	cfg.InmemorySignatures = ctx.Int(CliqueSnapshotInmemorySignaturesFlag.Name)
-	if ctx.IsSet(CliqueDataDirFlag.Name) {
-		cfg.DBPath = filepath.Join(ctx.String(CliqueDataDirFlag.Name), "clique", "db")
-	} else {
-		cfg.DBPath = filepath.Join(datadir, "clique", "db")
-	}
-}
-
 func setBorConfig(ctx *cli.Context, cfg *ethconfig.Config, nodeConfig *nodecfg.Config, logger log.Logger) {
 	cfg.HeimdallURL = ctx.String(HeimdallURLFlag.Name)
 	cfg.WithoutHeimdall = ctx.Bool(WithoutHeimdallFlag.Name)
@@ -1681,7 +1730,7 @@ func setBorConfig(ctx *cli.Context, cfg *ethconfig.Config, nodeConfig *nodecfg.C
 	cfg.PolygonPosSingleSlotFinalityBlockAt = ctx.Uint64(PolygonPosSingleSlotFinalityBlockAtFlag.Name)
 }
 
-func setMiner(ctx *cli.Context, cfg *buildercfg.MiningConfig) {
+func setBuilder(ctx *cli.Context, cfg *buildercfg.BuilderConfig) {
 	cfg.EnabledPOS = !ctx.IsSet(ProposingDisableFlag.Name)
 
 	if ctx.IsSet(MinerExtraDataFlag.Name) {
@@ -1700,6 +1749,11 @@ func setMiner(ctx *cli.Context, cfg *buildercfg.MiningConfig) {
 		if gasLimit := ctx.Uint64(MinerGasLimitFlag.Name); gasLimit != 0 {
 			cfg.GasLimit = &gasLimit
 		}
+	}
+
+	if ctx.IsSet(BuilderMaxBlobsFlag.Name) {
+		maxBlobs := ctx.Uint64(BuilderMaxBlobsFlag.Name)
+		cfg.MaxBlobsPerBlock = &maxBlobs
 	}
 }
 
@@ -1777,6 +1831,7 @@ func setCaplin(ctx *cli.Context, cfg *ethconfig.Config) {
 	cfg.CaplinConfig.ImmediateBlobsBackfilling = ctx.Bool(CaplinImmediateBlobBackfillFlag.Name)
 	cfg.CaplinConfig.SnapshotGenerationEnabled = ctx.Bool(CaplinEnableSnapshotGeneration.Name)
 	cfg.CaplinConfig.DisabledCheckpointSync = ctx.Bool(CaplinDisableCheckpointSyncFlag.Name)
+	cfg.CaplinConfig.ColumnKeepSlots = ctx.Uint64(CaplinColumnKeepSlotsFlag.Name)
 	// bunch of extra stuff
 	cfg.CaplinConfig.MevRelayUrl = ctx.String(CaplinMevRelayUrl.Name)
 	cfg.CaplinConfig.EnableValidatorMonitor = ctx.Bool(CaplinValidatorMonitorFlag.Name)
@@ -1787,25 +1842,10 @@ func setCaplin(ctx *cli.Context, cfg *ethconfig.Config) {
 	cfg.CaplinConfig.CustomGenesisStatePath = ctx.String(CaplinCustomGenesisFlag.Name)
 }
 
-func setSilkworm(ctx *cli.Context, cfg *ethconfig.Config) {
-	cfg.SilkwormExecution = ctx.Bool(SilkwormExecutionFlag.Name)
-	cfg.SilkwormRpcDaemon = ctx.Bool(SilkwormRpcDaemonFlag.Name)
-	cfg.SilkwormSentry = ctx.Bool(SilkwormSentryFlag.Name)
-	cfg.SilkwormVerbosity = ctx.String(SilkwormVerbosityFlag.Name)
-	cfg.SilkwormNumContexts = uint32(ctx.Uint64(SilkwormNumContextsFlag.Name))
-	cfg.SilkwormRpcLogEnabled = ctx.Bool(SilkwormRpcLogEnabledFlag.Name)
-	cfg.SilkwormRpcLogDirPath = logging.LogDirPath(ctx)
-	cfg.SilkwormRpcLogMaxFileSize = uint16(ctx.Uint64(SilkwormRpcLogMaxFileSizeFlag.Name))
-	cfg.SilkwormRpcLogMaxFiles = uint16(ctx.Uint(SilkwormRpcLogMaxFilesFlag.Name))
-	cfg.SilkwormRpcLogDumpResponse = ctx.Bool(SilkwormRpcLogDumpResponseFlag.Name)
-	cfg.SilkwormRpcNumWorkers = uint32(ctx.Uint64(SilkwormRpcNumWorkersFlag.Name))
-	cfg.SilkwormRpcJsonCompatibility = ctx.Bool(SilkwormRpcJsonCompatibilityFlag.Name)
-}
-
 // CheckExclusive verifies that only a single instance of the provided flags was
 // set by the user. Each flag might optionally be followed by a string type to
 // specialize it further.
-func CheckExclusive(ctx *cli.Context, args ...interface{}) {
+func CheckExclusive(ctx *cli.Context, args ...any) {
 	set := make([]string, 0, 1)
 	for i := 0; i < len(args); i++ {
 		// Make sure the next argument is a flag and skip if not set
@@ -1845,17 +1885,23 @@ func CheckExclusive(ctx *cli.Context, args ...interface{}) {
 
 // SetEthConfig applies eth-related command line flags to the config.
 func SetEthConfig(ctx *cli.Context, nodeConfig *nodecfg.Config, cfg *ethconfig.Config, logger log.Logger) {
+	if !ctx.Bool(MCPDisableFlag.Name) && ctx.String(MCPAddrFlag.Name) != "" {
+		cfg.MCPAddress = fmt.Sprintf("%s:%d", ctx.String(MCPAddrFlag.Name), ctx.Uint(MCPPortFlag.Name))
+	}
+
 	cfg.CaplinConfig.CaplinDiscoveryAddr = ctx.String(CaplinDiscoveryAddrFlag.Name)
 	cfg.CaplinConfig.CaplinDiscoveryPort = ctx.Uint64(CaplinDiscoveryPortFlag.Name)
 	cfg.CaplinConfig.CaplinDiscoveryTCPPort = ctx.Uint64(CaplinDiscoveryTCPPortFlag.Name)
 	if ctx.Bool(KeepExecutionProofsFlag.Name) {
 		cfg.KeepExecutionProofs = true
-		statecfg.EnableHistoricalCommitment()
 	}
+
 	if ctx.IsSet(AlwaysGenerateChangesetsFlag.Name) {
 		cfg.AlwaysGenerateChangesets = ctx.Bool(AlwaysGenerateChangesetsFlag.Name)
 	}
 	cfg.CaplinConfig.EnableUPnP = ctx.Bool(CaplinEnableUPNPlag.Name)
+	cfg.CaplinConfig.LocalDiscovery = ctx.Bool(CaplinLocalDiscoveryFlag.Name)
+	cfg.CaplinConfig.CaplinNAT = ctx.String(CaplinNATFlag.Name)
 	var err error
 	cfg.CaplinConfig.MaxInboundTrafficPerPeer, err = datasize.ParseString(ctx.String(CaplinMaxInboundTrafficPerPeerFlag.Name))
 	if err != nil {
@@ -1875,25 +1921,21 @@ func SetEthConfig(ctx *cli.Context, nodeConfig *nodecfg.Config, cfg *ethconfig.C
 	cfg.CaplinConfig.BootstrapNodes = ctx.StringSlice(SentinelBootnodes.Name)
 	cfg.CaplinConfig.StaticPeers = ctx.StringSlice(SentinelStaticPeers.Name)
 
-	chain := ctx.String(ChainFlag.Name) // mainnet by default
+	chain := resolveChainName(ctx)
 	if ctx.IsSet(NetworkIdFlag.Name) {
 		cfg.NetworkID = ctx.Uint64(NetworkIdFlag.Name)
-		if cfg.NetworkID != 1 && !ctx.IsSet(ChainFlag.Name) {
-			chainName, ok := chainspec.NetworkNameByID[cfg.NetworkID]
-			if !ok {
-				chain = "" // don't default to mainnet if NetworkID != 1 and it's devchain or smth
-			} else {
-				chain = chainName // fetch network name from id if name wasn't provided
-			}
-
-		}
-	} else {
+	} else if chain != networkname.Dev && chain != networkname.BorDevnet {
 		spec, err := chainspec.ChainSpecByName(chain)
 		if err != nil {
 			Fatalf("chain name is not recognized: %s", chain)
 			return
 		}
-		cfg.NetworkID = spec.Config.ChainID.Uint64()
+		// Use custom NetworkID from spec if set, otherwise use ChainID
+		if spec.NetworkID != 0 {
+			cfg.NetworkID = spec.NetworkID
+		} else {
+			cfg.NetworkID = spec.Config.ChainID.Uint64()
+		}
 	}
 
 	cfg.Dirs = nodeConfig.Dirs
@@ -1902,13 +1944,11 @@ func SetEthConfig(ctx *cli.Context, nodeConfig *nodecfg.Config, cfg *ethconfig.C
 	cfg.Snapshot.ProduceE3 = !ctx.Bool(SnapStateStopFlag.Name)
 	cfg.Snapshot.DisableDownloadE3 = ctx.Bool(SnapSkipStateSnapshotDownloadFlag.Name)
 	cfg.Snapshot.NoDownloader = ctx.Bool(NoDownloaderFlag.Name)
+	cfg.Snapshot.P2PManifest = ctx.Bool(SnapP2PManifestFlag.Name)
+	cfg.Snapshot.ChainTomlURL = strings.TrimSpace(ctx.String(SnapChainTomlURLFlag.Name))
 	cfg.Snapshot.DownloaderAddr = strings.TrimSpace(ctx.String(DownloaderAddrFlag.Name))
 	cfg.Snapshot.ChainName = chain
 	nodeConfig.Http.Snap = cfg.Snapshot
-
-	if ctx.Command.Name == "import" {
-		cfg.ImportMode = true
-	}
 
 	setEtherbase(ctx, cfg)
 	setGPO(ctx, &cfg.GPO)
@@ -1917,11 +1957,9 @@ func SetEthConfig(ctx *cli.Context, nodeConfig *nodecfg.Config, cfg *ethconfig.C
 	setShutter(ctx, chain, nodeConfig, cfg)
 
 	setEthash(ctx, nodeConfig.Dirs.DataDir, cfg)
-	setClique(ctx, &cfg.Clique, nodeConfig.Dirs.DataDir)
-	setMiner(ctx, &cfg.Miner)
+	setBuilder(ctx, &cfg.Builder)
 	setWhitelist(ctx, cfg)
 	setBorConfig(ctx, cfg, nodeConfig, logger)
-	setSilkworm(ctx, cfg)
 	if err := setBeaconAPI(ctx, cfg); err != nil {
 		log.Error("Failed to set beacon API", "err", err)
 	}
@@ -1931,14 +1969,48 @@ func SetEthConfig(ctx *cli.Context, nodeConfig *nodecfg.Config, cfg *ethconfig.C
 	cfg.Ethstats = ctx.String(EthStatsURLFlag.Name)
 
 	if ctx.Bool(ExperimentalConcurrentCommitmentFlag.Name) {
-		// cfg.ExperimentalConcurrentCommitment = true
-		statecfg.ExperimentalConcurrentCommitment = true
+		cfg.ExperimentalConcurrentCommitment = true
 	}
 
-	cfg.ErigonDBStepSize = ctx.Int(ErigonDBStepSizeFlag.Name)
-	cfg.ErigonDBStepsInFrozenFile = ctx.Int(ErigonDBStepsInFrozenFileFlag.Name)
 	cfg.FcuTimeout = ctx.Duration(FcuTimeoutFlag.Name)
 	cfg.FcuBackgroundPrune = ctx.Bool(FcuBackgroundPruneFlag.Name)
+	cfg.FcuBackgroundCommit = ctx.Bool(FcuBackgroundCommitFlag.Name)
+
+	// Executor performance toggles. When the user explicitly sets the CLI
+	// flag, it overrides the env-var default that dbg read at package init.
+	// Otherwise env vars (IGNORE_BAL, USE_STATE_CACHE, EXEC3_WORKERS,
+	// NO_MERGE, NO_PRUNE, NO_BACKGROUND_E3_BUILD) remain the source of truth.
+	if ctx.IsSet(ExecBatchedIOFlag.Name) {
+		// --exec.batched-io toggles two BAL-driven optimisations together:
+		// read-ahead pre-warming (ReadAhead) and version-map pre-population
+		// (IgnoreBAL, inverted). Flipped in lockstep so perf comparisons
+		// test "all BAL I/O off" vs "all BAL I/O on".
+		v := ctx.Bool(ExecBatchedIOFlag.Name)
+		dbg.SetReadAhead(v)
+		dbg.SetIgnoreBAL(!v)
+	}
+	if ctx.IsSet(ExecStateCacheFlag.Name) {
+		dbg.SetUseStateCache(ctx.Bool(ExecStateCacheFlag.Name))
+	}
+	if ctx.IsSet(ExecWorkersFlag.Name) {
+		n := ctx.Int(ExecWorkersFlag.Name)
+		dbg.SetExec3Workers(n)
+		cfg.ExecWorkerCount = n
+	}
+	// --exec.serial wins over --exec.workers / EXEC3_WORKERS: clamp to 1.
+	if ctx.IsSet(ExecSerialFlag.Name) && ctx.Bool(ExecSerialFlag.Name) {
+		dbg.SetExec3Workers(1)
+		cfg.ExecWorkerCount = 1
+	}
+	if ctx.IsSet(ExecNoMergeFlag.Name) {
+		dbg.SetNoMerge(ctx.Bool(ExecNoMergeFlag.Name))
+	}
+	if ctx.IsSet(ExecNoPruneFlag.Name) {
+		dbg.SetNoPrune(ctx.Bool(ExecNoPruneFlag.Name))
+	}
+	if ctx.IsSet(ExecNoBackgroundMaintenanceFlag.Name) {
+		dbg.SetNoBackgroundMaintenance(ctx.Bool(ExecNoBackgroundMaintenanceFlag.Name))
+	}
 	if ctx.IsSet(RPCGlobalGasCapFlag.Name) {
 		cfg.RPCGasCap = ctx.Uint64(RPCGlobalGasCapFlag.Name)
 	}
@@ -1970,29 +2042,22 @@ func SetEthConfig(ctx *cli.Context, nodeConfig *nodecfg.Config, cfg *ethconfig.C
 			return
 		}
 		cfg.Genesis = spec.Genesis
-		SetDNSDiscoveryDefaults(cfg, spec.GenesisHash)
+		SetDNSDiscoveryDefaults(cfg, spec)
 	case "":
 		if cfg.NetworkID == 1 {
-			SetDNSDiscoveryDefaults(cfg, chainspec.Mainnet.GenesisHash)
+			SetDNSDiscoveryDefaults(cfg, chainspec.Mainnet)
 		}
 	case networkname.Dev:
-		// Create new developer account or reuse existing one
-		developer := cfg.Miner.Etherbase
-		if developer == (common.Address{}) {
-			Fatalf("Please specify developer account address using --miner.etherbase")
-		}
-		logger.Info("Using developer account", "address", developer)
-
-		// Create a new developer genesis block or reuse existing one
-		cfg.Genesis = chainspec.DeveloperGenesisBlock(uint64(ctx.Int(DeveloperPeriodFlag.Name)), developer)
-		logger.Info("Using custom developer period", "seconds", cfg.Genesis.Config.Clique.Period)
+		setDevnetEthConfig(ctx, cfg, logger)
 	}
 
 	if ctx.IsSet(OverrideOsakaFlag.Name) {
-		cfg.OverrideOsakaTime = flags.GlobalBig(ctx, OverrideOsakaFlag.Name)
+		v := ctx.Uint64(OverrideOsakaFlag.Name)
+		cfg.OverrideOsakaTime = &v
 	}
-	if ctx.IsSet(OverrideBalancerFlag.Name) {
-		cfg.OverrideBalancerTime = flags.GlobalBig(ctx, OverrideBalancerFlag.Name)
+	if ctx.IsSet(OverrideAmsterdamFlag.Name) {
+		v := ctx.Uint64(OverrideAmsterdamFlag.Name)
+		cfg.OverrideAmsterdamTime = &v
 	}
 	cfg.KeepStoredChainConfig = ctx.Bool(KeepStoredChainConfigFlag.Name)
 
@@ -2017,7 +2082,7 @@ func SetEthConfig(ctx *cli.Context, nodeConfig *nodecfg.Config, cfg *ethconfig.C
 			// Unfortunately we don't take webseed URL here in the native format.
 			webseedsList = common.CliString2Array(ctx.String(WebSeedsFlag.Name))
 		} else {
-			if known, ok := snapcfg.KnownWebseeds[chain]; ok {
+			if known, ok := snapcfg.GetEmbeddedWebseeds(chain); ok {
 				webseedsList = append(webseedsList, known...)
 			}
 		}
@@ -2044,6 +2109,136 @@ func SetEthConfig(ctx *cli.Context, nodeConfig *nodecfg.Config, cfg *ethconfig.C
 		}
 		downloadernat.DoNat(nodeConfig.P2P.NAT, cfg.Downloader.ClientConfig, logger)
 	}
+
+	if ctx.IsSet(ErigondbDomainStepsInFrozenFileFlag.Name) {
+		s := ctx.String(ErigondbDomainStepsInFrozenFileFlag.Name)
+		var v uint64
+		if strings.EqualFold(s, "inf") {
+			v = config3.UnboundedDomainMerge
+		} else {
+			parsed, err := strconv.ParseUint(s, 10, 64)
+			if err != nil {
+				Fatalf("invalid --%s value %q: must be a positive integer or \"Inf\"", ErigondbDomainStepsInFrozenFileFlag.Name, s)
+			}
+			if parsed == 0 {
+				Fatalf("invalid --%s value %q: must be a positive integer or \"Inf\"", ErigondbDomainStepsInFrozenFileFlag.Name, s)
+			}
+			v = parsed
+		}
+		cfg.ErigondbDomainStepsInFrozenFile = &v
+	}
+}
+
+// setDevnetEthConfig configures PoS dev mode (--chain dev): embedded Caplin with
+// dev validators producing Fusaka blocks from genesis.
+func setDevnetEthConfig(ctx *cli.Context, cfg *ethconfig.Config, logger log.Logger) {
+	seed := ctx.String(DevValidatorSeedFlag.Name)
+	validatorCount := ctx.Int(DevValidatorCountFlag.Name)
+	if validatorCount == 0 {
+		validatorCount = 64
+	}
+
+	// Derive the signer key for the dev account.
+	signerKey, signerAddr, err := devgenesis.DeriveSignerKey(seed)
+	if err != nil {
+		Fatalf("Failed to derive dev signer key: %v", err)
+	}
+	_ = signerKey // available for future use (e.g., auto-funding txs)
+	logger.Info("Using PoS dev mode",
+		"seed", seed,
+		"validators", validatorCount,
+		"signer", signerAddr.Hex(),
+	)
+
+	cfg.Genesis = chainspec.DeveloperGenesisBlock()
+	// Ensure the derived signer address is pre-funded.
+	if _, ok := cfg.Genesis.Alloc[signerAddr]; !ok {
+		cfg.Genesis.Alloc[signerAddr] = types.GenesisAccount{
+			Balance: big.NewInt(0).Mul(big.NewInt(1000), big.NewInt(common.Ether)),
+		}
+	}
+
+	// Configure embedded Caplin + dev validator.
+	cfg.InternalCL = true
+	cfg.CaplinConfig.DevValidatorSeed = seed
+	cfg.CaplinConfig.DevValidatorCount = validatorCount
+	// Enable Beacon API for dev mode — the embedded dev validator
+	// calls /eth/v1/beacon/genesis, /eth/v1/validator/duties/*, etc.
+	cfg.CaplinConfig.BeaconAPIRouter.Active = true
+	cfg.CaplinConfig.BeaconAPIRouter.Beacon = true
+	cfg.CaplinConfig.BeaconAPIRouter.Node = true
+	cfg.CaplinConfig.BeaconAPIRouter.Validator = true
+	cfg.CaplinConfig.BeaconAPIRouter.Config = true
+	cfg.CaplinConfig.BeaconAPIRouter.Events = true
+	if cfg.CaplinConfig.BeaconAPIRouter.Address == "" {
+		cfg.CaplinConfig.BeaconAPIRouter.Address = "127.0.0.1:5555"
+	}
+
+	// Build beacon genesis state and write to temp file for Caplin.
+	beaconCfg := clparams.MainnetBeaconConfig
+	clparams.ApplyMinimalPreset(&beaconCfg)
+	// Enable all forks from genesis (PoS from block 0).
+	beaconCfg.AltairForkEpoch = 0
+	beaconCfg.BellatrixForkEpoch = 0
+	beaconCfg.CapellaForkEpoch = 0
+	beaconCfg.DenebForkEpoch = 0
+	beaconCfg.ElectraForkEpoch = 0
+	beaconCfg.FuluForkEpoch = 0
+	slotTime := uint64(ctx.Int(DevSlotTimeFlag.Name))
+	if slotTime < 2 {
+		slotTime = 2
+	}
+	beaconCfg.SecondsPerSlot = slotTime
+	beaconCfg.InitializeForkSchedule()
+	genesisTime := uint64(time.Now().Unix())
+	// Compute the EL genesis block hash so the beacon state's Eth1Data
+	// matches the actual chain genesis.
+	elGenesisBlock, _, err := genesiswrite.GenesisToBlock(nil, cfg.Genesis, cfg.Dirs, logger)
+	if err != nil {
+		Fatalf("Failed to compute dev EL genesis hash: %v", err)
+	}
+	elGenesisHash := elGenesisBlock.Hash()
+	beaconState, _, err := devgenesis.BuildGenesisState(seed, validatorCount, &beaconCfg, genesisTime, elGenesisHash)
+	if err != nil {
+		Fatalf("Failed to build dev beacon genesis: %v", err)
+	}
+	// Write beacon config and genesis state to temp files.
+	tmpDir := filepath.Join(cfg.Dirs.DataDir, "dev-beacon")
+	if err := os.MkdirAll(tmpDir, 0755); err != nil {
+		Fatalf("Failed to create dev beacon dir: %v", err)
+	}
+	stateSSZ, err := beaconState.EncodeSSZ(nil)
+	if err != nil {
+		Fatalf("Failed to encode dev genesis state: %v", err)
+	}
+	genesisStatePath := filepath.Join(tmpDir, "genesis.ssz")
+	if err := os.WriteFile(genesisStatePath, stateSSZ, 0644); err != nil {
+		Fatalf("Failed to write dev genesis state: %v", err)
+	}
+
+	// Write beacon config YAML with all forks enabled from genesis.
+	// All known fork epochs are listed explicitly so that Caplin's
+	// CustomConfig (which falls back to minimal preset defaults for
+	// missing fields) activates every fork at epoch 0.
+	configPath := filepath.Join(tmpDir, "config.yaml")
+	configYAML := fmt.Sprintf(
+		"PRESET_BASE: minimal\n"+
+			"MIN_GENESIS_TIME: %d\n"+
+			"SECONDS_PER_SLOT: %d\n"+
+			"ALTAIR_FORK_EPOCH: 0\n"+
+			"BELLATRIX_FORK_EPOCH: 0\n"+
+			"CAPELLA_FORK_EPOCH: 0\n"+
+			"DENEB_FORK_EPOCH: 0\n"+
+			"ELECTRA_FORK_EPOCH: 0\n"+
+			"FULU_FORK_EPOCH: 0\n"+
+			"TERMINAL_TOTAL_DIFFICULTY: 0\n",
+		genesisTime, beaconCfg.SecondsPerSlot)
+	if err := os.WriteFile(configPath, []byte(configYAML), 0644); err != nil {
+		Fatalf("Failed to write dev beacon config: %v", err)
+	}
+
+	cfg.CaplinConfig.CustomConfigPath = configPath
+	cfg.CaplinConfig.CustomGenesisStatePath = genesisStatePath
 }
 
 // Convenience type for optional flag value representing a rate limit that should print nicely for
@@ -2088,16 +2283,11 @@ func boolFlagOpt(ctx *cli.Context, flag *cli.BoolFlag) g.Option[bool] {
 
 // SetDNSDiscoveryDefaults configures DNS discovery with the given URL if
 // no URLs are set.
-func SetDNSDiscoveryDefaults(cfg *ethconfig.Config, genesis common.Hash) {
+func SetDNSDiscoveryDefaults(cfg *ethconfig.Config, spec chainspec.Spec) {
 	if cfg.EthDiscoveryURLs != nil {
 		return // already set through flags/config
 	}
-	s, err := chainspec.ChainSpecByGenesisHash(genesis)
-	if err != nil {
-		log.Warn("Failed to set DNS discovery defaults", "genesis", genesis, "err", err)
-		return
-	}
-	if url := s.DNSNetwork; url != "" {
+	if url := spec.DNSNetwork; url != "" {
 		cfg.EthDiscoveryURLs = []string{url}
 	}
 }
@@ -2129,9 +2319,15 @@ func CobraFlags(cmd *cobra.Command, urfaveCliFlagsLists ...[]cli.Flag) {
 			case *cli.UintFlag:
 				flags.Uint(f.Name, f.Value, f.Usage)
 			case *cli.StringFlag:
-				flags.String(f.Name, f.Value, f.Usage)
+				flags.StringVar(&f.Value, f.Name, f.Value, f.Usage)
+			case *cli.StringSliceFlag:
+				var val []string
+				if f.Value != nil {
+					val = f.Value.Value()
+				}
+				flags.StringSlice(f.Name, val, f.Usage)
 			case *cli.BoolFlag:
-				flags.Bool(f.Name, false, f.Usage)
+				flags.Bool(f.Name, f.Value, f.Usage)
 			default:
 				panic(fmt.Errorf("unexpected type: %T", flag))
 			}

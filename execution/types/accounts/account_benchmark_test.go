@@ -37,9 +37,9 @@ func BenchmarkEncodingLengthForStorage(b *testing.B) {
 			name: "EmptyAccount",
 			acc: &Account{
 				Nonce:    0,
-				Balance:  *new(uint256.Int),
+				Balance:  uint256.Int{},
 				Root:     empty.RootHash, // extAccount doesn't have Root value
-				CodeHash: empty.CodeHash, // extAccount doesn't have CodeHash value
+				CodeHash: EmptyCodeHash,  // extAccount doesn't have CodeHash value
 			},
 		},
 
@@ -47,9 +47,9 @@ func BenchmarkEncodingLengthForStorage(b *testing.B) {
 			name: "AccountEncodeWithCode",
 			acc: &Account{
 				Nonce:    2,
-				Balance:  *new(uint256.Int).SetUint64(1000),
+				Balance:  *uint256.NewInt(1000),
 				Root:     common.HexToHash("0000000000000000000000000000000000000000000000000000000000000021"),
-				CodeHash: common.BytesToHash(crypto.Keccak256([]byte{1, 2, 3})),
+				CodeHash: InternCodeHash(common.BytesToHash(crypto.Keccak256([]byte{1, 2, 3}))),
 			},
 		},
 
@@ -57,9 +57,9 @@ func BenchmarkEncodingLengthForStorage(b *testing.B) {
 			name: "AccountEncodeWithCodeWithStorageSizeHack",
 			acc: &Account{
 				Nonce:    2,
-				Balance:  *new(uint256.Int).SetUint64(1000),
+				Balance:  *uint256.NewInt(1000),
 				Root:     common.HexToHash("0000000000000000000000000000000000000000000000000000000000000021"),
-				CodeHash: common.BytesToHash(crypto.Keccak256([]byte{1, 2, 3})),
+				CodeHash: InternCodeHash(common.BytesToHash(crypto.Keccak256([]byte{1, 2, 3}))),
 			},
 		},
 	}
@@ -67,15 +67,11 @@ func BenchmarkEncodingLengthForStorage(b *testing.B) {
 	b.ResetTimer()
 	for _, test := range accountCases {
 		b.Run(fmt.Sprint(test.name), func(b *testing.B) {
-			lengths := make([]uint, b.N)
-
-			for i := 0; i < b.N; i++ {
-				b.StartTimer()
-				lengths[i] = test.acc.EncodingLengthForStorage()
-				b.StopTimer()
+			var length uint
+			for b.Loop() {
+				length = test.acc.EncodingLengthForStorage()
 			}
-
-			fmt.Fprint(io.Discard, lengths)
+			fmt.Fprint(io.Discard, length)
 		})
 	}
 }
@@ -89,9 +85,9 @@ func BenchmarkEncodingLengthForHashing(b *testing.B) {
 			name: "EmptyAccount",
 			acc: &Account{
 				Nonce:    0,
-				Balance:  *new(uint256.Int),
+				Balance:  uint256.Int{},
 				Root:     empty.RootHash, // extAccount doesn't have Root value
-				CodeHash: empty.CodeHash, // extAccount doesn't have CodeHash value
+				CodeHash: EmptyCodeHash,  // extAccount doesn't have CodeHash value
 			},
 		},
 
@@ -99,9 +95,9 @@ func BenchmarkEncodingLengthForHashing(b *testing.B) {
 			name: "AccountEncodeWithCode",
 			acc: &Account{
 				Nonce:    2,
-				Balance:  *new(uint256.Int).SetUint64(1000),
+				Balance:  *uint256.NewInt(1000),
 				Root:     common.HexToHash("0000000000000000000000000000000000000000000000000000000000000021"),
-				CodeHash: common.BytesToHash(crypto.Keccak256([]byte{1, 2, 3})),
+				CodeHash: InternCodeHash(common.BytesToHash(crypto.Keccak256([]byte{1, 2, 3}))),
 			},
 		},
 
@@ -109,9 +105,9 @@ func BenchmarkEncodingLengthForHashing(b *testing.B) {
 			name: "AccountEncodeWithCodeWithStorageSizeHack",
 			acc: &Account{
 				Nonce:    2,
-				Balance:  *new(uint256.Int).SetUint64(1000),
+				Balance:  *uint256.NewInt(1000),
 				Root:     common.HexToHash("0000000000000000000000000000000000000000000000000000000000000021"),
-				CodeHash: common.BytesToHash(crypto.Keccak256([]byte{1, 2, 3})),
+				CodeHash: InternCodeHash(common.BytesToHash(crypto.Keccak256([]byte{1, 2, 3}))),
 			},
 		},
 	}
@@ -119,15 +115,11 @@ func BenchmarkEncodingLengthForHashing(b *testing.B) {
 	b.ResetTimer()
 	for _, test := range accountCases {
 		b.Run(fmt.Sprint(test.name), func(bn *testing.B) {
-			lengths := make([]uint, bn.N)
-
-			for i := 0; i < bn.N; i++ {
-				bn.StartTimer()
-				lengths[i] = test.acc.EncodingLengthForHashing()
-				bn.StopTimer()
+			var length uint
+			for bn.Loop() {
+				length = test.acc.EncodingLengthForHashing()
 			}
-
-			fmt.Fprint(io.Discard, lengths)
+			fmt.Fprint(io.Discard, length)
 		})
 
 	}
@@ -143,9 +135,9 @@ func BenchmarkEncodingAccountForStorage(b *testing.B) {
 			name: "EmptyAccount",
 			acc: &Account{
 				Nonce:    0,
-				Balance:  *new(uint256.Int),
+				Balance:  uint256.Int{},
 				Root:     empty.RootHash, // extAccount doesn't have Root value
-				CodeHash: empty.CodeHash, // extAccount doesn't have CodeHash value
+				CodeHash: EmptyCodeHash,  // extAccount doesn't have CodeHash value
 			},
 		},
 
@@ -153,9 +145,9 @@ func BenchmarkEncodingAccountForStorage(b *testing.B) {
 			name: "AccountEncodeWithCode",
 			acc: &Account{
 				Nonce:    2,
-				Balance:  *new(uint256.Int).SetUint64(1000),
+				Balance:  *uint256.NewInt(1000),
 				Root:     common.HexToHash("0000000000000000000000000000000000000000000000000000000000000021"),
-				CodeHash: common.BytesToHash(crypto.Keccak256([]byte{1, 2, 3})),
+				CodeHash: InternCodeHash(common.BytesToHash(crypto.Keccak256([]byte{1, 2, 3}))),
 			},
 		},
 
@@ -163,9 +155,9 @@ func BenchmarkEncodingAccountForStorage(b *testing.B) {
 			name: "AccountEncodeWithCodeWithStorageSizeHack",
 			acc: &Account{
 				Nonce:    2,
-				Balance:  *new(uint256.Int).SetUint64(1000),
+				Balance:  *uint256.NewInt(1000),
 				Root:     common.HexToHash("0000000000000000000000000000000000000000000000000000000000000021"),
-				CodeHash: common.BytesToHash(crypto.Keccak256([]byte{1, 2, 3})),
+				CodeHash: InternCodeHash(common.BytesToHash(crypto.Keccak256([]byte{1, 2, 3}))),
 			},
 		},
 	}
@@ -175,7 +167,7 @@ func BenchmarkEncodingAccountForStorage(b *testing.B) {
 
 		//buf := make([]byte, test.acc.EncodingLengthForStorage())
 		b.Run(fmt.Sprint(test.name), func(b *testing.B) {
-			for i := 0; i < b.N; i++ {
+			for b.Loop() {
 				SerialiseV3(test.acc)
 				//test.acc.EncodeForStorage(buf) performance has degraded a bit because we are not using the same buf now
 			}
@@ -198,9 +190,9 @@ func BenchmarkEncodingAccountForHashing(b *testing.B) {
 			name: "EmptyAccount",
 			acc: &Account{
 				Nonce:    0,
-				Balance:  *new(uint256.Int),
+				Balance:  uint256.Int{},
 				Root:     empty.RootHash, // extAccount doesn't have Root value
-				CodeHash: empty.CodeHash, // extAccount doesn't have CodeHash value
+				CodeHash: EmptyCodeHash,  // extAccount doesn't have CodeHash value
 			},
 		},
 
@@ -208,9 +200,9 @@ func BenchmarkEncodingAccountForHashing(b *testing.B) {
 			name: "AccountEncodeWithCode",
 			acc: &Account{
 				Nonce:    2,
-				Balance:  *new(uint256.Int).SetUint64(1000),
+				Balance:  *uint256.NewInt(1000),
 				Root:     common.HexToHash("0000000000000000000000000000000000000000000000000000000000000021"),
-				CodeHash: common.BytesToHash(crypto.Keccak256([]byte{1, 2, 3})),
+				CodeHash: InternCodeHash(common.BytesToHash(crypto.Keccak256([]byte{1, 2, 3}))),
 			},
 		},
 
@@ -218,18 +210,18 @@ func BenchmarkEncodingAccountForHashing(b *testing.B) {
 			name: "AccountEncodeWithCodeWithStorageSizeHack",
 			acc: &Account{
 				Nonce:    2,
-				Balance:  *new(uint256.Int).SetUint64(1000),
+				Balance:  *uint256.NewInt(1000),
 				Root:     common.HexToHash("0000000000000000000000000000000000000000000000000000000000000021"),
-				CodeHash: common.BytesToHash(crypto.Keccak256([]byte{1, 2, 3})),
+				CodeHash: InternCodeHash(common.BytesToHash(crypto.Keccak256([]byte{1, 2, 3}))),
 			},
 		},
 	}
 
 	b.ResetTimer()
 	for _, test := range accountCases {
-		buf := make([]byte, test.acc.EncodingLengthForStorage())
+		buf := make([]byte, test.acc.EncodingLengthForHashing())
 		b.Run(fmt.Sprint(test.name), func(b *testing.B) {
-			for i := 0; i < b.N; i++ {
+			for b.Loop() {
 				test.acc.EncodeForHashing(buf)
 			}
 		})
@@ -251,9 +243,9 @@ func BenchmarkDecodingAccount(b *testing.B) {
 			name: "EmptyAccount",
 			acc: &Account{
 				Nonce:    0,
-				Balance:  *new(uint256.Int),
+				Balance:  uint256.Int{},
 				Root:     empty.RootHash, // extAccount doesn't have Root value
-				CodeHash: empty.CodeHash, // extAccount doesn't have CodeHash value
+				CodeHash: EmptyCodeHash,  // extAccount doesn't have CodeHash value
 			},
 		},
 
@@ -261,9 +253,9 @@ func BenchmarkDecodingAccount(b *testing.B) {
 			name: "AccountEncodeWithCode",
 			acc: &Account{
 				Nonce:    2,
-				Balance:  *new(uint256.Int).SetUint64(1000),
+				Balance:  *uint256.NewInt(1000),
 				Root:     common.HexToHash("0000000000000000000000000000000000000000000000000000000000000021"),
-				CodeHash: common.BytesToHash(crypto.Keccak256([]byte{1, 2, 3})),
+				CodeHash: InternCodeHash(common.BytesToHash(crypto.Keccak256([]byte{1, 2, 3}))),
 			},
 		},
 
@@ -271,9 +263,9 @@ func BenchmarkDecodingAccount(b *testing.B) {
 			name: "AccountEncodeWithCodeWithStorageSizeHack",
 			acc: &Account{
 				Nonce:    2,
-				Balance:  *new(uint256.Int).SetUint64(1000),
+				Balance:  *uint256.NewInt(1000),
 				Root:     common.HexToHash("0000000000000000000000000000000000000000000000000000000000000021"),
-				CodeHash: common.BytesToHash(crypto.Keccak256([]byte{1, 2, 3})),
+				CodeHash: InternCodeHash(common.BytesToHash(crypto.Keccak256([]byte{1, 2, 3}))),
 			},
 		},
 	}
@@ -282,7 +274,7 @@ func BenchmarkDecodingAccount(b *testing.B) {
 	b.ResetTimer()
 	for _, test := range accountCases {
 		b.Run(fmt.Sprint(test.name), func(b *testing.B) {
-			for i := 0; i < b.N; i++ {
+			for i := 0; b.Loop(); i++ {
 				println(test.name, i, b.N) //TODO: it just stucks w/o that print
 				b.StopTimer()
 				test.acc.Nonce = uint64(i)
@@ -319,9 +311,9 @@ func BenchmarkDecodingIncarnation(b *testing.B) { // V2 version of bench was a p
 			name: "EmptyAccount",
 			acc: &Account{
 				Nonce:    0,
-				Balance:  *new(uint256.Int),
+				Balance:  uint256.Int{},
 				Root:     empty.RootHash, // extAccount doesn't have Root value
-				CodeHash: empty.CodeHash, // extAccount doesn't have CodeHash value
+				CodeHash: EmptyCodeHash,  // extAccount doesn't have CodeHash value
 			},
 		},
 
@@ -329,9 +321,9 @@ func BenchmarkDecodingIncarnation(b *testing.B) { // V2 version of bench was a p
 			name: "AccountEncodeWithCode",
 			acc: &Account{
 				Nonce:    2,
-				Balance:  *new(uint256.Int).SetUint64(1000),
+				Balance:  *uint256.NewInt(1000),
 				Root:     common.HexToHash("0000000000000000000000000000000000000000000000000000000000000021"),
-				CodeHash: common.BytesToHash(crypto.Keccak256([]byte{1, 2, 3})),
+				CodeHash: InternCodeHash(common.BytesToHash(crypto.Keccak256([]byte{1, 2, 3}))),
 			},
 		},
 
@@ -339,9 +331,9 @@ func BenchmarkDecodingIncarnation(b *testing.B) { // V2 version of bench was a p
 			name: "AccountEncodeWithCodeWithStorageSizeHack",
 			acc: &Account{
 				Nonce:    2,
-				Balance:  *new(uint256.Int).SetUint64(1000),
+				Balance:  *uint256.NewInt(1000),
 				Root:     common.HexToHash("0000000000000000000000000000000000000000000000000000000000000021"),
-				CodeHash: common.BytesToHash(crypto.Keccak256([]byte{1, 2, 3})),
+				CodeHash: InternCodeHash(common.BytesToHash(crypto.Keccak256([]byte{1, 2, 3}))),
 			},
 		},
 	}
@@ -350,7 +342,7 @@ func BenchmarkDecodingIncarnation(b *testing.B) { // V2 version of bench was a p
 	b.ResetTimer()
 	for _, test := range accountCases {
 		b.Run(fmt.Sprint(test.name), func(b *testing.B) {
-			for i := 0; i < b.N; i++ {
+			for i := 0; b.Loop(); i++ {
 				println(test.name, i, b.N) //TODO: it just stucks w/o that print
 				b.StopTimer()
 
@@ -389,9 +381,9 @@ func BenchmarkRLPEncodingAccount(b *testing.B) {
 			name: "EmptyAccount",
 			acc: &Account{
 				Nonce:    0,
-				Balance:  *new(uint256.Int),
+				Balance:  uint256.Int{},
 				Root:     empty.RootHash, // extAccount doesn't have Root value
-				CodeHash: empty.CodeHash, // extAccount doesn't have CodeHash value
+				CodeHash: EmptyCodeHash,  // extAccount doesn't have CodeHash value
 			},
 		},
 
@@ -399,9 +391,9 @@ func BenchmarkRLPEncodingAccount(b *testing.B) {
 			name: "AccountEncodeWithCode",
 			acc: &Account{
 				Nonce:    2,
-				Balance:  *new(uint256.Int).SetUint64(1000),
+				Balance:  *uint256.NewInt(1000),
 				Root:     common.HexToHash("0000000000000000000000000000000000000000000000000000000000000021"),
-				CodeHash: common.BytesToHash(crypto.Keccak256([]byte{1, 2, 3})),
+				CodeHash: InternCodeHash(common.BytesToHash(crypto.Keccak256([]byte{1, 2, 3}))),
 			},
 		},
 
@@ -409,9 +401,9 @@ func BenchmarkRLPEncodingAccount(b *testing.B) {
 			name: "AccountEncodeWithCodeWithStorageSizeHack",
 			acc: &Account{
 				Nonce:    2,
-				Balance:  *new(uint256.Int).SetUint64(1000),
+				Balance:  *uint256.NewInt(1000),
 				Root:     common.HexToHash("0000000000000000000000000000000000000000000000000000000000000021"),
-				CodeHash: common.BytesToHash(crypto.Keccak256([]byte{1, 2, 3})),
+				CodeHash: InternCodeHash(common.BytesToHash(crypto.Keccak256([]byte{1, 2, 3}))),
 			},
 		},
 	}
@@ -419,7 +411,7 @@ func BenchmarkRLPEncodingAccount(b *testing.B) {
 	b.ResetTimer()
 	for _, test := range accountCases {
 		b.Run(fmt.Sprint(test.name), func(b *testing.B) {
-			for i := 0; i < b.N; i++ {
+			for b.Loop() {
 				if err := test.acc.EncodeRLP(io.Discard); err != nil {
 					b.Fatal("cant encode the account", err, test)
 				}
@@ -431,9 +423,9 @@ func BenchmarkRLPEncodingAccount(b *testing.B) {
 func BenchmarkIsEmptyCodeHash(b *testing.B) {
 	acc := &Account{
 		Nonce:    0,
-		Balance:  *new(uint256.Int),
+		Balance:  uint256.Int{},
 		Root:     empty.RootHash, // extAccount doesn't have Root value
-		CodeHash: empty.CodeHash, // extAccount doesn't have CodeHash value
+		CodeHash: EmptyCodeHash,  // extAccount doesn't have CodeHash value
 	}
 
 	var isEmpty bool
@@ -449,9 +441,9 @@ func BenchmarkIsEmptyCodeHash(b *testing.B) {
 func BenchmarkIsEmptyRoot(b *testing.B) {
 	acc := &Account{
 		Nonce:    0,
-		Balance:  *new(uint256.Int),
+		Balance:  uint256.Int{},
 		Root:     empty.RootHash, // extAccount doesn't have Root value
-		CodeHash: empty.CodeHash, // extAccount doesn't have CodeHash value
+		CodeHash: EmptyCodeHash,  // extAccount doesn't have CodeHash value
 	}
 
 	var isEmpty bool

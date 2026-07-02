@@ -23,7 +23,7 @@ import (
 	"fmt"
 	"math/big"
 
-	"golang.org/x/crypto/sha3"
+	keccak "github.com/erigontech/fastkeccak"
 
 	"github.com/erigontech/erigon/common/hexutil"
 	"github.com/erigontech/erigon/common/length"
@@ -57,9 +57,6 @@ func IsHexAddress(s string) bool {
 	return len(s) == 2*length.Addr && hexutil.IsHex(s)
 }
 
-// Bytes gets the string representation of the underlying address.
-func (a Address) Bytes() []byte { return a[:] }
-
 // Hash converts an address to a hash by left-padding it with zeros.
 func (a Address) Hash() Hash { return BytesToHash(a[:]) }
 
@@ -77,7 +74,7 @@ func (a *Address) checksumHex() []byte {
 	buf := a.hex()
 
 	// compute checksum
-	sha := sha3.NewLegacyKeccak256()
+	sha := keccak.NewFastKeccak()
 	//nolint:errcheck
 	sha.Write(buf[2:])
 	hash := sha.Sum(nil)
@@ -144,7 +141,7 @@ func (a *Address) SetBytes(b []byte) {
 func (a Address) MarshalText() ([]byte, error) {
 	b := a[:]
 	result := make([]byte, len(b)*2+2)
-	copy(result, hexPrefix)
+	copy(result, hexutil.HexPrefix)
 	hex.Encode(result[2:], b)
 	return result, nil
 }
@@ -160,7 +157,7 @@ func (a *Address) UnmarshalJSON(input []byte) error {
 }
 
 // Scan implements Scanner for database/sql.
-func (a *Address) Scan(src interface{}) error {
+func (a *Address) Scan(src any) error {
 	srcB, ok := src.([]byte)
 	if !ok {
 		return fmt.Errorf("can't scan %T into Address", src)

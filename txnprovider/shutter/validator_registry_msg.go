@@ -39,10 +39,12 @@ type AggregateRegistrationMessage struct {
 }
 
 func (m *AggregateRegistrationMessage) Marshal() []byte {
-	b := make([]byte, 0)
+	// Fixed-size message: preallocate to avoid growth reallocations during appends.
+	expectedLength := 1 + 8 + 20 + 8 + 4 + 4 + 1
+	b := make([]byte, 0, expectedLength)
 	b = append(b, m.Version)
 	b = binary.BigEndian.AppendUint64(b, m.ChainId)
-	b = append(b, m.ValidatorRegistryAddress.Bytes()...)
+	b = append(b, m.ValidatorRegistryAddress[:]...)
 	b = binary.BigEndian.AppendUint64(b, m.ValidatorIndex)
 	b = binary.BigEndian.AppendUint32(b, m.Count)
 	b = binary.BigEndian.AppendUint32(b, m.Nonce)
@@ -98,10 +100,12 @@ type LegacyRegistrationMessage struct {
 }
 
 func (m *LegacyRegistrationMessage) Marshal() []byte {
-	b := make([]byte, 0)
+	// Fixed-size message: preallocate to avoid growth reallocations during appends.
+	expectedLength := 1 + 8 + 20 + 8 + 8 + 1
+	b := make([]byte, 0, expectedLength)
 	b = append(b, m.Version)
 	b = binary.BigEndian.AppendUint64(b, m.ChainId)
-	b = append(b, m.ValidatorRegistryAddress.Bytes()...)
+	b = append(b, m.ValidatorRegistryAddress[:]...)
 	b = binary.BigEndian.AppendUint64(b, m.ValidatorIndex)
 	b = binary.BigEndian.AppendUint64(b, m.Nonce)
 	if m.IsRegistration {

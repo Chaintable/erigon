@@ -27,7 +27,7 @@ import (
 
 type packUnpackTest struct {
 	def      string
-	unpacked interface{}
+	unpacked any
 	packed   string
 }
 
@@ -71,7 +71,7 @@ var packUnpackTests = []packUnpackTest{
 			"0000000000000000000000000000000000000000000000000000000000000002",
 	},
 	{
-		def:      `[{"type": "uint17"}]`,
+		def:      `[{"type": "uint72"}]`,
 		packed:   "0000000000000000000000000000000000000000000000000000000000000001",
 		unpacked: big.NewInt(1),
 	},
@@ -141,7 +141,7 @@ var packUnpackTests = []packUnpackTest{
 			"0000000000000000000000000000000000000000000000000000000000000002",
 	},
 	{
-		def:      `[{"type": "int17"}]`,
+		def:      `[{"type": "int72"}]`,
 		packed:   "0000000000000000000000000000000000000000000000000000000000000001",
 		unpacked: big.NewInt(1),
 	},

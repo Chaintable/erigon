@@ -25,7 +25,6 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/ecdsa"
-	"crypto/elliptic"
 	"crypto/hmac"
 	"crypto/rand"
 	"encoding/binary"
@@ -35,10 +34,11 @@ import (
 	"io"
 	mrand "math/rand"
 	"net"
+	"slices"
 	"time"
 
+	keccak "github.com/erigontech/fastkeccak"
 	"github.com/golang/snappy"
-	"golang.org/x/crypto/sha3"
 
 	"github.com/erigontech/erigon/common/crypto"
 	"github.com/erigontech/erigon/common/crypto/ecies"
@@ -157,7 +157,7 @@ func (c *Conn) Read() (code uint64, data []byte, wireSize int, err error) {
 		if actualSize > maxUint24 {
 			return code, nil, 0, errPlainMessageTooLarge
 		}
-		c.snappyReadBuffer = growslice(c.snappyReadBuffer, actualSize)
+		c.snappyReadBuffer = slices.Grow(c.snappyReadBuffer[:0], actualSize)[:actualSize]
 		data, err = snappy.Decode(c.snappyReadBuffer, data)
 	}
 	return code, data, wireSize, err
@@ -223,7 +223,8 @@ func (c *Conn) Write(code uint64, data []byte) (uint32, error) {
 		// Ensure the buffer has sufficient size.
 		// Package snappy will allocate its own buffer if the provided
 		// one is smaller than MaxEncodedLen.
-		c.snappyWriteBuffer = growslice(c.snappyWriteBuffer, snappy.MaxEncodedLen(len(data)))
+		snappyBound := snappy.MaxEncodedLen(len(data))
+		c.snappyWriteBuffer = slices.Grow(c.snappyWriteBuffer[:0], snappyBound)[:snappyBound]
 		data = snappy.Encode(c.snappyWriteBuffer, data)
 	}
 
@@ -236,7 +237,7 @@ func (h *sessionState) writeFrame(conn io.Writer, code uint64, data []byte) erro
 	h.wbuf.reset()
 
 	// Write header.
-	fsize := rlp.IntSize(code) + len(data)
+	fsize := rlp.U64Len(code) + len(data)
 	if fsize > maxUint24 {
 		return errPlainMessageTooLarge
 	}
@@ -490,10 +491,10 @@ func (h *handshakeState) secrets(auth, authResp []byte) (Secrets, error) {
 	}
 
 	// setup sha3 instances for the MACs
-	mac1 := sha3.NewLegacyKeccak256()
+	mac1 := keccak.NewFastKeccak()
 	mac1.Write(xor(s.MAC, h.respNonce))
 	mac1.Write(auth)
-	mac2 := sha3.NewLegacyKeccak256()
+	mac2 := keccak.NewFastKeccak()
 	mac2.Write(xor(s.MAC, h.initNonce))
 	mac2.Write(authResp)
 	if h.initiator {
@@ -598,7 +599,7 @@ func (h *handshakeState) makeAuthResp() (msg *authRespV4, err error) {
 }
 
 // readMsg reads an encrypted handshake message, decoding it into msg.
-func (h *handshakeState) readMsg(msg interface{}, prv *ecdsa.PrivateKey, r io.Reader) ([]byte, error) {
+func (h *handshakeState) readMsg(msg any, prv *ecdsa.PrivateKey, r io.Reader) ([]byte, error) {
 	h.rbuf.reset()
 	h.rbuf.grow(512)
 
@@ -626,7 +627,7 @@ func (h *handshakeState) readMsg(msg interface{}, prv *ecdsa.PrivateKey, r io.Re
 }
 
 // sealEIP8 encrypts a handshake message.
-func (h *handshakeState) sealEIP8(msg interface{}) ([]byte, error) {
+func (h *handshakeState) sealEIP8(msg any) ([]byte, error) {
 	h.wbuf.reset()
 
 	// Write the message plaintext.
@@ -637,7 +638,7 @@ func (h *handshakeState) sealEIP8(msg interface{}) ([]byte, error) {
 	// the message distinguishable from pre-EIP-8 handshakes.
 	h.wbuf.appendZero(mrand.Intn(100) + 100) //nolint:gosec
 
-	prefix := make([]byte, 2)
+	prefix := make([]byte, 2) //nolint:prealloc
 	binary.BigEndian.PutUint16(prefix, uint16(len(h.wbuf.data)+eciesOverhead))
 
 	enc, err := ecies.Encrypt(rand.Reader, h.remote, h.wbuf.data, nil, prefix)
@@ -666,7 +667,10 @@ func exportPubkey(pub *ecies.PublicKey) []byte {
 	if pub == nil {
 		panic("nil pubkey")
 	}
-	return elliptic.Marshal(pub.Curve, pub.X, pub.Y)[1:]
+	if curve, ok := pub.Curve.(crypto.EllipticCurve); ok {
+		return curve.Marshal(pub.X, pub.Y)[1:]
+	}
+	return []byte{}
 }
 
 func xor(one, other []byte) (xor []byte) {

@@ -2,9 +2,7 @@ package test
 
 import (
 	"bytes"
-	"context"
 	"fmt"
-	"math/big"
 	"testing"
 
 	"github.com/c2h5oh/datasize"
@@ -21,6 +19,7 @@ import (
 	"github.com/erigontech/erigon/db/snaptype2"
 	"github.com/erigontech/erigon/db/state"
 	"github.com/erigontech/erigon/db/state/statecfg"
+	"github.com/erigontech/erigon/db/version"
 	"github.com/erigontech/erigon/execution/types"
 )
 
@@ -32,12 +31,13 @@ type UnmarkedTxI = state.UnmarkedTxI
 
 func registerEntity(dirs datadir.Dirs, name string, id ForkableId) *state.SnapshotConfig {
 	stepSize := uint64(10)
+	ver := version.V1_0_standart
 	snapCfg := state.NewSnapshotConfig(&state.SnapshotCreationConfig{
 		RootNumPerStep: 10,
 		MergeStages:    []uint64{20, 40},
 		MinimumSize:    10,
 		SafetyMargin:   5,
-	}, state.NewE2SnapSchemaWithStep(dirs, name, []string{name}, stepSize))
+	}, state.NewE2SnapSchemaWithStep(dirs, name, []string{name}, stepSize, state.NewE2SnapSchemaVersion(ver, ver)))
 	registerEntityWithSnapshotConfig(dirs, name, id, snapCfg)
 	return snapCfg
 }
@@ -51,6 +51,7 @@ func setup(tb testing.TB) (datadir.Dirs, kv.RwDB, log.Logger) {
 	logger := log.New()
 	dirs := datadir.New(tb.TempDir())
 	db := mdbx.New(dbcfg.ChainDB, logger).InMem(tb, dirs.Chaindata).GrowthStep(32 * datasize.MB).MapSize(2 * datasize.GB).MustOpen()
+	tb.Cleanup(db.Close)
 	return dirs, db, logger
 }
 
@@ -104,12 +105,13 @@ func TestMarked_PutToDb(t *testing.T) {
 
 	ma_tx := ma.BeginTemporalTx()
 	defer ma_tx.Close()
-	rwtx, err := db.BeginRw(context.Background())
-	defer rwtx.Rollback()
+	rwtx, err := db.BeginRw(t.Context())
 	require.NoError(t, err)
+	defer rwtx.Rollback()
 
 	num := Num(1)
-	hash := common.HexToHash("0x1234").Bytes()
+	hashVal := common.HexToHash("0x1234")
+	hash := hashVal[:]
 	value := []byte{1, 2, 3, 4, 5}
 
 	err = ma_tx.Put(num, hash, value, rwtx)
@@ -138,7 +140,7 @@ func TestPrune(t *testing.T) {
 			dir, db, log := setup(t)
 			headerId, ma := setupHeader(t, log, dir, db)
 
-			ctx := context.Background()
+			ctx := t.Context()
 			cfg := state.Registry.SnapshotConfig(headerId)
 			extras_count := uint64(5) // in db
 			entries_count = cfg.MinimumSize + cfg.SafetyMargin + extras_count
@@ -146,21 +148,22 @@ func TestPrune(t *testing.T) {
 			ma_tx := ma.BeginTemporalTx()
 			defer ma_tx.Close()
 			rwtx, err := db.BeginRw(ctx)
-			defer rwtx.Rollback()
 			require.NoError(t, err)
+			defer rwtx.Rollback()
 
 			buffer := &bytes.Buffer{}
 
 			getData := func(i int) (num Num, hash []byte, value []byte) {
 				header := &types.Header{
-					Number: big.NewInt(int64(i)),
-					Extra:  []byte("test header"),
+					Extra: []byte("test header"),
 				}
+				header.Number.SetUint64(uint64(i))
 				buffer.Reset()
 				err = header.EncodeRLP(buffer)
 				require.NoError(t, err)
 
-				return Num(i), header.Hash().Bytes(), buffer.Bytes()
+				headerHash := header.Hash()
+				return Num(i), headerHash[:], buffer.Bytes()
 			}
 
 			for i := range int(entries_count) {
@@ -192,8 +195,8 @@ func TestPrune(t *testing.T) {
 			defer ma_tx.Close()
 
 			rwtx, err = db.BeginRw(ctx)
-			defer rwtx.Rollback()
 			require.NoError(t, err)
+			defer rwtx.Rollback()
 
 			stat, err := ma_tx.Prune(ctx, pruneTo, 1000, nil, rwtx)
 			require.NoError(t, err)
@@ -229,27 +232,28 @@ func TestBuildFiles_Marked(t *testing.T) {
 	// then unwind and check get
 	dir, db, log := setup(t)
 	headerId, ma := setupHeader(t, log, dir, db)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	ma_tx := ma.BeginTemporalTx()
 	defer ma_tx.Close()
 	rwtx, err := db.BeginRw(ctx)
-	defer rwtx.Rollback()
 	require.NoError(t, err)
+	defer rwtx.Rollback()
 	cfg := state.Registry.SnapshotConfig(headerId)
 	entries_count := cfg.MinimumSize + cfg.SafetyMargin + /** in db **/ 2
 	buffer := &bytes.Buffer{}
 
 	getData := func(i int) (num Num, hash []byte, value []byte) {
 		header := &types.Header{
-			Number: big.NewInt(int64(i)),
-			Extra:  []byte("test header"),
+			Extra: []byte("test header"),
 		}
+		header.Number.SetUint64(uint64(i))
 		buffer.Reset()
 		err = header.EncodeRLP(buffer)
 		require.NoError(t, err)
 
-		return Num(i), header.Hash().Bytes(), buffer.Bytes()
+		headerHash := header.Hash()
+		return Num(i), headerHash[:], buffer.Bytes()
 	}
 
 	for i := range int(entries_count) {
@@ -283,8 +287,8 @@ func TestBuildFiles_Marked(t *testing.T) {
 	defer ma_tx.Close()
 
 	rwtx, err = db.BeginRw(ctx)
-	defer rwtx.Rollback()
 	require.NoError(t, err)
+	defer rwtx.Rollback()
 
 	firstRootNumNotInSnap := ma_tx.DebugFiles().VisibleFilesMaxRootNum()
 	stat, err := ma_tx.Prune(ctx, firstRootNumNotInSnap, 1000, nil, rwtx)

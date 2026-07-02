@@ -30,6 +30,7 @@ import (
 	"github.com/erigontech/erigon/execution/tracing"
 	"github.com/erigontech/erigon/execution/tracing/tracers"
 	"github.com/erigontech/erigon/execution/types"
+	"github.com/erigontech/erigon/execution/types/accounts"
 	"github.com/erigontech/erigon/execution/vm"
 )
 
@@ -70,22 +71,22 @@ func (t *Tracer) Hooks() *tracing.Hooks {
 		OnFault:     t.OnFault,
 		OnGasChange: t.OnGasChange,
 		// Chain events
-		OnBlockchainInit:  t.OnBlockchainInit,
-		OnBlockStart:      t.OnBlockStart,
-		OnBlockEnd:        t.OnBlockEnd,
-		OnGenesisBlock:    t.OnGenesisBlock,
-		OnSystemCallStart: t.OnSystemCallStart,
-		OnSystemCallEnd:   t.OnSystemCallEnd,
+		OnBlockchainInit:    t.OnBlockchainInit,
+		OnBlockStart:        t.OnBlockStart,
+		OnBlockEnd:          t.OnBlockEnd,
+		OnGenesisBlock:      t.OnGenesisBlock,
+		OnSystemCallStartV2: t.OnSystemCallStartV2,
+		OnSystemCallEnd:     t.OnSystemCallEnd,
 		// State events
 		OnBalanceChange: t.OnBalanceChange,
-		OnNonceChange:   t.OnNonceChange,
-		OnCodeChange:    t.OnCodeChange,
+		OnNonceChangeV2: t.OnNonceChangeV2,
+		OnCodeChangeV2:  t.OnCodeChangeV2,
 		OnStorageChange: t.OnStorageChange,
 		OnLog:           t.OnLog,
 	}
 }
 
-func (t *Tracer) OnTxStart(vm *tracing.VMContext, txn types.Transaction, from common.Address) {
+func (t *Tracer) OnTxStart(vm *tracing.VMContext, txn types.Transaction, from accounts.Address) {
 	if t.recordOptions.DisableOnTxStartRecording {
 		return
 	}
@@ -98,7 +99,7 @@ func (t *Tracer) OnTxStart(vm *tracing.VMContext, txn types.Transaction, from co
 		OnTxStart: &OnTxStartTrace{
 			VMContext:   vm,
 			Transaction: txn,
-			From:        from,
+			From:        from.Value(),
 		},
 	})
 }
@@ -132,7 +133,7 @@ func (t *Tracer) OnTxEnd(receipt *types.Receipt, err error) {
 	t.mustFlushToFile(path.Join(t.outputDir, txnTraceFile))
 }
 
-func (t *Tracer) OnEnter(depth int, typ byte, from, to common.Address, precompile bool, input []byte, gas uint64, value uint256.Int, code []byte) {
+func (t *Tracer) OnEnter(depth int, typ byte, from, to accounts.Address, precompile bool, input []byte, gas uint64, value uint256.Int, code []byte) {
 	if t.recordOptions.DisableOnEnterRecording {
 		return
 	}
@@ -147,8 +148,8 @@ func (t *Tracer) OnEnter(depth int, typ byte, from, to common.Address, precompil
 		OnEnter: &OnEnterTrace{
 			Depth:      depth,
 			Type:       typ,
-			From:       from,
-			To:         to,
+			From:       from.Value(),
+			To:         to.Value(),
 			Precompile: precompile,
 			Input:      inputCopy,
 			Gas:        gas,
@@ -219,7 +220,7 @@ func (t *Tracer) OnOpcode(pc uint64, op byte, gas, cost uint64, opContext tracin
 			Op:         fmt.Sprintf("%v", vm.OpCode(op)),
 			Gas:        gas,
 			Cost:       cost,
-			Caller:     opContext.Caller(),
+			Caller:     opContext.Caller().Value(),
 			Stack:      stack,
 			Memory:     memory,
 			MemorySize: len(memory),
@@ -266,7 +267,7 @@ func (t *Tracer) OnFault(pc uint64, op byte, gas, cost uint64, opContext tracing
 			Op:         op,
 			Gas:        gas,
 			Cost:       cost,
-			Caller:     opContext.Caller(),
+			Caller:     opContext.Caller().Value(),
 			Stack:      stack,
 			Memory:     memory,
 			MemorySize: len(memory),
@@ -372,13 +373,17 @@ func (t *Tracer) OnGenesisBlock(genesis *types.Block, alloc types.GenesisAlloc) 
 	})
 }
 
-func (t *Tracer) OnSystemCallStart() {
+func (t *Tracer) OnSystemCallStartV2(vm *tracing.VMContext) {
 	if t.recordOptions.DisableOnSystemCallStartRecording {
 		return
 	}
 
-	if t.wrapped != nil && t.wrapped.OnSystemCallStart != nil {
-		t.wrapped.OnSystemCallStart()
+	if t.wrapped != nil {
+		if t.wrapped.OnSystemCallStartV2 != nil {
+			t.wrapped.OnSystemCallStartV2(vm)
+		} else if t.wrapped.OnSystemCallStart != nil {
+			t.wrapped.OnSystemCallStart()
+		}
 	}
 
 	t.traces.Append(Trace{
@@ -400,7 +405,7 @@ func (t *Tracer) OnSystemCallEnd() {
 	})
 }
 
-func (t *Tracer) OnBalanceChange(address common.Address, oldBalance, newBalance uint256.Int, reason tracing.BalanceChangeReason) {
+func (t *Tracer) OnBalanceChange(address accounts.Address, oldBalance, newBalance uint256.Int, reason tracing.BalanceChangeReason) {
 	if t.recordOptions.DisableOnBalanceChangeRecording {
 		return
 	}
@@ -411,7 +416,7 @@ func (t *Tracer) OnBalanceChange(address common.Address, oldBalance, newBalance 
 
 	t.traces.Append(Trace{
 		OnBalanceChange: &OnBalanceChangeTrace{
-			Address:    address,
+			Address:    address.Value(),
 			OldBalance: oldBalance,
 			NewBalance: newBalance,
 			Reason:     fmt.Sprintf("%v", reason),
@@ -419,45 +424,55 @@ func (t *Tracer) OnBalanceChange(address common.Address, oldBalance, newBalance 
 	})
 }
 
-func (t *Tracer) OnNonceChange(address common.Address, oldNonce, newNonce uint64) {
+func (t *Tracer) OnNonceChangeV2(address accounts.Address, oldNonce, newNonce uint64, reason tracing.NonceChangeReason) {
 	if t.recordOptions.DisableOnNonceChangeRecording {
 		return
 	}
 
-	if t.wrapped != nil && t.wrapped.OnNonceChange != nil {
-		t.wrapped.OnNonceChange(address, oldNonce, newNonce)
+	if t.wrapped != nil {
+		if t.wrapped.OnNonceChangeV2 != nil {
+			t.wrapped.OnNonceChangeV2(address, oldNonce, newNonce, reason)
+		} else if t.wrapped.OnNonceChange != nil {
+			t.wrapped.OnNonceChange(address, oldNonce, newNonce)
+		}
 	}
 
 	t.traces.Append(Trace{
 		OnNonceChange: &OnNonceChangeTrace{
-			Address:  address,
+			Address:  address.Value(),
 			OldNonce: oldNonce,
 			NewNonce: newNonce,
+			Reason:   fmt.Sprintf("%v", reason),
 		},
 	})
 }
 
-func (t *Tracer) OnCodeChange(address common.Address, prevCodeHash common.Hash, prevCode []byte, newCodeHash common.Hash, newCode []byte) {
+func (t *Tracer) OnCodeChangeV2(address accounts.Address, prevCodeHash accounts.CodeHash, prevCode []byte, newCodeHash accounts.CodeHash, newCode []byte, reason tracing.CodeChangeReason) {
 	if t.recordOptions.DisableOnCodeChangeRecording {
 		return
 	}
 
-	if t.wrapped != nil && t.wrapped.OnCodeChange != nil {
-		t.wrapped.OnCodeChange(address, prevCodeHash, prevCode, newCodeHash, newCode)
+	if t.wrapped != nil {
+		if t.wrapped.OnCodeChangeV2 != nil {
+			t.wrapped.OnCodeChangeV2(address, prevCodeHash, prevCode, newCodeHash, newCode, reason)
+		} else if t.wrapped.OnCodeChange != nil {
+			t.wrapped.OnCodeChange(address, prevCodeHash, prevCode, newCodeHash, newCode)
+		}
 	}
 
 	t.traces.Append(Trace{
 		OnCodeChange: &OnCodeChangeTrace{
-			Address:      address,
-			PrevCodeHash: prevCodeHash,
+			Address:      address.Value(),
+			PrevCodeHash: prevCodeHash.Value(),
 			PrevCode:     prevCode,
-			NewCodeHash:  newCodeHash,
+			NewCodeHash:  newCodeHash.Value(),
 			NewCode:      newCode,
+			Reason:       fmt.Sprintf("%v", reason),
 		},
 	})
 }
 
-func (t *Tracer) OnStorageChange(address common.Address, slot common.Hash, prev, new uint256.Int) {
+func (t *Tracer) OnStorageChange(address accounts.Address, slot accounts.StorageKey, prev, new uint256.Int) {
 	if t.recordOptions.DisableOnStorageChangeRecording {
 		return
 	}
@@ -468,8 +483,8 @@ func (t *Tracer) OnStorageChange(address common.Address, slot common.Hash, prev,
 
 	t.traces.Append(Trace{
 		OnStorageChange: &OnStorageChangeTrace{
-			Address: address,
-			Slot:    slot,
+			Address: address.Value(),
+			Slot:    slot.Value(),
 			Prev:    prev,
 			New:     new,
 		},
@@ -717,6 +732,7 @@ type OnNonceChangeTrace struct {
 	Address  common.Address `json:"address,omitempty"`
 	OldNonce uint64         `json:"oldNonce,omitempty"`
 	NewNonce uint64         `json:"newNonce,omitempty"`
+	Reason   string         `json:"reason,omitempty"`
 }
 
 type OnCodeChangeTrace struct {
@@ -725,6 +741,7 @@ type OnCodeChangeTrace struct {
 	PrevCode     hexutil.Bytes  `json:"prevCode,omitempty"`
 	NewCodeHash  common.Hash    `json:"newCodeHash,omitempty"`
 	NewCode      hexutil.Bytes  `json:"newCode,omitempty"`
+	Reason       string         `json:"reason,omitempty"`
 }
 
 type OnStorageChangeTrace struct {

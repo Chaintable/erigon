@@ -22,10 +22,21 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestGraphQLQueryBlock(t *testing.T) {
-	t.Skip("Not a unit test")
+	// Probe the GraphQL endpoint itself (not just the TCP port) so the test skips
+	// cleanly unless a rpcdaemon with GraphQL enabled is actually answering.
+	const endpoint = "http://localhost:8545/graphql"
+	probe, err := (&http.Client{Timeout: time.Second}).Post(endpoint, "application/json", strings.NewReader(`{"query":"{chainID}","variables":null}`))
+	if err != nil {
+		t.Skipf("requires a running rpcdaemon with GraphQL at %s: %v", endpoint, err)
+	}
+	_ = probe.Body.Close()
+	if probe.StatusCode != http.StatusOK {
+		t.Skipf("GraphQL at %s not available (status %d)", endpoint, probe.StatusCode)
+	}
 
 	for i, tt := range []struct {
 		body string
@@ -139,9 +150,8 @@ func TestGraphQLQueryBlock(t *testing.T) {
 		if err != nil {
 			t.Fatalf("could not post: %v", err)
 		}
-		defer resp.Body.Close()
-
 		bodyBytes, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
 		if err != nil {
 			t.Fatalf("could not read from response body: %v", err)
 		}

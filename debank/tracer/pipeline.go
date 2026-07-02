@@ -16,9 +16,10 @@ import (
 )
 
 func BuildPipelineBlock(rawBlock *types.Block) dtypes.Block {
+	number := rawBlock.Number()
 	block := dtypes.Block{
 		ID:                    rawBlock.Hash().Hex(),
-		Height:                rawBlock.Number(),
+		Height:                number.ToBig(),
 		ParentID:              rawBlock.ParentHash().Hex(),
 		BaseFeePerGas:         big.NewInt(0),
 		Miner:                 strings.ToLower(rawBlock.Coinbase().Hex()),
@@ -28,7 +29,7 @@ func BuildPipelineBlock(rawBlock *types.Block) dtypes.Block {
 		ProcessStartTimestamp: time.Now().UnixMilli(),
 	}
 	if rawBlock.Header().BaseFee != nil {
-		block.BaseFeePerGas = rawBlock.Header().BaseFee
+		block.BaseFeePerGas = rawBlock.Header().BaseFee.ToBig()
 	}
 	return block
 }
@@ -51,8 +52,10 @@ func BuildPipelineWithdrawals(rawBlock *types.Block) []dtypes.SpecialTransfer {
 }
 
 func BuildPilelineBlockHeader(block *types.Block) *dtypes.Header {
+	number := block.Number()
+	difficulty := block.Difficulty()
 	blockHeader := dtypes.Header{
-		Number:           (*hexutil.Big)(block.Number()),
+		Number:           (*hexutil.Big)(number.ToBig()),
 		Hash:             block.Hash(),
 		ParentHash:       block.ParentHash(),
 		Nonce:            block.Nonce(),
@@ -61,7 +64,7 @@ func BuildPilelineBlockHeader(block *types.Block) *dtypes.Header {
 		LogsBloom:        block.Bloom(),
 		StateRoot:        block.Root(),
 		Miner:            block.Coinbase(),
-		Difficulty:       (*hexutil.Big)(block.Difficulty()),
+		Difficulty:       (*hexutil.Big)(difficulty.ToBig()),
 		ExtraData:        hexutil.Bytes(block.Extra()),
 		GasLimit:         hexutil.Uint64(block.GasLimit()),
 		GasUsed:          hexutil.Uint64(block.GasUsed()),
@@ -70,7 +73,7 @@ func BuildPilelineBlockHeader(block *types.Block) *dtypes.Header {
 		ReceiptsRoot:     block.ReceiptHash(),
 	}
 	if block.Header().BaseFee != nil {
-		blockHeader.BaseFeePerGas = (*hexutil.Big)(block.Header().BaseFee)
+		blockHeader.BaseFeePerGas = (*hexutil.Big)(block.Header().BaseFee.ToBig())
 	}
 	if block.Header().WithdrawalsHash != nil {
 		blockHeader.WithdrawalsRoot = block.Header().WithdrawalsHash
@@ -98,9 +101,9 @@ func BuildPipelineTransaction(tx types.Transaction, receipt *types.Receipt, from
 	gasPrice := big.NewInt(0)
 	if !chainConfig.IsLondon(header.Number.Uint64()) {
 		gasPrice = tx.GetFeeCap().ToBig()
-	} else {
-		baseFee, _ := uint256.FromBig(header.BaseFee)
-		gasPrice = new(big.Int).Add(header.BaseFee, tx.GetEffectiveGasTip(baseFee).ToBig())
+	} else if header.BaseFee != nil {
+		effectiveTip := tx.GetEffectiveGasTip(header.BaseFee)
+		gasPrice = new(uint256.Int).Add(header.BaseFee, &effectiveTip).ToBig()
 	}
 	if gasPrice.Cmp(big.NewInt(0)) == 0 {
 		gasPrice = tx.GetFeeCap().ToBig()

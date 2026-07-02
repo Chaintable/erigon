@@ -127,6 +127,9 @@ func EnvDuration(envVarName string, defaultVal time.Duration) time.Duration {
 	return defaultVal
 }
 
+var TrieTraceFile = EnvString("TRIE_TRACE_FILE", "")
+var TrieTraceBlock = EnvUint("TRIE_TRACE_BLOCK", 0)
+
 func MustParseInt(strNum string) int64 {
 	cleanNum := strings.ReplaceAll(strNum, "_", "")
 	parsed, err := strconv.ParseInt(cleanNum, 10, 64)
@@ -161,7 +164,7 @@ func MustParseUints(strNum, separator string) []uint64 {
 	}
 	parts := strings.Split(strNum, separator)
 	ints := make([]uint64, 0, len(parts))
-	for _, str := range strings.Split(strNum, separator) {
+	for str := range strings.SplitSeq(strNum, separator) {
 		ints = append(ints, MustParseUint(str))
 	}
 	return ints

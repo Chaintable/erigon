@@ -20,6 +20,7 @@ import (
 	"bytes"
 	"encoding/hex"
 	"fmt"
+	"unsafe"
 )
 
 func ByteCount(b uint64) string {
@@ -27,34 +28,17 @@ func ByteCount(b uint64) string {
 	if b < unit {
 		return fmt.Sprintf("%dB", b)
 	}
-	bGb, exp := MBToGB(b)
-	return fmt.Sprintf("%.1f%cB", bGb, "KMGTPE"[exp])
-}
-
-func MBToGB(b uint64) (float64, int) {
-	const unit = 1024
-	if b < unit {
-		return float64(b), 0
-	}
 
 	div, exp := uint64(unit), 0
 	for n := b / unit; n >= unit; n /= unit {
 		div *= unit
 		exp++
 	}
+	return fmt.Sprintf("%.1f%cB", float64(b)/float64(div), "KMGTPE"[exp])
 
-	return float64(b) / float64(div), exp
 }
 
 var Copy = bytes.Clone
-
-func Append(data ...[]byte) []byte {
-	s := new(bytes.Buffer)
-	for _, d := range data {
-		s.Write(d)
-	}
-	return s.Bytes()
-}
 
 func EnsureEnoughSize(in []byte, size int) []byte {
 	if cap(in) < size {
@@ -96,8 +80,8 @@ func isHex(str string) bool {
 	if len(str)%2 != 0 {
 		return false
 	}
-	for _, c := range []byte(str) {
-		if !isHexCharacter(c) {
+	for i := 0; i < len(str); i++ {
+		if !isHexCharacter(str[i]) {
 			return false
 		}
 	}
@@ -154,6 +138,19 @@ func TrimRightZeroes(s []byte) []byte {
 	}
 	return s[:idx]
 }
+
+// ToStringZeroCopy converts a byte slice to a string without copying.
+// The caller must ensure the byte slice is not modified after the conversion.
+func ToStringZeroCopy(v []byte) string {
+	if len(v) == 0 {
+		return ""
+	}
+	return unsafe.String(&v[0], len(v))
+}
+
+// ToBytesZeroCopy converts a string to a byte slice without copying.
+// The returned slice must not be modified.
+func ToBytesZeroCopy(s string) []byte { return unsafe.Slice(unsafe.StringData(s), len(s)) }
 
 func KeyCmp(key1, key2 []byte) (int, bool) {
 	switch {

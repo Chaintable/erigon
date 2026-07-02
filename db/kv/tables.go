@@ -61,6 +61,8 @@ const (
 	HeaderTD        = "HeadersTotalDifficulty" // block_num_u64 + hash -> td (RLP)
 
 	BlockBody = "BlockBody" // block_num_u64 + hash -> block body
+	// BlockAccessList stores RLP-encoded block access lists, keyed by block_num_u64 + hash.
+	BlockAccessList = "BlockAccessList"
 
 	// Naming:
 	//  TxNum - Ethereum canonical transaction number - same across all nodes.
@@ -86,9 +88,6 @@ const (
 
 	// Progress of sync stages: stageName -> stageData
 	SyncStageProgress = "SyncStage"
-
-	CliqueSeparate     = "CliqueSeparate"
-	CliqueLastSnapshot = "CliqueLastSnapshot"
 
 	// Node database tables (see nodedb.go)
 
@@ -187,6 +186,8 @@ const (
 	// corresponding history tables `Tbl{Account,Storage,Code,Commitment}HistoryKeys` for history
 	// and `Tbl{Account,Storage,Code,Commitment}Idx` for inverted indices
 	TblPruningProgress = "PruningProgress"
+	// tableName -> txTo;last pruned val
+	TblPruningValsProg = "PruningValsProgress"
 
 	// Erigon-CL Objects
 
@@ -259,6 +260,19 @@ const (
 	PendingConsolidations         = "PendingConsolidations"         // slot => queue_diffs
 	// End Electra
 
+	// GLOAS (EIP-7732)
+	BuildersDump                      = "BuildersDump"                   // slot => dump
+	Builders                          = "Builders"                       // slot => queue_diffs
+	BuilderPendingWithdrawalsDump     = "BuilderPendingWithdrawalsDump"  // slot => dump
+	BuilderPendingWithdrawals         = "BuilderPendingWithdrawals"      // slot => queue_diffs
+	PayloadExpectedWithdrawalsDump    = "PayloadExpectedWithdrawalsDump" // slot => dump
+	PayloadExpectedWithdrawals        = "PayloadExpectedWithdrawals"     // slot => queue_diffs
+	ExecutionPayloadAvailabilityTable = "ExecutionPayloadAvailability"   // slot => bitvector SSZ
+	BuilderPendingPaymentsTable       = "BuilderPendingPayments"         // slot => vector SSZ
+	PtcWindowTable                    = "PtcWindow"                      // slot => ptc window SSZ
+	LatestExecutionPayloadBidTable    = "LatestExecutionPayloadBid"      // slot => compressed SSZ
+	// End GLOAS
+
 	StatesProcessingProgress = "StatesProcessingProgress"
 
 	//Diagnostics tables
@@ -298,16 +312,14 @@ var (
 // This list will be sorted in `init` method.
 // ChaindataTablesCfg - can be used to find index in sorted version of ChaindataTables list by name
 var ChaindataTables = []string{
-	E2AccountsHistory,
-	E2StorageHistory,
 	HeaderNumber,
 	BadHeaderNumber,
 	BlockBody,
+	BlockAccessList,
 	TxLookup,
 	ConfigTable,
 	DatabaseInfo,
 	SyncStageProgress,
-	PlainState,
 	ChangeSets3,
 	Senders,
 	HeadBlockKey,
@@ -377,6 +389,7 @@ var ChaindataTables = []string{
 	TblTracesToIdx,
 
 	TblPruningProgress,
+	TblPruningValsProg,
 
 	MaxTxNum,
 
@@ -424,33 +437,37 @@ var ChaindataTables = []string{
 	ActiveValidatorIndicies,
 	EffectiveBalancesDump,
 	BalancesDump,
-	AccountChangeSetDeprecated,
-	StorageChangeSetDeprecated,
-	HashedAccountsDeprecated,
-	HashedStorageDeprecated,
+	// GLOAS (EIP-7732)
+	BuildersDump,
+	Builders,
+	BuilderPendingWithdrawalsDump,
+	BuilderPendingWithdrawals,
+	PayloadExpectedWithdrawalsDump,
+	PayloadExpectedWithdrawals,
+	ExecutionPayloadAvailabilityTable,
+	BuilderPendingPaymentsTable,
+	PtcWindowTable,
+	LatestExecutionPayloadBidTable,
 }
 
 const (
 	RecentLocalTransaction = "RecentLocalTransaction" // sequence_u64 -> tx_hash
 	PoolTransaction        = "PoolTransaction"        // txHash -> sender+tx_rlp
 	PoolInfo               = "PoolInfo"               // option_key -> option_value
+	SenderLastActivity     = "SenderLastActivity"     // senderID_u64 -> last_on_chain_block_u64
 )
 
 var TxPoolTables = []string{
 	RecentLocalTransaction,
 	PoolTransaction,
 	PoolInfo,
+	SenderLastActivity,
 }
 var SentryTables = []string{
 	Inodes,
 	NodeRecords,
 }
-var ConsensusTables = append([]string{
-	CliqueSeparate,
-	CliqueLastSnapshot,
-},
-	ChaindataTables..., //TODO: move bor tables from chaintables to `ConsensusTables`
-)
+var ConsensusTables = ChaindataTables //TODO: move bor tables from chaintables to `ConsensusTables`
 var HeimdallTables = ChaindataTables
 var PolygonBridgeTables = ChaindataTables
 var DownloaderTables = []string{
@@ -459,7 +476,23 @@ var DownloaderTables = []string{
 }
 
 // ChaindataDeprecatedTables - list of buckets which can be programmatically deleted - for example after migration
-var ChaindataDeprecatedTables = []string{}
+var ChaindataDeprecatedTables = []string{
+	// Pre-E3 plain / hashed state, changeset, and history-index tables.
+	// PlainState / HashedStorage / StorageChangeSet baked the per-account
+	// incarnation counter into the storage key; the rest are dead E2-era
+	// indices. The E3 execution path stores state in kv.AccountsDomain /
+	// kv.StorageDomain / kv.CommitmentDomain, which are incarnation-free.
+	// The `drop_legacy_e2_tables` migration drops these buckets on
+	// databases that still carry them; listing them here marks them as
+	// deprecated so the live schema never recreates them on fresh DBs.
+	PlainState,
+	HashedAccountsDeprecated,
+	HashedStorageDeprecated,
+	AccountChangeSetDeprecated,
+	StorageChangeSetDeprecated,
+	E2AccountsHistory,
+	E2StorageHistory,
+}
 
 // Diagnostics tables
 var DiagnosticsTables = []string{
@@ -485,35 +518,20 @@ const (
 )
 
 type TableCfgItem struct {
-	Flags TableFlags
-	// AutoDupSortKeysConversion - enables some keys transformation - to change db layout without changing app code.
-	// Use it wisely - it helps to do experiments with DB format faster, but better reduce amount of Magic in app.
-	// If good DB format found, push app code to accept this format and then disable this property.
-	AutoDupSortKeysConversion bool
-	IsDeprecated              bool
-	DBI                       DBI
-	// DupFromLen - if user provide key of this length, then next transformation applied:
-	// v = append(k[DupToLen:], v...)
-	// k = k[:DupToLen]
-	// And opposite at retrieval
-	// Works only if AutoDupSortKeysConversion enabled
-	DupFromLen int
-	DupToLen   int
+	Flags        TableFlags
+	IsDeprecated bool
+	DBI          DBI
 }
 
 var ChaindataTablesCfg = TableCfg{
-	HashedStorageDeprecated: {
-		Flags:                     DupSort,
-		AutoDupSortKeysConversion: true,
-		DupFromLen:                72,
-		DupToLen:                  40,
-	},
-	PlainState: {
-		Flags:                     DupSort,
-		AutoDupSortKeysConversion: true,
-		DupFromLen:                60,
-		DupToLen:                  28,
-	},
+	// E2-era tables (deprecated; see ChaindataDeprecatedTables). The
+	// DupSort flag is preserved here so that opening an existing E2
+	// database for migration uses the right bucket flags before the
+	// drop_legacy_e2_tables migration drops them.
+	PlainState:                 {Flags: DupSort},
+	HashedStorageDeprecated:    {Flags: DupSort},
+	AccountChangeSetDeprecated: {Flags: DupSort},
+	StorageChangeSetDeprecated: {Flags: DupSort},
 
 	TblAccountVals:        {Flags: DupSort},
 	TblAccountHistoryKeys: {Flags: DupSort},
@@ -582,11 +600,14 @@ var DownloaderTablesCfg = TableCfg{}
 var DiagnosticsTablesCfg = TableCfg{}
 var HeimdallTablesCfg = TableCfg{}
 var PolygonBridgeTablesCfg = TableCfg{}
+var MigrationsTablesCfg = TableCfg{Migrations: {}}
 
 func TablesCfgByLabel(label Label) TableCfg {
 	switch label {
 	case dbcfg.ChainDB, dbcfg.TemporaryDB, dbcfg.CaplinDB: //TODO: move caplindb tables to own table config
 		return ChaindataTablesCfg
+	case dbcfg.MigrationsDB:
+		return MigrationsTablesCfg
 	case dbcfg.TxPoolDB:
 		return TxpoolTablesCfg
 	case dbcfg.SentryDB:
@@ -710,6 +731,8 @@ const (
 	LogAddrIdx    InvertedIdx = 7
 	TracesFromIdx InvertedIdx = 8
 	TracesToIdx   InvertedIdx = 9
+
+	StandaloneIdxLen = 4 // Count of standalone IIs registered via RegisterII (LogTopicIdx..TracesToIdx). Update this when adding a new standalone II.
 )
 
 func (idx InvertedIdx) String() string {
@@ -740,7 +763,7 @@ func (idx InvertedIdx) String() string {
 }
 
 func String2InvertedIdx(in string) (InvertedIdx, error) {
-	switch in {
+	switch strings.ToLower(in) {
 	case "accounts":
 		return AccountsHistoryIdx, nil
 	case "storage":
@@ -802,7 +825,7 @@ func (d Domain) String() string {
 }
 
 func String2Domain(in string) (Domain, error) {
-	switch in {
+	switch strings.ToLower(in) {
 	case "accounts":
 		return AccountsDomain, nil
 	case "storage":
@@ -887,8 +910,6 @@ const (
 	   	AccountChangeSet has record: bigEndian(N) + A -> X
 	   	PlainState has record: A -> Y
 
-	   See also: docs/programmers_guide/db_walkthrough.MD#table-history-of-accounts
-
 	   As you can see if block N changes much accounts - then all records have repetitive prefix `bigEndian(N)`.
 	   MDBX can store such prefixes only once - by DupSort feature (see `docs/programmers_guide/dupsort.md`).
 	   Both buckets are DupSort-ed and have physical format:
@@ -930,8 +951,6 @@ const (
 	   It allows:
 	     - server task 1. by 1 db operation db.seekInFiles(A+bigEndian(X))
 	     - server task 2. by 1 db operation db.Get(A+0xFF)
-
-	   see also: docs/programmers_guide/db_walkthrough.MD#table-change-sets
 
 	   AccountsHistory:
 

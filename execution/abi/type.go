@@ -26,6 +26,8 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/erigontech/erigon/common"
 )
@@ -126,7 +128,7 @@ func NewType(t string, internalType string, components []ArgumentMarshaling) (ty
 	var varSize int
 	if len(parsedType[3]) > 0 {
 		var err error
-		varSize, err = strconv.Atoi(parsedType[2])
+		varSize, err = strconv.Atoi(parsedType[3])
 		if err != nil {
 			return Type{}, fmt.Errorf("abi: error parsing variable size: %w", err)
 		}
@@ -140,9 +142,15 @@ func NewType(t string, internalType string, components []ArgumentMarshaling) (ty
 	// varType is the parsed abi type
 	switch varType := parsedType[1]; varType {
 	case "int":
+		if varSize < 8 || varSize > 256 || varSize%8 != 0 {
+			return Type{}, fmt.Errorf("unsupported arg type: %s", t)
+		}
 		typ.Size = varSize
 		typ.T = IntTy
 	case "uint":
+		if varSize < 8 || varSize > 256 || varSize%8 != 0 {
+			return Type{}, fmt.Errorf("unsupported arg type: %s", t)
+		}
 		typ.Size = varSize
 		typ.T = UintTy
 	case "bool":
@@ -153,9 +161,12 @@ func NewType(t string, internalType string, components []ArgumentMarshaling) (ty
 	case "string":
 		typ.T = StringTy
 	case "bytes":
-		if varSize == 0 {
+		if varSize == 0 && len(parsedType[3]) == 0 {
 			typ.T = BytesTy
 		} else {
+			if varSize == 0 || varSize > 32 {
+				return Type{}, fmt.Errorf("unsupported arg type: %s", t)
+			}
 			typ.T = FixedBytesTy
 			typ.Size = varSize
 		}
@@ -164,9 +175,9 @@ func NewType(t string, internalType string, components []ArgumentMarshaling) (ty
 			fields     []reflect.StructField
 			elems      []*Type
 			names      []string
-			expression string // canonical parameter expression
+			expression strings.Builder // canonical parameter expression
 		)
-		expression += "("
+		expression.WriteString("(")
 		overloadedNames := make(map[string]string)
 		for idx, c := range components {
 			cType, err := NewType(c.Type, c.InternalType, c.Components)
@@ -177,6 +188,9 @@ func NewType(t string, internalType string, components []ArgumentMarshaling) (ty
 			if err != nil {
 				return Type{}, err
 			}
+			if !isValidFieldName(fieldName) {
+				return Type{}, fmt.Errorf("abi: field %d has invalid name: abi name %q normalized to go field %q", idx, c.Name, fieldName)
+			}
 			overloadedNames[fieldName] = fieldName
 			fields = append(fields, reflect.StructField{
 				Name: fieldName, // reflect.StructOf will panic for any exported field.
@@ -185,18 +199,18 @@ func NewType(t string, internalType string, components []ArgumentMarshaling) (ty
 			})
 			elems = append(elems, &cType)
 			names = append(names, c.Name)
-			expression += cType.stringKind
+			expression.WriteString(cType.stringKind)
 			if idx != len(components)-1 {
-				expression += ","
+				expression.WriteString(",")
 			}
 		}
-		expression += ")"
+		expression.WriteString(")")
 
 		typ.TupleType = reflect.StructOf(fields)
 		typ.TupleElems = elems
 		typ.TupleRawNames = names
 		typ.T = TupleTy
-		typ.stringKind = expression
+		typ.stringKind = expression.String()
 
 		const structPrefix = "struct "
 		// After solidity 0.5.10, a new field of abi "internalType"
@@ -226,9 +240,9 @@ func (t Type) GetType() reflect.Type {
 	case UintTy:
 		return reflectIntType(true, t.Size)
 	case BoolTy:
-		return reflect.TypeOf(false)
+		return reflect.TypeFor[bool]()
 	case StringTy:
-		return reflect.TypeOf("")
+		return reflect.TypeFor[string]()
 	case SliceTy:
 		return reflect.SliceOf(t.Elem.GetType())
 	case ArrayTy:
@@ -236,19 +250,19 @@ func (t Type) GetType() reflect.Type {
 	case TupleTy:
 		return t.TupleType
 	case AddressTy:
-		return reflect.TypeOf(common.Address{})
+		return reflect.TypeFor[common.Address]()
 	case FixedBytesTy:
-		return reflect.ArrayOf(t.Size, reflect.TypeOf(byte(0)))
+		return reflect.ArrayOf(t.Size, reflect.TypeFor[byte]())
 	case BytesTy:
-		return reflect.SliceOf(reflect.TypeOf(byte(0)))
+		return reflect.SliceOf(reflect.TypeFor[byte]())
 	case HashTy:
 		// hashtype currently not used
-		return reflect.ArrayOf(32, reflect.TypeOf(byte(0)))
+		return reflect.ArrayOf(32, reflect.TypeFor[byte]())
 	case FixedPointTy:
 		// fixedpoint type currently not used
-		return reflect.ArrayOf(32, reflect.TypeOf(byte(0)))
+		return reflect.ArrayOf(32, reflect.TypeFor[byte]())
 	case FunctionTy:
-		return reflect.ArrayOf(24, reflect.TypeOf(byte(0)))
+		return reflect.ArrayOf(24, reflect.TypeFor[byte]())
 	default:
 		panic("Invalid type")
 	}
@@ -402,4 +416,29 @@ func getTypeSize(t Type) int {
 		return total
 	}
 	return 32
+}
+
+// isLetter reports whether a given 'rune' is classified as a Letter.
+// Copied from reflect/type.go.
+func isLetter(ch rune) bool {
+	return 'a' <= ch && ch <= 'z' || 'A' <= ch && ch <= 'Z' || ch == '_' || ch >= utf8.RuneSelf && unicode.IsLetter(ch)
+}
+
+// isValidFieldName checks if a string is a valid (struct) field name or not.
+//
+// According to the language spec, a field name should be an identifier.
+//
+// identifier = letter { letter | unicode_digit } .
+// letter = unicode_letter | "_" .
+// Copied from reflect/type.go.
+func isValidFieldName(fieldName string) bool {
+	for i, c := range fieldName {
+		if i == 0 && !isLetter(c) {
+			return false
+		}
+		if !(isLetter(c) || unicode.IsDigit(c)) {
+			return false
+		}
+	}
+	return len(fieldName) > 0
 }

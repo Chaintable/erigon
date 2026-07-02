@@ -17,12 +17,10 @@
 package kv
 
 import (
-	"bytes"
 	"context"
 	"encoding/binary"
 	"errors"
 	"maps"
-	"os"
 	"sort"
 	"strings"
 	"sync"
@@ -31,12 +29,44 @@ import (
 	"unsafe"
 
 	"github.com/c2h5oh/datasize"
-	"github.com/erigontech/mdbx-go/mdbx"
 
 	"github.com/erigontech/erigon/common/hexutil"
 
 	"github.com/erigontech/erigon/common"
 )
+
+// NewGatedRoDB wraps an RoDB so every View() call acquires gate.RLock() for
+// the duration of the tx. Purpose: serialize background read txs (e.g.
+// snapshot retirement reading chaindata) against a writer that briefly holds
+// gate.Lock() during commit. Without the gate, a concurrent reader pins the
+// MDBX freelist and prevents page reclamation at commit time.
+//
+// BeginRo is passed through ungated — gating open-ended Tx lifetimes has
+// ambiguous scope. Callers that need gating must use the View closure idiom.
+func NewGatedRoDB(inner RoDB, gate *sync.RWMutex) RoDB {
+	if gate == nil {
+		return inner
+	}
+	return &gatedRoDB{inner: inner, gate: gate}
+}
+
+type gatedRoDB struct {
+	inner RoDB
+	gate  *sync.RWMutex
+}
+
+func (g *gatedRoDB) Close()                                  { g.inner.Close() }
+func (g *gatedRoDB) BeginRo(ctx context.Context) (Tx, error) { return g.inner.BeginRo(ctx) }
+func (g *gatedRoDB) ReadOnly() bool                          { return g.inner.ReadOnly() }
+func (g *gatedRoDB) AllTables() TableCfg                     { return g.inner.AllTables() }
+func (g *gatedRoDB) PageSize() datasize.ByteSize             { return g.inner.PageSize() }
+func (g *gatedRoDB) CHandle() unsafe.Pointer                 { return g.inner.CHandle() }
+func (g *gatedRoDB) Path() string                            { return g.inner.Path() }
+func (g *gatedRoDB) View(ctx context.Context, f func(tx Tx) error) error {
+	g.gate.RLock()
+	defer g.gate.RUnlock()
+	return g.inner.View(ctx, f)
+}
 
 // Adapts an RoDB to the RwDB interface (invoking write operations results in error)
 type RwWrapper struct {
@@ -54,17 +84,6 @@ func (w RwWrapper) BeginRw(ctx context.Context) (RwTx, error) {
 }
 func (w RwWrapper) BeginRwNosync(ctx context.Context) (RwTx, error) {
 	return nil, errors.New("BeginRwNosync not implemented")
-}
-
-func DefaultPageSize() datasize.ByteSize {
-	osPageSize := os.Getpagesize()
-	if osPageSize < 4096 { // reduce further may lead to errors (because some data is just big)
-		osPageSize = 4096
-	} else if osPageSize > mdbx.MaxPageSize {
-		osPageSize = mdbx.MaxPageSize
-	}
-	osPageSize = osPageSize / 4096 * 4096 // ensure it's rounded
-	return datasize.ByteSize(osPageSize)
 }
 
 // BigChunks - read `table` by big chunks - restart read transaction after each 1 minutes
@@ -130,8 +149,6 @@ func bytes2bool(in []byte) bool {
 	}
 	return in[0] == 1
 }
-
-var ErrChanged = errors.New("key must not change")
 
 // EnsureNotChangedBool - used to store immutable config flags in db. protects from human mistakes
 func EnsureNotChangedBool(tx GetPut, bucket string, k []byte, value bool) (notChanged, enabled bool, err error) {
@@ -264,49 +281,50 @@ func IncrementKey(tx RwTx, table string, k []byte) error {
 }
 
 type DomainEntryDiff struct {
-	Key           string
-	Value         []byte
-	PrevStepBytes []byte
+	Key   string
+	Value []byte // nil means "delete only" (prev value was at a different step), non-nil means "restore this value"
 }
 
 // DomainDiff represents a domain of state changes.
 type DomainDiff struct {
 	// We can probably flatten these into single slices for GC/cache optimization
-	keys          map[string][]byte
 	prevValues    map[string][]byte
 	prevValsSlice []DomainEntryDiff
 
-	prevStepBuf, currentStepBuf, keyBuf []byte
+	currentStepBuf, keyBuf []byte
 }
 
 func (d *DomainDiff) Copy() *DomainDiff {
-	return &DomainDiff{keys: maps.Clone(d.keys), prevValues: maps.Clone(d.prevValues)}
+	return &DomainDiff{prevValues: maps.Clone(d.prevValues)}
+}
+
+func (d *DomainDiff) Len() int {
+	if d == nil {
+		return 0
+	}
+	return len(d.prevValues)
 }
 
 // RecordDelta records a state change.
-func (d *DomainDiff) DomainUpdate(k []byte, step Step, prevValue []byte, prevStep Step) {
-	if d.keys == nil {
-		d.keys = make(map[string][]byte, 16)
+// prevValue is the previous value at the key. If prevStep != step, the previous value lives
+// at a different step position in the DB and doesn't need restoring on unwind (just delete current).
+// We encode this as nil in prevValues. If prevStep == step, we store the actual prevValue.
+func (d *DomainDiff) DomainUpdate(k []byte, step Step, prevValue []byte) {
+	if d.prevValues == nil {
 		d.prevValues = make(map[string][]byte, 16)
-		d.prevStepBuf = make([]byte, 8)
 		d.currentStepBuf = make([]byte, 8)
 	}
-	binary.BigEndian.PutUint64(d.prevStepBuf, ^uint64(prevStep))
 	binary.BigEndian.PutUint64(d.currentStepBuf, ^uint64(step))
 
 	d.keyBuf = append(append(d.keyBuf[:0], k...), d.currentStepBuf...)
-	key := toStringZeroCopy(d.keyBuf[:len(k)])
-	if _, ok := d.keys[key]; !ok {
-		d.keys[strings.Clone(key)] = common.Copy(d.prevStepBuf)
-	}
 
-	valsKey := toStringZeroCopy(d.keyBuf)
+	valsKey := common.ToStringZeroCopy(d.keyBuf)
 	if _, ok := d.prevValues[valsKey]; !ok {
 		valsKeySCopy := strings.Clone(valsKey)
-		if bytes.Equal(d.currentStepBuf, d.prevStepBuf) {
-			d.prevValues[valsKeySCopy] = common.Copy(prevValue)
+		if prevValue == nil {
+			d.prevValues[valsKeySCopy] = []byte{} // no previous value (new key)
 		} else {
-			d.prevValues[valsKeySCopy] = []byte{} // We need to delete the current step but restore the previous one
+			d.prevValues[valsKeySCopy] = common.Copy(prevValue)
 		}
 		d.prevValsSlice = nil
 	}
@@ -321,17 +339,10 @@ func (d *DomainDiff) GetDiffSet() (keysToValue []DomainEntryDiff) {
 	for k, v := range d.prevValues {
 		d.prevValsSlice[i].Key = k
 		d.prevValsSlice[i].Value = v
-		d.prevValsSlice[i].PrevStepBytes = d.keys[k[:len(k)-8]]
 		i++
 	}
 	sort.Slice(d.prevValsSlice, func(i, j int) bool {
 		return d.prevValsSlice[i].Key < d.prevValsSlice[j].Key
 	})
 	return d.prevValsSlice
-}
-func toStringZeroCopy(v []byte) string {
-	if len(v) == 0 {
-		return ""
-	}
-	return unsafe.String(&v[0], len(v))
 }

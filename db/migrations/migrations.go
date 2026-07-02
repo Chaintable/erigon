@@ -24,12 +24,15 @@ import (
 	"fmt"
 	"path/filepath"
 
+	"github.com/c2h5oh/datasize"
+
 	"github.com/erigontech/erigon/common"
 	"github.com/erigontech/erigon/common/dir"
 	"github.com/erigontech/erigon/common/log/v3"
 	"github.com/erigontech/erigon/db/datadir"
 	"github.com/erigontech/erigon/db/kv"
 	"github.com/erigontech/erigon/db/kv/dbcfg"
+	kv2 "github.com/erigontech/erigon/db/kv/mdbx"
 	"github.com/erigontech/erigon/db/rawdb"
 )
 
@@ -52,6 +55,9 @@ var migrations = map[kv.Label][]Migration{
 	dbcfg.ChainDB: {
 		dbSchemaVersion5,
 		ResetStageTxnLookup,
+		dbSchemaVersion6,
+		dbSchemaVersion7,
+		dropLegacyE2Tables,
 	},
 	dbcfg.TxPoolDB: {},
 	dbcfg.SentryDB: {},
@@ -71,6 +77,23 @@ var (
 	)
 )
 
+// OpenMigrationsDB opens (or creates) the dedicated migrations-tracking database at the given
+// directory. Only the kv.Migrations table is opened; all other tables are excluded. The DB
+// survives deletion of any other sub-database (e.g. chaindata) so migration state persists
+// across datadir clean-ups.
+//
+// MapSize is capped at 1 GB: the DB only tracks migration names (kilobytes
+// even with thousands of migrations) and the default 2 TB MDBX reservation
+// would otherwise consume process address space at a rate that limits how
+// many engine-api testers can coexist in one process.
+func OpenMigrationsDB(migrationsDir string, logger log.Logger) (kv.RwDB, error) {
+	dir.MustExist(migrationsDir)
+	return kv2.New(dbcfg.MigrationsDB, logger).
+		Path(migrationsDir).
+		MapSize(1 * datasize.GB).
+		Open(context.Background())
+}
+
 func NewMigrator(label kv.Label) *Migrator {
 	return &Migrator{
 		Migrations: migrations[label],
@@ -81,6 +104,9 @@ type Migrator struct {
 	Migrations []Migration
 }
 
+// AppliedMigrations returns the set of migration names that have already been recorded as
+// complete. tx must be a read transaction on the migrations-tracking DB (opened via
+// OpenMigrationsDB), NOT on the target database.
 func AppliedMigrations(tx kv.Tx, withPayload bool) (map[string][]byte, error) {
 	applied := map[string][]byte{}
 	err := tx.ForEach(kv.Migrations, nil, func(k []byte, v []byte) error {
@@ -88,18 +114,20 @@ func AppliedMigrations(tx kv.Tx, withPayload bool) (map[string][]byte, error) {
 			return nil
 		}
 		if withPayload {
-			applied[string(common.CopyBytes(k))] = common.CopyBytes(v)
+			applied[string(common.Copy(k))] = common.Copy(v)
 		} else {
-			applied[string(common.CopyBytes(k))] = []byte{}
+			applied[string(common.Copy(k))] = []byte{}
 		}
 		return nil
 	})
 	return applied, err
 }
 
-func (m *Migrator) HasPendingMigrations(db kv.RwDB) (bool, error) {
+// HasPendingMigrations reports whether any registered migrations have not yet been applied.
+// migrationsDB must be the database returned by OpenMigrationsDB.
+func (m *Migrator) HasPendingMigrations(migrationsDB kv.RwDB) (bool, error) {
 	var has bool
-	if err := db.View(context.Background(), func(tx kv.Tx) error {
+	if err := migrationsDB.View(context.Background(), func(tx kv.Tx) error {
 		pending, err := m.PendingMigrations(tx)
 		if err != nil {
 			return err
@@ -112,6 +140,8 @@ func (m *Migrator) HasPendingMigrations(db kv.RwDB) (bool, error) {
 	return has, nil
 }
 
+// PendingMigrations returns the subset of registered migrations that have not yet been applied.
+// tx must be a read transaction on the migrations-tracking DB.
 func (m *Migrator) PendingMigrations(tx kv.Tx) ([]Migration, error) {
 	applied, err := AppliedMigrations(tx, false)
 	if err != nil {
@@ -153,7 +183,9 @@ func (m *Migrator) VerifyVersion(db kv.RwDB, chaindata string) error {
 				}
 			} else {
 				if kv.DBSchemaVersion.Major != major {
-					return fmt.Errorf("cannot switch major DB version, db: %d, erigon: %d, try \"rm -rf %s\"", major, kv.DBSchemaVersion.Major, chaindata)
+					return fmt.Errorf(
+						"cannot switch major DB version, db: %d, erigon: %d, try \"rm -rf %s\" if you are sure that you are running right version of erigon on right datadir",
+						major, kv.DBSchemaVersion.Major, chaindata)
 				}
 			}
 		}
@@ -165,14 +197,21 @@ func (m *Migrator) VerifyVersion(db kv.RwDB, chaindata string) error {
 	return nil
 }
 
-func (m *Migrator) Apply(db kv.RwDB, dataDir, chaindata string, logger log.Logger) error {
+// Apply runs all pending migrations in order.
+//
+//   - db is the target database being migrated (e.g. chaindata).
+//   - migrationsDB is the dedicated migrations-tracking database (opened via OpenMigrationsDB).
+//     Applied-migration records are written here, so they survive deletion of the target DB.
+//   - dataDir is the root data directory (used to set up per-migration temp dirs).
+//   - chaindata is the path to the target DB directory (used only in error messages).
+func (m *Migrator) Apply(db kv.RwDB, migrationsDB kv.RwDB, dataDir, chaindata string, logger log.Logger) error {
 	if len(m.Migrations) == 0 {
 		return nil
 	}
 	dirs := datadir.New(dataDir)
 
 	var applied map[string][]byte
-	if err := db.View(context.Background(), func(tx kv.Tx) error {
+	if err := migrationsDB.View(context.Background(), func(tx kv.Tx) error {
 		var err error
 		applied, err = AppliedMigrations(tx, false)
 		if err != nil {
@@ -206,19 +245,23 @@ func (m *Migrator) Apply(db kv.RwDB, dataDir, chaindata string, logger log.Logge
 
 		logger.Info("Apply migration", "name", v.Name)
 		var progress []byte
-		if err := db.View(context.Background(), func(tx kv.Tx) (err error) {
+		if err := migrationsDB.View(context.Background(), func(tx kv.Tx) (err error) {
 			progress, err = tx.GetOne(kv.Migrations, []byte("_progress_"+v.Name))
 			return err
 		}); err != nil {
 			return fmt.Errorf("migrator.Apply: %w", err)
 		}
 
-		dirs.Tmp = filepath.Join(dirs.DataDir, "migrations", v.Name)
+		// Each migration gets its own sub-directory inside dirs.Migrations for ETL temp files.
+		dirs.Tmp = filepath.Join(dirs.Migrations, v.Name)
 		dir.MustExist(dirs.Tmp)
 		if err := v.Up(db, dirs, progress, func(tx kv.RwTx, key []byte, isDone bool) error {
 			if !isDone {
 				if key != nil {
-					if err := tx.Put(kv.Migrations, []byte("_progress_"+v.Name), key); err != nil {
+					// Persist resumable progress in the migrations DB.
+					if err := migrationsDB.Update(context.Background(), func(migTx kv.RwTx) error {
+						return migTx.Put(kv.Migrations, []byte("_progress_"+v.Name), key)
+					}); err != nil {
 						return err
 					}
 				}
@@ -226,21 +269,18 @@ func (m *Migrator) Apply(db kv.RwDB, dataDir, chaindata string, logger log.Logge
 			}
 			callbackCalled = true
 
+			// Capture the target DB's stage state for bug-report context, then record
+			// the migration as complete in the migrations-tracking DB.
 			stagesProgress, err := json.Marshal(tx)
 			if err != nil {
 				return err
 			}
-			err = tx.Put(kv.Migrations, []byte(v.Name), stagesProgress)
-			if err != nil {
-				return err
-			}
-
-			err = tx.Delete(kv.Migrations, []byte("_progress_"+v.Name))
-			if err != nil {
-				return err
-			}
-
-			return nil
+			return migrationsDB.Update(context.Background(), func(migTx kv.RwTx) error {
+				if err := migTx.Put(kv.Migrations, []byte(v.Name), stagesProgress); err != nil {
+					return err
+				}
+				return migTx.Delete(kv.Migrations, []byte("_progress_"+v.Name))
+			})
 		}, logger); err != nil {
 			return fmt.Errorf("migrator.Apply.Up: %s, %w", v.Name, err)
 		}

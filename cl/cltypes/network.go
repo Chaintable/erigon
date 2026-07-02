@@ -36,7 +36,7 @@ type Metadata struct {
 }
 
 func (m *Metadata) EncodeSSZ(buf []byte) ([]byte, error) {
-	schema := []interface{}{
+	schema := []any{
 		m.SeqNumber,
 		m.Attnets[:],
 	}
@@ -83,7 +83,7 @@ func (m *Metadata) DecodeSSZ(buf []byte, _ int) error {
 }
 
 func (m *Metadata) MarshalJSON() ([]byte, error) {
-	out := map[string]interface{}{
+	out := map[string]any{
 		"seq_number": strconv.FormatUint(m.SeqNumber, 10),
 		"attnets":    hexutil.Bytes(m.Attnets[:]),
 	}
@@ -112,6 +112,9 @@ func (p *Ping) EncodingSizeSSZ() int {
 }
 
 func (p *Ping) DecodeSSZ(buf []byte, _ int) error {
+	if len(buf) < 8 {
+		return ssz.ErrLowBufferSize
+	}
 	p.Id = ssz.UnmarshalUint64SSZ(buf)
 	return nil
 }
@@ -194,7 +197,7 @@ func (s *Status) EncodeSSZ(buf []byte) ([]byte, error) {
 }
 
 func (s *Status) DecodeSSZ(buf []byte, version int) error {
-	schema := []interface{}{
+	schema := []any{
 		s.ForkDigest[:],
 		s.FinalizedRoot[:],
 		&s.FinalizedEpoch,
@@ -210,8 +213,8 @@ func (s *Status) DecodeSSZ(buf []byte, version int) error {
 	return ssz2.UnmarshalSSZ(buf, version, schema...)
 }
 
-func (s *Status) schema() []interface{} {
-	schema := []interface{}{
+func (s *Status) schema() []any {
+	schema := []any{
 		s.ForkDigest[:],
 		s.FinalizedRoot[:],
 		&s.FinalizedEpoch,
@@ -251,4 +254,54 @@ func (l *BlobsByRangeRequest) EncodingSizeSSZ() int {
 
 func (*BlobsByRangeRequest) Clone() clonable.Clonable {
 	return &BlobsByRangeRequest{}
+}
+
+/*
+ * ExecutionPayloadEnvelopesByRangeRequest requests execution payload envelopes by slot range.
+ * [New in Gloas:EIP7732]
+ */
+type ExecutionPayloadEnvelopesByRangeRequest struct {
+	StartSlot uint64
+	Count     uint64
+}
+
+func (l *ExecutionPayloadEnvelopesByRangeRequest) EncodeSSZ(buf []byte) ([]byte, error) {
+	return ssz2.MarshalSSZ(buf, &l.StartSlot, &l.Count)
+}
+
+func (l *ExecutionPayloadEnvelopesByRangeRequest) DecodeSSZ(buf []byte, _ int) error {
+	return ssz2.UnmarshalSSZ(buf, 0, &l.StartSlot, &l.Count)
+}
+
+func (l *ExecutionPayloadEnvelopesByRangeRequest) EncodingSizeSSZ() int {
+	return 16
+}
+
+func (*ExecutionPayloadEnvelopesByRangeRequest) Clone() clonable.Clonable {
+	return &ExecutionPayloadEnvelopesByRangeRequest{}
+}
+
+/*
+ * BeaconBlocksByHeadRequest requests blocks walking the parent chain from a given root.
+ * [New in Fulu] consensus-specs PR #5181
+ */
+type BeaconBlocksByHeadRequest struct {
+	BeaconRoot common.Hash
+	Count      uint64
+}
+
+func (b *BeaconBlocksByHeadRequest) EncodeSSZ(buf []byte) ([]byte, error) {
+	return ssz2.MarshalSSZ(buf, b.BeaconRoot[:], &b.Count)
+}
+
+func (b *BeaconBlocksByHeadRequest) DecodeSSZ(buf []byte, _ int) error {
+	return ssz2.UnmarshalSSZ(buf, 0, b.BeaconRoot[:], &b.Count)
+}
+
+func (b *BeaconBlocksByHeadRequest) EncodingSizeSSZ() int {
+	return 40
+}
+
+func (*BeaconBlocksByHeadRequest) Clone() clonable.Clonable {
+	return &BeaconBlocksByHeadRequest{}
 }

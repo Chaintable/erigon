@@ -25,7 +25,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"math/big"
 	"runtime"
 	"sync"
 	"testing"
@@ -36,7 +35,6 @@ import (
 
 	"github.com/erigontech/erigon/common"
 	"github.com/erigontech/erigon/common/hexutil"
-	"github.com/erigontech/erigon/common/math"
 )
 
 type testEncoder struct {
@@ -66,7 +64,7 @@ func (e testEncoderValueMethod) EncodeRLP(w io.Writer) error {
 type byteEncoder byte
 
 func (e byteEncoder) EncodeRLP(w io.Writer) error {
-	_, err := w.Write(EmptyList)
+	_, err := w.Write([]byte{EmptyListCode})
 	return err
 }
 
@@ -95,7 +93,7 @@ var (
 )
 
 type encTest struct {
-	val           interface{}
+	val           any
 	output, error string
 }
 
@@ -117,46 +115,6 @@ var encTests = []encTest{
 	{val: uint64(0xFFFFFFFFFFFF), output: "86FFFFFFFFFFFF"},
 	{val: uint64(0xFFFFFFFFFFFFFF), output: "87FFFFFFFFFFFFFF"},
 	{val: uint64(0xFFFFFFFFFFFFFFFF), output: "88FFFFFFFFFFFFFFFF"},
-
-	// big integers (should match uint for small values)
-	{val: big.NewInt(0), output: "80"},
-	{val: big.NewInt(1), output: "01"},
-	{val: big.NewInt(127), output: "7F"},
-	{val: big.NewInt(128), output: "8180"},
-	{val: big.NewInt(256), output: "820100"},
-	{val: big.NewInt(1024), output: "820400"},
-	{val: big.NewInt(0xFFFFFF), output: "83FFFFFF"},
-	{val: big.NewInt(0xFFFFFFFF), output: "84FFFFFFFF"},
-	{val: big.NewInt(0xFFFFFFFFFF), output: "85FFFFFFFFFF"},
-	{val: big.NewInt(0xFFFFFFFFFFFF), output: "86FFFFFFFFFFFF"},
-	{val: big.NewInt(0xFFFFFFFFFFFFFF), output: "87FFFFFFFFFFFFFF"},
-	{
-		val:    big.NewInt(0).SetBytes(unhex("102030405060708090A0B0C0D0E0F2")),
-		output: "8F102030405060708090A0B0C0D0E0F2",
-	},
-	{
-		val:    big.NewInt(0).SetBytes(unhex("0100020003000400050006000700080009000A000B000C000D000E01")),
-		output: "9C0100020003000400050006000700080009000A000B000C000D000E01",
-	},
-	{
-		val:    big.NewInt(0).SetBytes(unhex("010000000000000000000000000000000000000000000000000000000000000000")),
-		output: "A1010000000000000000000000000000000000000000000000000000000000000000",
-	},
-	{
-		val:    veryBigInt,
-		output: "89FFFFFFFFFFFFFFFFFF",
-	},
-	{
-		val:    veryVeryBigInt,
-		output: "B848FFFFFFFFFFFFFFFFF800000000000000001BFFFFFFFFFFFFFFFFC8000000000000000045FFFFFFFFFFFFFFFFC800000000000000001BFFFFFFFFFFFFFFFFF8000000000000000001",
-	},
-
-	// non-pointer big.Int
-	{val: *big.NewInt(0), output: "80"},
-	{val: *big.NewInt(0xFFFFFF), output: "83FFFFFF"},
-
-	// negative ints are not supported
-	{val: big.NewInt(-1), error: "rlp: cannot encode negative *big.Int"},
 
 	// uint256 integers (should match uint for small values)
 	{val: uint256.NewInt(0), output: "80"},
@@ -229,7 +187,7 @@ var encTests = []encTest{
 	{val: []uint{1, 2, 3}, output: "C3010203"},
 	{
 		// [ [], [[]], [ [], [[]] ] ]
-		val:    []interface{}{[]interface{}{}, [][]interface{}{{}}, []interface{}{[]interface{}{}, [][]interface{}{{}}}},
+		val:    []any{[]any{}, [][]any{{}}, []any{[]any{}, [][]any{{}}}},
 		output: "C7C0C1C0C3C0C1C0",
 	},
 	{
@@ -237,7 +195,7 @@ var encTests = []encTest{
 		output: "F83C836161618362626283636363836464648365656583666666836767678368686883696969836A6A6A836B6B6B836C6C6C836D6D6D836E6E6E836F6F6F",
 	},
 	{
-		val:    []interface{}{uint(1), uint(0xFFFFFF), []interface{}{[]uint{4, 5, 5}}, "abc"},
+		val:    []any{uint(1), uint(0xFFFFFF), []any{[]uint{4, 5, 5}}, "abc"},
 		output: "CE0183FFFFFFC4C304050583616263",
 	},
 	{
@@ -288,7 +246,7 @@ var encTests = []encTest{
 	{val: simplestruct{A: 3, B: "foo"}, output: "C50383666F6F"},
 	{val: &recstruct{5, nil}, output: "C205C0"},
 	{val: &recstruct{5, &recstruct{4, &recstruct{3, nil}}}, output: "C605C404C203C0"},
-	{val: &intField{X: -3}, error: "rlp: type reflect.Value -ve values are not RLP-serializable"},
+	{val: &intField{X: -3}, error: "rlp: type int -ve values are not RLP-serializable"},
 	{val: &intField{X: 3}, output: "C103"},
 
 	// struct tag "-"
@@ -310,7 +268,6 @@ var encTests = []encTest{
 	{val: &optionalAndTailField{A: 1, B: 2}, output: "C20102"},
 	{val: &optionalAndTailField{A: 1, Tail: []uint{5, 6}}, output: "C401800506"},
 	{val: &optionalAndTailField{A: 1, Tail: []uint{5, 6}}, output: "C401800506"},
-	{val: &optionalBigIntField{A: 1}, output: "C101"},
 	{val: &optionalPtrField{A: 1}, output: "C101"},
 	{val: &optionalPtrFieldNil{A: 1}, output: "C101"},
 
@@ -319,13 +276,12 @@ var encTests = []encTest{
 	{val: (*string)(nil), output: "80"},
 	{val: (*[]byte)(nil), output: "80"},
 	{val: (*[10]byte)(nil), output: "80"},
-	{val: (*big.Int)(nil), output: "80"},
 	{val: (*uint256.Int)(nil), output: "80"},
 	{val: (*[]string)(nil), output: "C0"},
 	{val: (*[10]string)(nil), output: "C0"},
-	{val: (*[]interface{})(nil), output: "C0"},
+	{val: (*[]any)(nil), output: "C0"},
 	{val: (*[]struct{ uint })(nil), output: "C0"},
-	{val: (*interface{})(nil), output: "C0"},
+	{val: (*any)(nil), output: "C0"},
 
 	// nil struct fields
 	{
@@ -390,7 +346,7 @@ var encTests = []encTest{
 	{val: []byteEncoder{0, 1, 2, 3, 4}, output: "C5C0C0C0C0C0"},
 }
 
-func runEncTests(t *testing.T, f func(val interface{}) ([]byte, error)) {
+func runEncTests(t *testing.T, f func(val any) ([]byte, error)) {
 	for i, test := range encTests {
 		output, err := f(test.val)
 		if err != nil && test.error == "" {
@@ -411,7 +367,7 @@ func runEncTests(t *testing.T, f func(val interface{}) ([]byte, error)) {
 }
 
 func TestEncode(t *testing.T) {
-	runEncTests(t, func(val interface{}) ([]byte, error) {
+	runEncTests(t, func(val any) ([]byte, error) {
 		b := new(bytes.Buffer)
 		err := Encode(b, val)
 		return b.Bytes(), err
@@ -423,7 +379,7 @@ func TestEncodeToBytes(t *testing.T) {
 }
 
 func TestEncodeToReader(t *testing.T) {
-	runEncTests(t, func(val interface{}) ([]byte, error) {
+	runEncTests(t, func(val any) ([]byte, error) {
 		_, r, err := EncodeToReader(val)
 		if err != nil {
 			return nil, err
@@ -433,7 +389,7 @@ func TestEncodeToReader(t *testing.T) {
 }
 
 func TestEncodeToReaderPiecewise(t *testing.T) {
-	runEncTests(t, func(val interface{}) ([]byte, error) {
+	runEncTests(t, func(val any) ([]byte, error) {
 		size, r, err := EncodeToReader(val)
 		if err != nil {
 			return nil, err
@@ -481,13 +437,7 @@ func TestEncodeToReaderReturnToPool(t *testing.T) {
 	wg.Wait()
 }
 
-var sink interface{}
-
-func BenchmarkIntsize(b *testing.B) {
-	for b.Loop() {
-		sink = intsize(0x12345678)
-	}
-}
+var sink any
 
 func BenchmarkPutint(b *testing.B) {
 	buf := make([]byte, 8)
@@ -497,10 +447,10 @@ func BenchmarkPutint(b *testing.B) {
 	}
 }
 
-func BenchmarkEncodeBigInts(b *testing.B) {
-	ints := make([]*big.Int, 200)
+func BenchmarkEncodeUint256Ints(b *testing.B) {
+	ints := make([]*uint256.Int, 200)
 	for i := range ints {
-		ints[i] = math.BigPow(2, int64(i))
+		ints[i] = new(uint256.Int).Lsh(uint256.NewInt(1), uint(i))
 	}
 	out := bytes.NewBuffer(make([]byte, 0, 4096))
 
@@ -522,7 +472,7 @@ func TestStringLen56(t *testing.T) {
 	assert.Equal(t, 56+2, strLen)
 
 	encoded := make([]byte, strLen)
-	EncodeString2(str, encoded)
+	EncodeStringToBuf(str, encoded)
 
 	dataPos, dataLen, err := ParseString(encoded, 0)
 	require.NoError(t, err)
@@ -533,7 +483,7 @@ func TestStringLen56(t *testing.T) {
 // Any buffer of 32 bytes or more should be fine for EncodeUint256.
 // See https://github.com/erigontech/erigon/pull/13574
 func TestEncodeUint256Buffer(t *testing.T) {
-	i := uint256.NewInt(128)
+	i := *uint256.NewInt(128)
 	output := "8180"
 
 	var writer1 bytes.Buffer
@@ -558,7 +508,7 @@ func TestEncodeUint256Random(t *testing.T) {
 			_, err := rand.Read(randomBytes)
 			require.NoError(t, err)
 
-			i := new(uint256.Int).SetBytes(randomBytes)
+			i := *new(uint256.Int).SetBytes(randomBytes)
 			var writer bytes.Buffer
 			var buf [32]byte
 			require.NoError(t, EncodeUint256(i, &writer, buf[:]))
@@ -567,7 +517,7 @@ func TestEncodeUint256Random(t *testing.T) {
 			s := NewStream(encoded, 0)
 			decoded, err := s.Uint256Bytes()
 			require.NoError(t, err)
-			assert.Equal(t, i, uint256.NewInt(0).SetBytes(decoded))
+			assert.Equal(t, i, *uint256.NewInt(0).SetBytes(decoded))
 		})
 	}
 }
@@ -575,12 +525,12 @@ func TestEncodeUint256Random(t *testing.T) {
 func BenchmarkEncodeConcurrentInterface(b *testing.B) {
 	type struct1 struct {
 		A string
-		B *big.Int
+		B *uint256.Int
 		C [20]byte
 	}
-	value := []interface{}{
+	value := []any{
 		uint(999),
-		&struct1{A: "hello", B: big.NewInt(0xFFFFFFFF)},
+		&struct1{A: "hello", B: uint256.NewInt(0xFFFFFFFF)},
 		[10]byte{1, 2, 3, 4, 5, 6},
 		[]string{"yeah", "yeah", "yeah"},
 	}

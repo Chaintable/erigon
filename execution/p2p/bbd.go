@@ -26,6 +26,7 @@ import (
 
 	"github.com/erigontech/erigon/common"
 	"github.com/erigontech/erigon/common/log/v3"
+	"github.com/erigontech/erigon/common/math"
 	"github.com/erigontech/erigon/db/etl"
 	"github.com/erigontech/erigon/db/kv/dbutils"
 	"github.com/erigontech/erigon/execution/rlp"
@@ -210,7 +211,7 @@ func (bbd *BackwardBlockDownloader) downloadInitialHeader(
 		return nil, fmt.Errorf("asked to download hash at num 0: %s", hash)
 	}
 	currentHead := config.chainLengthCurrentHead
-	if currentHead != nil && *currentHead > headerNum && *currentHead-headerNum > config.chainLengthLimit {
+	if currentHead != nil && math.AbsoluteDifference(*currentHead, headerNum) > config.chainLengthLimit {
 		return nil, fmt.Errorf(
 			"%w: num=%d, hash=%s, currentHead=%d, limit=%d",
 			ErrChainLengthExceedsLimit,
@@ -296,17 +297,23 @@ func (bbd *BackwardBlockDownloader) downloadHeaderChainBackwards(
 			)
 		}
 
-		progressLogArgs := []interface{}{
-			"num", parentNum,
-			"hash", parentHash,
-			"amount", amount,
-			"peerId", peerId.String(),
-		}
 		select {
 		case <-logProgressTicker.C:
-			bbd.logger.Info("[backward-block-downloader] fetching headers backward periodic progress", progressLogArgs...)
+			progressLogArgs := []any{
+				"num", parentNum,
+				"hash", parentHash,
+				"amount", amount,
+			}
+			bbd.logger.Info("[backward-block-downloader] progress", progressLogArgs...)
 		default:
-			bbd.logger.Trace("[backward-block-downloader] fetching headers backward", progressLogArgs...)
+			if bbd.logger.Enabled(ctx, log.LvlTrace) {
+				progressLogArgs := []any{
+					"num", parentNum,
+					"hash", parentHash,
+					"amount", amount,
+				}
+				bbd.logger.Trace("[backward-block-downloader] fetching headers backward", progressLogArgs...)
+			}
 		}
 
 		peerIndex := peers.peerIdToIndex[peerId]
@@ -391,7 +398,7 @@ func (bbd *BackwardBlockDownloader) downloadBlocks(
 		return err
 	}
 	if len(headers) == 0 {
-		return feed.consumeData(ctx, nil)
+		return nil
 	}
 	// make sure to download blocks for the remaining incomplete header batch after the etl collector has been loaded
 	return bbd.downloadBlocksForHeaders(ctx, headers, peers, config, logProgressTicker, feed)
@@ -415,7 +422,7 @@ func (bbd *BackwardBlockDownloader) downloadBlocksForHeaders(
 	}
 	batchSize := (len(headers) + len(availablePeers) - 1) / len(availablePeers)
 	batchesCount := (len(headers) + batchSize - 1) / batchSize
-	progressLogArgs := []interface{}{
+	progressLogArgs := []any{
 		"fromNum", headers[0].Number.Uint64(),
 		"fromHash", headers[0].Hash(),
 		"toNum", headers[len(headers)-1].Number.Uint64(),

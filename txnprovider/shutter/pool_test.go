@@ -22,11 +22,13 @@ import (
 	"crypto/rand"
 	"fmt"
 	"io"
+	"math"
 	"math/big"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	mapset "github.com/deckarep/golang-set/v2"
@@ -37,14 +39,16 @@ import (
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc"
 
-	ethereum "github.com/erigontech/erigon"
 	"github.com/erigontech/erigon/common"
 	"github.com/erigontech/erigon/common/crypto"
+	"github.com/erigontech/erigon/common/event"
 	"github.com/erigontech/erigon/common/log/v3"
-	"github.com/erigontech/erigon/common/synctest"
 	"github.com/erigontech/erigon/common/testlog"
 	"github.com/erigontech/erigon/execution/abi"
+	"github.com/erigontech/erigon/execution/abi/bind"
+	"github.com/erigontech/erigon/execution/chain"
 	"github.com/erigontech/erigon/execution/chain/networkname"
+	"github.com/erigontech/erigon/execution/protocol/mdgas"
 	"github.com/erigontech/erigon/execution/types"
 	"github.com/erigontech/erigon/node/gointerfaces/remoteproto"
 	"github.com/erigontech/erigon/rpc/contracts"
@@ -200,6 +204,9 @@ func TestPoolCleanupShouldNotDeleteNewEncTxnsDueToConsecutiveEmptyDecrMsgs(t *te
 
 //goland:noinspection DuplicatedCode
 func TestPoolSkipsBlobTxns(t *testing.T) {
+	if testing.Short() {
+		t.Skip("slow test")
+	}
 	t.Parallel()
 	pt := PoolTest{t}
 	pt.Run(func(ctx context.Context, t *testing.T, pool *shutter.Pool, handle PoolTestHandle) {
@@ -288,7 +295,7 @@ func TestPoolProvideTxnsUsesGasTargetAndTxnsIdFilter(t *testing.T) {
 			txnprovider.WithBlockTime(handle.nextBlockTime),
 			txnprovider.WithParentBlockNum(handle.nextBlockNum-1),
 			txnprovider.WithTxnIdsFilter(txnsIdFilter),
-			txnprovider.WithGasTarget(gasLimit),
+			txnprovider.WithGasTarget(mdgas.NewFullMdGas(gasLimit, math.MaxUint64, math.MaxUint64)),
 		)
 		require.NoError(t, err)
 		require.Len(t, txnsRes1, 1)
@@ -297,11 +304,61 @@ func TestPoolProvideTxnsUsesGasTargetAndTxnsIdFilter(t *testing.T) {
 			txnprovider.WithBlockTime(handle.nextBlockTime),
 			txnprovider.WithParentBlockNum(handle.nextBlockNum-1),
 			txnprovider.WithTxnIdsFilter(txnsIdFilter),
-			txnprovider.WithGasTarget(gasLimit),
+			txnprovider.WithGasTarget(mdgas.NewFullMdGas(gasLimit, math.MaxUint64, math.MaxUint64)),
 		)
 		require.NoError(t, err)
 		require.Len(t, txnsRes2, 1)
 		require.Equal(t, 2, txnsIdFilter.Cardinality())
+	})
+}
+
+//goland:noinspection DuplicatedCode
+func TestPoolProvideTxnsFiltersByIntrinsicGasNotFullGasLimit(t *testing.T) {
+	// EIP-8037: gas filtering uses intrinsic regular/state gas per dimension,
+	// not the full txn gas limit. A txn whose gas limit exceeds availableGas
+	// in one dimension must still be included as long as its intrinsic gas
+	// fits. Execution-time state gas is enforced later by applyTransaction.
+	t.Parallel()
+	pt := PoolTest{t}
+	pt.Run(func(ctx context.Context, t *testing.T, pool *shutter.Pool, handle PoolTestHandle) {
+		ekg, err := testhelpers.MockEonKeyGeneration(shutter.EonIndex(0), 1, 2, 1)
+		require.NoError(t, err)
+		handle.SimulateInitialEonRead(t, ekg)
+		handle.SimulateFilterLogs(common.HexToAddress(handle.config.SequencerContractAddress), []types.Log{})
+		err = handle.SimulateNewBlockChange(ctx)
+		require.NoError(t, err)
+		synctest.Wait()
+		// A simple transfer has intrinsic regular gas of TxGas=21_000 and
+		// intrinsic state gas of 0 — but its declared gas limit is 100_000.
+		const txnGasLimit uint64 = 100_000
+		encTxn := MockEncryptedTxn(t, handle.config.ChainId, ekg.Eon(), MockWithGasLimit(txnGasLimit))
+		err = handle.SimulateLogEvents(ctx, []types.Log{
+			MockTxnSubmittedEventLog(t, handle.config, ekg.Eon(), 1, encTxn),
+		})
+		require.NoError(t, err)
+		handle.SimulateCachedEonRead(t, ekg)
+		err = handle.SimulateNewBlockChange(ctx)
+		require.NoError(t, err)
+		synctest.Wait()
+		require.Len(t, pool.AllEncryptedTxns(), 1)
+		handle.SimulateCurrentSlot()
+		handle.SimulateDecryptionKeys(ctx, t, ekg, 1, encTxn.IdentityPreimage)
+		synctest.Wait()
+		require.Len(t, pool.AllDecryptedTxns(), 1)
+		// Budget enough regular gas for the intrinsic (21_000) but strictly
+		// less than the txn's declared gas limit (100_000), and zero state
+		// gas. The pre-fix logic compared txn.GetGasLimit() against both
+		// dimensions and would have rejected this txn; the EIP-8037 logic
+		// accepts it because intrinsic gas fits.
+		txns, err := pool.ProvideTxns(
+			ctx,
+			txnprovider.WithBlockTime(handle.nextBlockTime),
+			txnprovider.WithParentBlockNum(handle.nextBlockNum-1),
+			txnprovider.WithGasTarget(mdgas.NewFullMdGas(50_000, 0, 0)),
+		)
+		require.NoError(t, err)
+		require.Len(t, txns, 1)
+		require.Equal(t, encTxn.OriginalTxn.Hash(), txns[0].Hash())
 	})
 }
 
@@ -370,6 +427,7 @@ func (t PoolTest) Run(testCase func(ctx context.Context, t *testing.T, pool *shu
 		pool := shutter.NewPool(
 			logger,
 			config,
+			chain.AllProtocolChanges,
 			baseTxnProvider,
 			contractBackend,
 			stateChangesClient,
@@ -541,7 +599,7 @@ type MockContractBackend struct {
 func (cb *MockContractBackend) PrepareMocks() {
 	cb.EXPECT().
 		SubscribeFilterLogs(gomock.Any(), gomock.Any(), gomock.Any()).
-		DoAndReturn(func(_ context.Context, q ethereum.FilterQuery, s chan<- types.Log) (ethereum.Subscription, error) {
+		DoAndReturn(func(_ context.Context, q bind.FilterQuery, s chan<- types.Log) (event.Subscription, error) {
 			cb.mu.Lock()
 			defer cb.mu.Unlock()
 			addrStrs := make([]string, 0, len(q.Addresses))
@@ -556,7 +614,7 @@ func (cb *MockContractBackend) PrepareMocks() {
 
 	cb.EXPECT().
 		CallContract(gomock.Any(), gomock.Any(), gomock.Any()).
-		DoAndReturn(func(ctx context.Context, msg ethereum.CallMsg, b *big.Int) ([]byte, error) {
+		DoAndReturn(func(ctx context.Context, msg bind.CallMsg, b *uint256.Int) ([]byte, error) {
 			cb.mu.Lock()
 			defer cb.mu.Unlock()
 			results := cb.mockedCallResults[*msg.To]
@@ -573,11 +631,10 @@ func (cb *MockContractBackend) PrepareMocks() {
 
 	cb.EXPECT().
 		FilterLogs(gomock.Any(), gomock.Any()).
-		DoAndReturn(func(ctx context.Context, query ethereum.FilterQuery) ([]types.Log, error) {
+		DoAndReturn(func(ctx context.Context, query bind.FilterQuery) ([]types.Log, error) {
 			cb.mu.Lock()
 			defer cb.mu.Unlock()
 			var res []types.Log
-			addrStrs := make([]string, 0, len(query.Addresses))
 			for _, addr := range query.Addresses {
 				logs := cb.mockedFilterLogs[addr]
 				if len(logs) == 0 {
@@ -586,7 +643,6 @@ func (cb *MockContractBackend) PrepareMocks() {
 				}
 				res = append(res, logs[0]...)
 				cb.mockedFilterLogs[addr] = logs[1:]
-				addrStrs = append(addrStrs, addr.Hex())
 			}
 			cb.logger.Trace("--- DEBUG --- called FilterLogs")
 			return res, nil
@@ -892,8 +948,14 @@ func MockTxnSubmittedEventData(
 	return data
 }
 
+type MockEncryptedTxnOption func(*types.LegacyTx)
+
+func MockWithGasLimit(gasLimit uint64) MockEncryptedTxnOption {
+	return func(tx *types.LegacyTx) { tx.GasLimit = gasLimit }
+}
+
 //goland:noinspection DuplicatedCode
-func MockEncryptedTxn(t *testing.T, chainId *uint256.Int, eon shutter.Eon) testhelpers.EncryptedSubmission {
+func MockEncryptedTxn(t *testing.T, chainId *uint256.Int, eon shutter.Eon, opts ...MockEncryptedTxnOption) testhelpers.EncryptedSubmission {
 	senderPrivKey, err := crypto.GenerateKey()
 	require.NoError(t, err)
 	senderAddr := crypto.PubkeyToAddress(senderPrivKey.PublicKey)
@@ -902,11 +964,14 @@ func MockEncryptedTxn(t *testing.T, chainId *uint256.Int, eon shutter.Eon) testh
 			Nonce:    uint64(99),
 			GasLimit: 21_000,
 			To:       &senderAddr, // send to self
-			Value:    uint256.NewInt(123),
+			Value:    *uint256.NewInt(123),
 		},
-		GasPrice: uint256.NewInt(555),
+		GasPrice: *uint256.NewInt(555),
 	}
-	signer := types.LatestSignerForChainID(chainId.ToBig())
+	for _, opt := range opts {
+		opt(txn)
+	}
+	signer := types.LatestSignerForChainID(chainId)
 	signedTxn, err := types.SignTx(txn, *signer, senderPrivKey)
 	require.NoError(t, err)
 	var signedTxnBuf bytes.Buffer
@@ -936,7 +1001,7 @@ func MockEncryptedBlobTxn(t *testing.T, chainId *uint256.Int, eon shutter.Eon) t
 	senderPrivKey, err := crypto.GenerateKey()
 	require.NoError(t, err)
 	senderAddr := crypto.PubkeyToAddress(senderPrivKey.PublicKey)
-	signer := types.LatestSignerForChainID(chainId.ToBig())
+	signer := types.LatestSignerForChainID(chainId)
 	txn := types.MakeV1WrappedBlobTxn(chainId)
 	signedTxn, err := types.SignTx(txn, *signer, senderPrivKey)
 	require.NoError(t, err)

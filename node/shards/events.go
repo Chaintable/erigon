@@ -21,43 +21,55 @@ import (
 	"sync/atomic"
 
 	"github.com/erigontech/erigon/common"
+	"github.com/erigontech/erigon/db/state/execctx"
+	"github.com/erigontech/erigon/execution/notifications"
 	"github.com/erigontech/erigon/execution/types"
-	"github.com/erigontech/erigon/node/gointerfaces"
-	"github.com/erigontech/erigon/node/gointerfaces/remoteproto"
-	"github.com/erigontech/erigon/node/gointerfaces/typesproto"
 )
 
-type RpcEventType uint64
+// RecentReceipts re-exports the type from execution/notifications.
+type RecentReceipts = notifications.RecentReceipts
+
+func NewRecentReceipts(limit uint64) *RecentReceipts {
+	return notifications.NewRecentReceipts(limit)
+}
 
 type NewSnapshotSubscription func() error
 type HeaderSubscription func(headerRLP []byte) error
 type PendingLogsSubscription func(types.Logs) error
 type PendingBlockSubscription func(*types.Block) error
 type PendingTxsSubscription func([]types.Transaction) error
-type LogsSubscription func([]*remoteproto.SubscribeLogsReply) error
 
-// Events manages event subscriptions and dissimination. Thread-safe
+// Events manages event subscriptions and dissemination. Thread-safe.
 type Events struct {
 	id                          int
 	headerSubscriptions         map[int]chan [][]byte
+	overlaySubscriptions        map[int]chan *execctx.SharedDomains
 	newSnapshotSubscription     map[int]chan struct{}
 	retirementStartSubscription map[int]chan bool
 	retirementDoneSubscription  map[int]chan struct{}
 	pendingLogsSubscriptions    map[int]PendingLogsSubscription
 	pendingBlockSubscriptions   map[int]PendingBlockSubscription
 	pendingTxsSubscriptions     map[int]PendingTxsSubscription
-	logsSubscriptions           map[int]chan []*remoteproto.SubscribeLogsReply
+	logsSubscriptions           map[int]chan []*notifications.LogNotification
 	hasLogSubscriptions         bool
+	receiptsSubscriptions       map[int]chan []*notifications.ReceiptNotification
+	hasReceiptSubscriptions     bool
 	lock                        sync.RWMutex
+
+	// latestSD holds the most recently published SharedDomains from FCU.
+	// Accessible lock-free for the builder and RPC layer.
+	latestSD atomic.Pointer[execctx.SharedDomains]
 }
 
 func NewEvents() *Events {
 	return &Events{
 		headerSubscriptions:         map[int]chan [][]byte{},
+		overlaySubscriptions:        map[int]chan *execctx.SharedDomains{},
+		receiptsSubscriptions:       map[int]chan []*notifications.ReceiptNotification{},
 		pendingLogsSubscriptions:    map[int]PendingLogsSubscription{},
 		pendingBlockSubscriptions:   map[int]PendingBlockSubscription{},
 		pendingTxsSubscriptions:     map[int]PendingTxsSubscription{},
-		logsSubscriptions:           map[int]chan []*remoteproto.SubscribeLogsReply{},
+		logsSubscriptions:           map[int]chan []*notifications.LogNotification{},
 		newSnapshotSubscription:     map[int]chan struct{}{},
 		retirementStartSubscription: map[int]chan bool{},
 		retirementDoneSubscription:  map[int]chan struct{}{},
@@ -72,9 +84,38 @@ func (e *Events) AddHeaderSubscription() (chan [][]byte, func()) {
 	id := e.id
 	e.headerSubscriptions[id] = ch
 	return ch, func() {
+		e.lock.Lock()
+		defer e.lock.Unlock()
 		delete(e.headerSubscriptions, id)
 		close(ch)
 	}
+}
+
+func (e *Events) AddReceiptsSubscription() (chan []*notifications.ReceiptNotification, func()) {
+	e.lock.Lock()
+	defer e.lock.Unlock()
+	ch := make(chan []*notifications.ReceiptNotification, 8)
+	e.id++
+	id := e.id
+	e.receiptsSubscriptions[id] = ch
+	return ch, func() {
+		e.lock.Lock()
+		defer e.lock.Unlock()
+		delete(e.receiptsSubscriptions, id)
+		close(ch)
+	}
+}
+
+func (e *Events) EmptyReceiptSubscription(empty bool) {
+	e.lock.Lock()
+	defer e.lock.Unlock()
+	e.hasReceiptSubscriptions = !empty
+}
+
+func (e *Events) HasReceiptSubscriptions() bool {
+	e.lock.RLock()
+	defer e.lock.RUnlock()
+	return e.hasReceiptSubscriptions
 }
 
 func (e *Events) AddNewSnapshotSubscription() (chan struct{}, func()) {
@@ -85,6 +126,8 @@ func (e *Events) AddNewSnapshotSubscription() (chan struct{}, func()) {
 	id := e.id
 	e.newSnapshotSubscription[id] = ch
 	return ch, func() {
+		e.lock.Lock()
+		defer e.lock.Unlock()
 		delete(e.newSnapshotSubscription, id)
 		close(ch)
 	}
@@ -98,6 +141,8 @@ func (e *Events) AddRetirementStartSubscription() (chan bool, func()) {
 	id := e.id
 	e.retirementStartSubscription[id] = ch
 	return ch, func() {
+		e.lock.Lock()
+		defer e.lock.Unlock()
 		delete(e.retirementStartSubscription, id)
 		close(ch)
 	}
@@ -111,19 +156,23 @@ func (e *Events) AddRetirementDoneSubscription() (chan struct{}, func()) {
 	id := e.id
 	e.retirementDoneSubscription[id] = ch
 	return ch, func() {
+		e.lock.Lock()
+		defer e.lock.Unlock()
 		delete(e.retirementDoneSubscription, id)
 		close(ch)
 	}
 }
 
-func (e *Events) AddLogsSubscription() (chan []*remoteproto.SubscribeLogsReply, func()) {
+func (e *Events) AddLogsSubscription() (chan []*notifications.LogNotification, func()) {
 	e.lock.Lock()
 	defer e.lock.Unlock()
-	ch := make(chan []*remoteproto.SubscribeLogsReply, 8)
+	ch := make(chan []*notifications.LogNotification, 8)
 	e.id++
 	id := e.id
 	e.logsSubscriptions[id] = ch
 	return ch, func() {
+		e.lock.Lock()
+		defer e.lock.Unlock()
 		delete(e.logsSubscriptions, id)
 		close(ch)
 	}
@@ -169,6 +218,41 @@ func (e *Events) OnNewHeader(newHeadersRlp [][]byte) {
 	}
 }
 
+// AddOverlaySubscription subscribes to SharedDomains publications. The SD
+// holds both the block overlay (table data) and domain state (accounts,
+// storage, code). In-process consumers (RPC, builder) use this to read
+// uncommitted data during background FCU commits.
+func (e *Events) AddOverlaySubscription() (chan *execctx.SharedDomains, func()) {
+	e.lock.Lock()
+	defer e.lock.Unlock()
+	ch := make(chan *execctx.SharedDomains, 2)
+	e.id++
+	id := e.id
+	e.overlaySubscriptions[id] = ch
+	return ch, func() {
+		e.lock.Lock()
+		defer e.lock.Unlock()
+		delete(e.overlaySubscriptions, id)
+		close(ch)
+	}
+}
+
+// PublishOverlay sends the SharedDomains to all in-process subscribers.
+// The SD is shared read-only; the background commit goroutine owns its lifecycle.
+func (e *Events) PublishOverlay(sd *execctx.SharedDomains) {
+	e.latestSD.Store(sd)
+	e.lock.Lock()
+	defer e.lock.Unlock()
+	for _, ch := range e.overlaySubscriptions {
+		common.PrioritizedSend(ch, sd)
+	}
+}
+
+// LatestSD returns the most recently published SharedDomains, or nil.
+func (e *Events) LatestSD() *execctx.SharedDomains {
+	return e.latestSD.Load()
+}
+
 func (e *Events) OnNewPendingLogs(logs types.Logs) {
 	e.lock.Lock()
 	defer e.lock.Unlock()
@@ -179,11 +263,19 @@ func (e *Events) OnNewPendingLogs(logs types.Logs) {
 	}
 }
 
-func (e *Events) OnLogs(logs []*remoteproto.SubscribeLogsReply) {
+func (e *Events) OnLogs(logs []*notifications.LogNotification) {
 	e.lock.Lock()
 	defer e.lock.Unlock()
 	for _, ch := range e.logsSubscriptions {
 		common.PrioritizedSend(ch, logs)
+	}
+}
+
+func (e *Events) OnReceipts(receipts []*notifications.ReceiptNotification) {
+	e.lock.Lock()
+	defer e.lock.Unlock()
+	for _, ch := range e.receiptsSubscriptions {
+		common.PrioritizedSend(ch, receipts)
 	}
 }
 
@@ -207,7 +299,7 @@ type Notifications struct {
 	Events               *Events
 	Accumulator          *Accumulator // StateAccumulator
 	StateChangesConsumer StateChangeConsumer
-	RecentLogs           *RecentLogs
+	RecentReceipts       *RecentReceipts
 	LastNewBlockSeen     atomic.Uint64 // This is used by eth_syncing as an heuristic to determine if the node is syncing or not.
 }
 
@@ -219,117 +311,7 @@ func NewNotifications(StateChangesConsumer StateChangeConsumer) *Notifications {
 	return &Notifications{
 		Events:               NewEvents(),
 		Accumulator:          NewAccumulator(),
-		RecentLogs:           NewRecentLogs(512),
+		RecentReceipts:       NewRecentReceipts(512),
 		StateChangesConsumer: StateChangesConsumer,
-	}
-}
-
-// Requirements:
-// - Erigon3 doesn't store logs in db (yet)
-// - need support unwind of receipts
-// - need send notification after `rwtx.Commit` (or user will recv notification, but can't request new data by RPC)
-type RecentLogs struct {
-	receipts map[uint64]types.Receipts
-	limit    uint64
-	mu       sync.Mutex
-}
-
-func NewRecentLogs(limit uint64) *RecentLogs {
-	return &RecentLogs{receipts: make(map[uint64]types.Receipts, limit), limit: limit}
-}
-
-// [from,to)
-func (r *RecentLogs) Notify(n *Events, from, to uint64, isUnwind bool) {
-	if !n.HasLogSubscriptions() {
-		return
-	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	for bn, receipts := range r.receipts {
-		if bn+r.limit < from { //evict old
-			delete(r.receipts, bn)
-			continue
-		}
-		if bn < from || bn >= to {
-			continue
-		}
-
-		var blockNum uint64
-		reply := make([]*remoteproto.SubscribeLogsReply, 0, len(receipts))
-		for _, receipt := range receipts {
-			if receipt == nil {
-				continue
-			}
-
-			blockNum = receipt.BlockNumber.Uint64()
-			//txIndex++
-			//// bor transactions are at the end of the bodies transactions (added manually but not actually part of the block)
-			//if txIndex == uint64(len(block.Transactions())) {
-			//	txHash = bortypes.ComputeBorTxHash(blockNum, block.Hash())
-			//} else {
-			//	txHash = block.Transactions()[txIndex].Hash()
-			//}
-
-			for _, l := range receipt.Logs {
-				res := &remoteproto.SubscribeLogsReply{
-					Address:          gointerfaces.ConvertAddressToH160(l.Address),
-					BlockHash:        gointerfaces.ConvertHashToH256(receipt.BlockHash),
-					BlockNumber:      blockNum,
-					Data:             l.Data,
-					LogIndex:         uint64(l.Index),
-					Topics:           make([]*typesproto.H256, 0, len(l.Topics)),
-					TransactionHash:  gointerfaces.ConvertHashToH256(receipt.TxHash),
-					TransactionIndex: uint64(l.TxIndex),
-					Removed:          isUnwind,
-				}
-				for _, topic := range l.Topics {
-					res.Topics = append(res.Topics, gointerfaces.ConvertHashToH256(topic))
-				}
-				reply = append(reply, res)
-			}
-		}
-
-		n.OnLogs(reply)
-	}
-}
-
-func (r *RecentLogs) Add(receipts types.Receipts) {
-	if len(receipts) == 0 {
-		return
-	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	var blockNum uint64
-	var ok bool
-	// find non-nil receipt
-	for _, receipt := range receipts {
-		if receipt != nil {
-			ok = true
-			blockNum = receipt.BlockNumber.Uint64()
-			break
-		}
-	}
-	if !ok {
-		return
-	}
-	r.receipts[blockNum] = receipts
-
-	//enforce `limit`: drop all items older than `limit` blocks
-	if len(r.receipts) <= int(r.limit) {
-		return
-	}
-	for bn := range r.receipts {
-		if bn+r.limit < blockNum {
-			delete(r.receipts, bn)
-		}
-	}
-}
-
-func (r *RecentLogs) CopyAndReset(target *RecentLogs) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	for blockNum, receipts := range r.receipts {
-		target.Add(receipts)
-		delete(r.receipts, blockNum)
 	}
 }

@@ -96,7 +96,7 @@ func TestTxDependencyBlockDecoding(t *testing.T) {
 	if err := rlp.DecodeBytes(blockEnc, &block); err != nil {
 		t.Fatal("decode error: ", err)
 	}
-	check := func(f string, got, want interface{}) {
+	check := func(f string, got, want any) {
 		if !reflect.DeepEqual(got, want) {
 			t.Errorf("%s mismatch: got %v, want %v", f, got, want)
 		}
@@ -132,12 +132,12 @@ func TestBlockEncoding(t *testing.T) {
 		t.Fatal("decode error: ", err)
 	}
 
-	check := func(f string, got, want interface{}) {
+	check := func(f string, got, want any) {
 		if !reflect.DeepEqual(got, want) {
 			t.Errorf("%s mismatch: got %v, want %v", f, got, want)
 		}
 	}
-	check("Difficulty", block.Difficulty(), big.NewInt(131072))
+	check("Difficulty", block.Difficulty(), *uint256.NewInt(131072))
 	check("GasLimit", block.GasLimit(), uint64(3141592))
 	check("GasUsed", block.GasUsed(), uint64(21000))
 	check("Coinbase", block.Coinbase(), common.HexToAddress("8888f1f195afa192cfee860698584c030f4c9db1"))
@@ -169,13 +169,13 @@ func TestEIP1559BlockEncoding(t *testing.T) {
 		t.Fatal("decode error: ", err)
 	}
 
-	check := func(f string, got, want interface{}) {
+	check := func(f string, got, want any) {
 		if !reflect.DeepEqual(got, want) {
 			t.Errorf("%s mismatch: got %v, want %v", f, got, want)
 		}
 	}
 
-	check("Difficulty", block.Difficulty(), big.NewInt(131072))
+	check("Difficulty", block.Difficulty(), *uint256.NewInt(131072))
 	check("GasLimit", block.GasLimit(), uint64(3141592))
 	check("GasUsed", block.GasUsed(), uint64(21000))
 	check("Coinbase", block.Coinbase(), common.HexToAddress("8888f1f195afa192cfee860698584c030f4c9db1"))
@@ -185,7 +185,7 @@ func TestEIP1559BlockEncoding(t *testing.T) {
 	check("Nonce", block.NonceU64(), uint64(0xa13a5a8c8f2bb1c4))
 	check("Time", block.Time(), uint64(1426516743))
 	check("Size", block.Size(), common.StorageSize(len(blockEnc)))
-	check("BaseFee", block.BaseFee(), new(big.Int).SetUint64(params.InitialBaseFee))
+	check("BaseFee", block.BaseFee(), uint256.NewInt(params.InitialBaseFee))
 
 	var tx1 Transaction = NewTransaction(0, common.HexToAddress("095e7baea6a6c7c4c2dfeb977efac326af552d87"), new(uint256.Int).SetUint64(10), 50000, new(uint256.Int).SetUint64(10), nil)
 	tx1, _ = tx1.WithSignature(*LatestSignerForChainID(nil), common.Hex2Bytes("9bea4c4daac7c7c52e093e6a4c35dbbcf8856f1af7b059ba20253e70848d094f8a8fae537ce25ed8cb5af9adac3f141af69bd515bd2ba031522df09b97dd72b100"))
@@ -198,7 +198,7 @@ func TestEIP1559BlockEncoding(t *testing.T) {
 		},
 	}}
 	to := common.HexToAddress("095e7baea6a6c7c4c2dfeb977efac326af552d87")
-	feeCap, _ := uint256.FromBig(block.BaseFee())
+	feeCap := block.BaseFee()
 	var tx2 Transaction = &DynamicFeeTransaction{
 		CommonTx: CommonTx{
 			Nonce:    0,
@@ -207,11 +207,11 @@ func TestEIP1559BlockEncoding(t *testing.T) {
 			Data:     []byte{},
 		},
 		ChainID:    u256.Num1,
-		FeeCap:     feeCap,
+		FeeCap:     *feeCap,
 		TipCap:     u256.Num0,
 		AccessList: accesses,
 	}
-	tx2, err := tx2.WithSignature(*LatestSignerForChainID(big.NewInt(1)), common.Hex2Bytes("fe38ca4e44a30002ac54af7cf922a6ac2ba11b7d22f548e8ecb3f51f41cb31b06de6a5cbae13c0c856e33acf021b51819636cfc009d39eafb9f606d546e305a800"))
+	tx2, err := tx2.WithSignature(*LatestSignerForChainID(uint256.NewInt(1)), common.Hex2Bytes("fe38ca4e44a30002ac54af7cf922a6ac2ba11b7d22f548e8ecb3f51f41cb31b06de6a5cbae13c0c856e33acf021b51819636cfc009d39eafb9f606d546e305a800"))
 	if err != nil {
 		t.Fatal("invalid signature error: ", err)
 	}
@@ -237,12 +237,12 @@ func TestEIP2718BlockEncoding(t *testing.T) {
 		t.Fatal("decode error: ", err)
 	}
 
-	check := func(f string, got, want interface{}) {
+	check := func(f string, got, want any) {
 		if !reflect.DeepEqual(got, want) {
 			t.Errorf("%s mismatch: got %v, want %v", f, got, want)
 		}
 	}
-	check("Difficulty", block.Difficulty(), big.NewInt(131072))
+	check("Difficulty", block.Difficulty(), *uint256.NewInt(131072))
 	check("GasLimit", block.GasLimit(), uint64(3141592))
 	check("GasUsed", block.GasUsed(), uint64(42000))
 	check("Coinbase", block.Coinbase(), common.HexToAddress("8888f1f195afa192cfee860698584c030f4c9db1"))
@@ -254,7 +254,7 @@ func TestEIP2718BlockEncoding(t *testing.T) {
 
 	// Create legacy tx.
 	to := common.HexToAddress("095e7baea6a6c7c4c2dfeb977efac326af552d87")
-	ten := new(uint256.Int).SetUint64(10)
+	ten := *new(uint256.Int).SetUint64(10)
 	var tx1 Transaction = &LegacyTx{
 		CommonTx: CommonTx{
 			Nonce:    0,
@@ -271,7 +271,7 @@ func TestEIP2718BlockEncoding(t *testing.T) {
 	// Create ACL tx.
 	addr := common.HexToAddress("0x0000000000000000000000000000000000000001")
 	var tx2 Transaction = &AccessListTx{
-		ChainID: chainID,
+		ChainID: *chainID,
 		LegacyTx: LegacyTx{
 			CommonTx: CommonTx{
 				Nonce:    0,
@@ -283,7 +283,7 @@ func TestEIP2718BlockEncoding(t *testing.T) {
 		AccessList: AccessList{{Address: addr, StorageKeys: []common.Hash{{0}}}},
 	}
 	sig2 := common.Hex2Bytes("3dbacc8d0259f2508625e97fdfc57cd85fdd16e5821bc2c10bdd1a52649e8335476e10695b183a87b0aa292a7f4b78ef0c3fbe62aa2c42c84e1d9c3da159ef1401")
-	tx2, _ = tx2.WithSignature(*LatestSignerForChainID(big.NewInt(1)), sig2)
+	tx2, _ = tx2.WithSignature(*LatestSignerForChainID(uint256.NewInt(1)), sig2)
 
 	check("len(Transactions)", len(block.Transactions()), 2)
 	check("Transactions[0].Hash", block.Transactions()[0].Hash(), tx1.Hash())
@@ -322,17 +322,33 @@ func BenchmarkEncodeBlock(b *testing.B) {
 	}
 }
 
+func BenchmarkDecodeBlock(b *testing.B) {
+	block := makeBenchBlock()
+	encoded, err := rlp.EncodeToBytes(block)
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.ResetTimer()
+
+	for b.Loop() {
+		var decoded Block
+		if err := rlp.DecodeBytes(encoded, &decoded); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
 func makeBenchBlock() *Block {
 	var (
 		key, _   = crypto.GenerateKey()
 		txs      = make([]Transaction, 70)
 		receipts = make([]*Receipt, len(txs))
-		signer   = LatestSigner(chain.TestChainConfig)
+		signer   = LatestSigner(chain.AllProtocolChanges)
 		uncles   = make([]*Header, 3)
 	)
 	header := &Header{
-		Difficulty: math.BigPow(11, 11),
-		Number:     math.BigPow(2, 9),
+		Difficulty: *uint256.NewInt(285311670611), // 11^11
+		Number:     *uint256.NewInt(0x200),        // 2^9
 		GasLimit:   12345678,
 		GasUsed:    1476322,
 		Time:       9876543,
@@ -352,8 +368,8 @@ func makeBenchBlock() *Block {
 	}
 	for i := range uncles {
 		uncles[i] = &Header{
-			Difficulty: math.BigPow(11, 11),
-			Number:     math.BigPow(2, 9),
+			Difficulty: *uint256.NewInt(285311670611), // 11^11
+			Number:     *uint256.NewInt(0x200),        // 2^9
 			GasLimit:   12345678,
 			GasUsed:    1476322,
 			Time:       9876543,
@@ -375,8 +391,8 @@ func TestCanEncodeAndDecodeRawBody(t *testing.T) {
 				TxHash:      common.Hash{},
 				ReceiptHash: common.Hash{},
 				Bloom:       Bloom{},
-				Difficulty:  big.NewInt(100),
-				Number:      big.NewInt(1000),
+				Difficulty:  *uint256.NewInt(100),
+				Number:      *uint256.NewInt(1000),
 				GasLimit:    50,
 				GasUsed:     60,
 				Time:        90,
@@ -385,8 +401,8 @@ func TestCanEncodeAndDecodeRawBody(t *testing.T) {
 			{
 				GasUsed:    108,
 				GasLimit:   100,
-				Difficulty: big.NewInt(99),
-				Number:     big.NewInt(1000),
+				Difficulty: *uint256.NewInt(99),
+				Number:     *uint256.NewInt(1000),
 			},
 		},
 		Transactions: [][]byte{
@@ -407,12 +423,12 @@ func TestCanEncodeAndDecodeRawBody(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	rlpBytes := common.CopyBytes(writer.Bytes())
+	rlpBytes := common.Copy(writer.Bytes())
 	writer.Reset()
 	writer.WriteString(hexutil.Encode(rlpBytes))
 
 	var rawBody RawBody
-	fromHex := common.CopyBytes(common.FromHex(writer.String()))
+	fromHex := common.Copy(common.FromHex(writer.String()))
 	bodyReader := bytes.NewReader(fromHex)
 	stream := rlp.NewStream(bodyReader, 0)
 
@@ -441,15 +457,15 @@ func TestCanEncodeAndDecodeRawBody(t *testing.T) {
 	if rawBody.Uncles[1].GasLimit != 100 {
 		t.Fatal("expected gas limit of 2nd uncle to be 100")
 	}
-	if string(resultJson) != string(expectedJson) {
+	if !bytes.Equal(resultJson, expectedJson) {
 		t.Fatalf("encoded and decoded json do not match, got\n%s\nwant\n%s", resultJson, expectedJson)
 	}
 }
 
 func TestAuRaHeaderEncoding(t *testing.T) {
 	t.Parallel()
-	difficulty, ok := new(big.Int).SetString("8398142613866510000000000000000000000000000000", 10)
-	require.True(t, ok)
+	difficulty, err := uint256.FromDecimal("8398142613866510000000000000000000000000000000")
+	require.NoError(t, err)
 
 	header := Header{
 		ParentHash:  common.HexToHash("0x8b00fcf1e541d371a3a1b79cc999a85cc3db5ee5637b5159646e1acd3613fd15"),
@@ -458,13 +474,13 @@ func TestAuRaHeaderEncoding(t *testing.T) {
 		Root:        common.HexToHash("0x351780124dae86b84998c6d4fe9a88acfb41b4856b4f2c56767b51a4e2f94dd4"),
 		TxHash:      common.HexToHash("0x6a35133fbff7ea2cb5ee7635c9fb623f96d31d689d806a2bfe40a2b1d90ee99c"),
 		ReceiptHash: common.HexToHash("0x324f54860e214ea896ea7a05bda30f85541be3157de77a9059a04fdb1e86badd"),
-		Difficulty:  difficulty,
-		Number:      big.NewInt(24679923),
+		Difficulty:  *difficulty,
+		Number:      *uint256.NewInt(24679923),
 		GasLimit:    30_000_000,
 		GasUsed:     3_074_345,
 		Time:        1666343339,
 		Extra:       common.FromHex("0x1234"),
-		BaseFee:     big.NewInt(7_000_000_000),
+		BaseFee:     uint256.NewInt(7_000_000_000),
 		AuRaStep:    13078,
 		AuRaSeal:    common.FromHex("0x75bda30f85541be059646e1acd3613fd100846e42308df2dad8ed79b9a9e91c9db994386599a683820a1394684d41fc139c4805684142e6b15a722a2e9cc51f7ee"),
 	}
@@ -479,20 +495,98 @@ func TestAuRaHeaderEncoding(t *testing.T) {
 	require.Nil(t, deep.Equal(&header, &decoded))
 }
 
+// TestDecodeHeader_HoistedReuseAcrossAuRaTransition exercises the hoisted
+// *Header pattern used by ForEachHeader at the AuRa/PoS boundary. The
+// inactive branch's fields must be cleared on each decode so a reused
+// struct does not leak AuRaStep/AuRaSeal (or, symmetrically, MixDigest/
+// Nonce) into the next header, which would make Header.EncodeRLP take the
+// wrong branch and yield a wrong Hash().
+func TestDecodeHeader_HoistedReuseAcrossAuRaTransition(t *testing.T) {
+	t.Parallel()
+
+	auraDifficulty, err := uint256.FromDecimal("8398142613866510000000000000000000000000000000")
+	require.NoError(t, err)
+	aura := Header{
+		ParentHash:  common.HexToHash("0x8b00fcf1e541d371a3a1b79cc999a85cc3db5ee5637b5159646e1acd3613fd15"),
+		UncleHash:   common.HexToHash("0x1dcc4de8dec75d7aab85b567b6ccd41ad312451b948a7413f0a142fd40d49347"),
+		Coinbase:    common.HexToAddress("0x571846e42308df2dad8ed792f44a8bfddf0acb4d"),
+		Root:        common.HexToHash("0x351780124dae86b84998c6d4fe9a88acfb41b4856b4f2c56767b51a4e2f94dd4"),
+		TxHash:      common.HexToHash("0x6a35133fbff7ea2cb5ee7635c9fb623f96d31d689d806a2bfe40a2b1d90ee99c"),
+		ReceiptHash: common.HexToHash("0x324f54860e214ea896ea7a05bda30f85541be3157de77a9059a04fdb1e86badd"),
+		Difficulty:  *auraDifficulty,
+		Number:      *uint256.NewInt(24_679_923),
+		GasLimit:    30_000_000,
+		GasUsed:     3_074_345,
+		Time:        1_666_343_339,
+		Extra:       common.FromHex("0x1234"),
+		BaseFee:     uint256.NewInt(7_000_000_000),
+		AuRaStep:    13_078,
+		AuRaSeal:    common.FromHex("0x75bda30f85541be059646e1acd3613fd100846e42308df2dad8ed79b9a9e91c9db994386599a683820a1394684d41fc139c4805684142e6b15a722a2e9cc51f7ee"),
+	}
+
+	pos := Header{
+		ParentHash:  common.HexToHash("0xaaaa000000000000000000000000000000000000000000000000000000000000"),
+		UncleHash:   common.HexToHash("0x1dcc4de8dec75d7aab85b567b6ccd41ad312451b948a7413f0a142fd40d49347"),
+		Coinbase:    common.HexToAddress("0xbbbb000000000000000000000000000000000000"),
+		Root:        common.HexToHash("0xcccc000000000000000000000000000000000000000000000000000000000000"),
+		TxHash:      common.HexToHash("0x6a35133fbff7ea2cb5ee7635c9fb623f96d31d689d806a2bfe40a2b1d90ee99c"),
+		ReceiptHash: common.HexToHash("0x324f54860e214ea896ea7a05bda30f85541be3157de77a9059a04fdb1e86badd"),
+		Difficulty:  *common.Num0,
+		Number:      *uint256.NewInt(25_528_811),
+		GasLimit:    30_000_000,
+		GasUsed:     1_234_567,
+		Time:        1_700_000_000,
+		Extra:       common.FromHex("0xdeadbeef"),
+		MixDigest:   common.HexToHash("0x7f04e338b206ef863a1fad30e082bbb61571c74e135df8d1677e3f8b8171a09b"),
+		Nonce:       BlockNonce{1, 2, 3, 4, 5, 6, 7, 8},
+		BaseFee:     uint256.NewInt(7_000_000_000),
+	}
+
+	auraHash := aura.Hash()
+	posHash := pos.Hash()
+
+	auraRLP, err := rlp.EncodeToBytes(&aura)
+	require.NoError(t, err)
+	posRLP, err := rlp.EncodeToBytes(&pos)
+	require.NoError(t, err)
+
+	t.Run("aura_then_pos", func(t *testing.T) {
+		var h Header
+		require.NoError(t, DecodeHeader(auraRLP, &h))
+		require.Equal(t, auraHash, h.Hash(), "AuRa decode hash mismatch")
+
+		require.NoError(t, DecodeHeader(posRLP, &h))
+		require.Zero(t, h.AuRaStep, "AuRaStep leaked from previous AuRa decode")
+		require.Empty(t, h.AuRaSeal, "AuRaSeal leaked from previous AuRa decode")
+		require.Equal(t, posHash, h.Hash(), "post-merge hash wrong after AuRa->PoS reuse")
+	})
+
+	t.Run("pos_then_aura", func(t *testing.T) {
+		var h Header
+		require.NoError(t, DecodeHeader(posRLP, &h))
+		require.Equal(t, posHash, h.Hash(), "PoS decode hash mismatch")
+
+		require.NoError(t, DecodeHeader(auraRLP, &h))
+		require.Equal(t, common.Hash{}, h.MixDigest, "MixDigest leaked from previous PoS decode")
+		require.Equal(t, BlockNonce{}, h.Nonce, "Nonce leaked from previous PoS decode")
+		require.Equal(t, auraHash, h.Hash(), "AuRa hash wrong after PoS->AuRa reuse")
+	})
+}
+
 func TestWithdrawalsEncoding(t *testing.T) {
 	t.Parallel()
 	header := Header{
 		ParentHash: common.HexToHash("0x8b00fcf1e541d371a3a1b79cc999a85cc3db5ee5637b5159646e1acd3613fd15"),
 		Coinbase:   common.HexToAddress("0x571846e42308df2dad8ed792f44a8bfddf0acb4d"),
 		Root:       common.HexToHash("0x351780124dae86b84998c6d4fe9a88acfb41b4856b4f2c56767b51a4e2f94dd4"),
-		Difficulty: common.Big0,
-		Number:     big.NewInt(20_000_000),
+		Difficulty: *common.Num0,
+		Number:     *uint256.NewInt(20_000_000),
 		GasLimit:   30_000_000,
 		GasUsed:    3_074_345,
 		Time:       1666343339,
 		Extra:      make([]byte, 0),
 		MixDigest:  common.HexToHash("0x7f04e338b206ef863a1fad30e082bbb61571c74e135df8d1677e3f8b8171a09b"),
-		BaseFee:    big.NewInt(7_000_000_000),
+		BaseFee:    uint256.NewInt(7_000_000_000),
 	}
 
 	withdrawals := make([]*Withdrawal, 2)
@@ -586,11 +680,11 @@ func TestCopyTxs(t *testing.T) {
 	txs = append(txs, &LegacyTx{
 		CommonTx: CommonTx{
 			Nonce:    0,
-			Value:    new(uint256.Int).SetUint64(10000),
+			Value:    *new(uint256.Int).SetUint64(10000),
 			GasLimit: 50000,
 			Data:     []byte("Sparta"),
 		},
-		GasPrice: new(uint256.Int).SetUint64(10),
+		GasPrice: *new(uint256.Int).SetUint64(10),
 	})
 
 	populateBlobTxs()
@@ -616,11 +710,11 @@ func TestCopyHeader(t *testing.T) {
 	}
 }
 
-func TestEncodeBigIntBufferOverflowPrevention(t *testing.T) {
-	// Covers an EncodeBigInt() panic that can happen if a malicious peer sends a header with a big.Int with a 32-byte value
+func TestEncodeUint256BufferOverflowPrevention(t *testing.T) {
+	// Covers an EncodeUint256() panic that can happen if a malicious peer sends a header with a uint256 with a 32-byte value
 	// Create a 249-bit base fee value (32 bytes in big-endian)
 	// This is the minimum bit length that requires 32 bytes of storage
-	maliciousBaseFee := new(big.Int).Lsh(big.NewInt(1), 248) // 2^248, BitLen() = 249
+	maliciousBaseFee := new(uint256.Int).Lsh(uint256.NewInt(1), 248) // 2^248, BitLen() = 249
 	// Create a header with the malicious difficulty
 	header := &Header{
 		ParentHash:  common.Hash{},
@@ -631,7 +725,7 @@ func TestEncodeBigIntBufferOverflowPrevention(t *testing.T) {
 		ReceiptHash: common.Hash{},
 		Bloom:       Bloom{},
 		BaseFee:     maliciousBaseFee,
-		Number:      big.NewInt(1),
+		Number:      *uint256.NewInt(1),
 		GasLimit:    8000000,
 		GasUsed:     0,
 		Time:        1234567890,
@@ -639,6 +733,43 @@ func TestEncodeBigIntBufferOverflowPrevention(t *testing.T) {
 		MixDigest:   common.Hash{},
 		Nonce:       BlockNonce{},
 	}
-	// Calling Hash() will trigger Header.EncodeRLP() -> EncodeBigInt() -> panic
+	// Calling Hash() will trigger Header.EncodeRLP() -> EncodeUint256() — make sure this doesn't panic.
 	_ = header.Hash()
+}
+
+// A Block built from the binary engine_newPayload tx bytes must produce exactly
+// the same RawBody() encoding as one built without the cache; otherwise the stored
+// body and the EIP-7934 block-RLP-size check diverge for typed (EIP-2718) txs.
+func TestBlockRawBodyFromBinaryTxsMatchesEncoded(t *testing.T) {
+	t.Parallel()
+	tr := NewTRand()
+	txTypes := []int{LegacyTxType, AccessListTxType, DynamicFeeTxType, BlobTxType, SetCodeTxType}
+
+	binaryTxs := make(BinaryTransactions, len(txTypes))
+	txns := make([]Transaction, len(txTypes))
+	for i, txType := range txTypes {
+		// Blob/SetCode txs require a non-nil To, which RandTransaction picks
+		// at random — retry until we get one that round-trips.
+		for attempt := 0; txns[i] == nil && attempt < 1000; attempt++ {
+			var buf bytes.Buffer
+			if tr.RandTransaction(txType).MarshalBinary(&buf) != nil {
+				continue
+			}
+			binaryTxn := common.Copy(buf.Bytes())
+			if decoded, err := DecodeTransaction(binaryTxn); err == nil {
+				binaryTxs[i], txns[i] = binaryTxn, decoded
+			}
+		}
+		require.NotNilf(t, txns[i], "could not generate a decodable txType=%d", txType)
+	}
+
+	cached := NewBlockFromStorageWithBinaryTxs(common.Hash{}, &Header{}, txns, binaryTxs, nil, nil)
+	reference := NewBlockFromStorage(common.Hash{}, &Header{}, txns, nil, nil)
+
+	got, want := cached.RawBody(), reference.RawBody()
+	require.Len(t, got.Transactions, len(want.Transactions))
+	for i, txType := range txTypes {
+		require.Equalf(t, want.Transactions[i], got.Transactions[i],
+			"txType=%d: cached RawBody tx bytes must equal the rlp.EncodeToBytes form", txType)
+	}
 }

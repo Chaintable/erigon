@@ -19,12 +19,14 @@ package exec
 import (
 	"context"
 	"fmt"
+	"runtime/pprof"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"golang.org/x/sync/errgroup"
 
+	"github.com/erigontech/erigon/common"
 	"github.com/erigontech/erigon/common/dbg"
 	"github.com/erigontech/erigon/common/log/v3"
 	"github.com/erigontech/erigon/db/consensuschain"
@@ -33,9 +35,10 @@ import (
 	"github.com/erigontech/erigon/db/services"
 	"github.com/erigontech/erigon/diagnostics/metrics"
 	"github.com/erigontech/erigon/execution/chain"
-	"github.com/erigontech/erigon/execution/exec/calltracer"
+	"github.com/erigontech/erigon/execution/protocol"
 	"github.com/erigontech/erigon/execution/protocol/rules"
 	"github.com/erigontech/erigon/execution/state"
+	"github.com/erigontech/erigon/execution/tracing/calltracer"
 	"github.com/erigontech/erigon/execution/types"
 	"github.com/erigontech/erigon/execution/vm"
 	"github.com/erigontech/erigon/execution/vm/evmtypes"
@@ -97,11 +100,17 @@ func (c *activeCount) Add(i int64) {
 }
 
 type Worker struct {
-	lock        *sync.RWMutex
-	notifier    *sync.Cond
-	runnable    atomic.Bool
-	logger      log.Logger
-	chainDb     kv.RoDB
+	lock     *sync.RWMutex
+	notifier *sync.Cond
+	runnable atomic.Bool
+	logger   log.Logger
+	chainDb  kv.TemporalRoDB
+	// chainRoTx is the raw MDBX roTx that owns this worker's snapshot — the
+	// only handle that may be Rolled back. chainTx is the overlay-aware view
+	// (chainRoTx wrapped with the SharedDomains BlockOverlay if one is active);
+	// all reads must go through chainTx so any new consumer is overlay-aware
+	// by construction.
+	chainRoTx   kv.TemporalTx
 	chainTx     kv.TemporalTx
 	background  bool // if true - worker does manage RoTx (begin/rollback) in .ResetTx()
 	blockReader services.FullBlockReader
@@ -126,7 +135,29 @@ type Worker struct {
 	metrics *WorkerMetrics
 }
 
-func NewWorker(ctx context.Context, background bool, metrics *WorkerMetrics, chainDb kv.RoDB, in *QueueWithRetry, blockReader services.FullBlockReader, chainConfig *chain.Config, genesis *types.Genesis, results *ResultsQueue, engine rules.Engine, dirs datadir.Dirs, logger log.Logger) *Worker {
+// installWorkerGetHash replaces the EVM's GetHash function with one that
+// uses the worker's own chainTx for BLOCKHASH lookups, avoiding any share
+// of the executeBlocks goroutine's roTx across worker goroutines (data
+// race). chainTx is already overlay-aware (see resetTx) so headers staged
+// in the BlockOverlay but not yet flushed to MDBX are visible.
+func (rw *Worker) installWorkerGetHash(txTask Task) {
+	header := txTask.BlockHeader()
+	if header == nil {
+		return
+	}
+	workerTx := rw.chainTx
+	br := rw.blockReader
+	ctx := rw.ctx
+	rw.evm.Context.GetHash = protocol.GetHashFn(header, func(hash common.Hash, number uint64) (*types.Header, error) {
+		h, err := br.Header(ctx, workerTx, hash, number)
+		if h == nil && err == nil {
+			h = &types.Header{}
+		}
+		return h, err
+	})
+}
+
+func NewWorker(ctx context.Context, background bool, metrics *WorkerMetrics, chainDb kv.TemporalRoDB, in *QueueWithRetry, blockReader services.FullBlockReader, chainConfig *chain.Config, genesis *types.Genesis, results *ResultsQueue, engine rules.Engine, dirs datadir.Dirs, logger log.Logger) *Worker {
 	lock := &sync.RWMutex{}
 
 	w := &Worker{
@@ -184,33 +215,51 @@ func (rw *Worker) Resume() {
 	rw.notifier.Signal()
 }
 
-func (rw *Worker) LogLRUStats() { rw.evm.Config().JumpDestCache.LogStats() }
+func (rw *Worker) LogLRUStats() {}
 
-func (rw *Worker) ResetState(rs *state.StateV3Buffered, chainTx kv.TemporalTx, stateReader state.StateReader, stateWriter state.StateWriter, accumulator *shards.Accumulator) {
+func (rw *Worker) ResetState(rs *state.StateV3Buffered, chainTx kv.TemporalTx, stateReader state.StateReader, stateWriter state.StateWriter, accumulator *shards.Accumulator) error {
 	rw.lock.Lock()
 	defer rw.lock.Unlock()
 
 	rw.rs = rs
-	rw.resetTx(chainTx)
 
 	if stateReader != nil {
 		rw.SetReader(stateReader)
 	} else {
-		rw.SetReader(state.NewBufferedReader(rs, state.NewReaderV3(rs.Domains().AsGetter(rw.chainTx))))
+		var getter kv.TemporalGetter
+		if chainTx != nil {
+			getter = rs.Domains().AsGetter(chainTx)
+		}
+		// Use CachedReaderV3 for parallel workers — caches account data
+		// on first read per block, providing a stable pre-block committed
+		// view for GetCommittedState. The blockStateCache is set per block
+		// via SetBlockStateCache before workers start.
+		rw.SetReader(state.NewCachedReaderV3(getter, nil))
 	}
 
 	if stateWriter != nil {
 		rw.stateWriter = stateWriter
 	} else {
-		rw.stateWriter = state.NewWriter(rs.Domains().AsPutDel(rw.chainTx), accumulator, 0)
+		var putdel kv.TemporalPutDel
+		if chainTx != nil {
+			putdel = rs.Domains().AsPutDel(chainTx)
+		}
+		rw.stateWriter = state.NewWriter(putdel, accumulator, 0)
 	}
+
+	if chainTx != nil {
+		if err := rw.resetTx(chainTx); err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
-func (rw *Worker) Tx() kv.TemporalTx { return rw.chainTx }
-func (rw *Worker) ResetTx(chainTx kv.TemporalTx) {
+func (rw *Worker) ResetTx(chainTx kv.TemporalTx) error {
 	rw.lock.Lock()
 	defer rw.lock.Unlock()
-	rw.resetTx(chainTx)
+	return rw.resetTx(chainTx)
 }
 
 func (rw *Worker) resetTxNum(txNum uint64) {
@@ -225,29 +274,64 @@ func (rw *Worker) resetTxNum(txNum uint64) {
 	if resettable, ok := rw.stateWriter.(resettable); ok {
 		resettable.SetTxNum(txNum)
 	}
-
-	// - only set this if something breaks - it will not be stable with multiple parallel workers
-	//rw.rs.Domains().SetTxNum(txTask.TxNum)
 }
 
-func (rw *Worker) resetTx(chainTx kv.TemporalTx) {
-	if rw.background && rw.chainTx != nil {
-		rw.chainTx.Rollback()
+func (rw *Worker) resetTx(chainTx kv.TemporalTx) error {
+	if rw.background && rw.chainRoTx != nil {
+		rw.chainRoTx.Rollback()
 	}
 
+	rw.chainRoTx = chainTx
+	// Wrap with BlockOverlay so block-metadata reads (headers/bodies/td
+	// staged by InsertBlocks at chaintip) are visible. Mirrors the blockTx
+	// pattern in executeBlocks (exec3.go:538-543). Single wrap here so every
+	// consumer of rw.chainTx is overlay-aware by construction.
+	if chainTx != nil && rw.rs != nil {
+		if sd := rw.rs.Domains(); sd != nil {
+			if overlay := sd.BlockOverlay(); overlay != nil {
+				chainTx = overlay.NewReadView(chainTx)
+			}
+		}
+	}
 	rw.chainTx = chainTx
 
 	if rw.chainTx != nil {
-		type resettable interface {
+		type latest interface {
 			SetGetter(kv.TemporalGetter)
 		}
 
-		if resettable, ok := rw.stateReader.(resettable); ok {
-			resettable.SetGetter(rw.rs.Domains().AsGetter(rw.chainTx))
+		type historic interface {
+			SetTx(kv.TemporalTx)
 		}
 
-		if resettable, ok := rw.stateWriter.(resettable); ok {
-			resettable.SetGetter(rw.rs.Domains().AsGetter(rw.chainTx))
+		switch typedReader := rw.stateReader.(type) {
+		case latest:
+			typedReader.SetGetter(rw.rs.Domains().AsGetter(rw.chainTx))
+		case historic:
+			typedReader.SetTx(rw.chainTx)
+		default:
+			if rw.stateReader != nil {
+				return fmt.Errorf("can't set tx for reader: %T", rw.stateReader)
+			}
+		}
+
+		type withPutter interface {
+			SetPutDel(kv.TemporalPutDel)
+		}
+
+		type withTx interface {
+			SetTx(kv.TemporalTx)
+		}
+
+		switch typedWriter := rw.stateWriter.(type) {
+		case withPutter:
+			typedWriter.SetPutDel(rw.rs.Domains().AsPutDel(rw.chainTx))
+		case withTx:
+			typedWriter.SetTx(rw.chainTx)
+		default:
+			// Writers that don't implement withPutter or withTx (e.g.
+			// NoopWriter, LightCollector) don't need a DB transaction —
+			// they accumulate writes in memory only. This is not an error.
 		}
 
 		rw.chain = consensuschain.NewReader(rw.chainConfig, rw.chainTx, rw.blockReader, rw.logger)
@@ -256,13 +340,25 @@ func (rw *Worker) resetTx(chainTx kv.TemporalTx) {
 		rw.stateReader = nil
 		rw.stateWriter = nil
 	}
+
+	return nil
 }
 
 func (rw *Worker) Run() (err error) {
+	pprof.SetGoroutineLabels(pprof.WithLabels(rw.ctx, pprof.Labels("sub", "exec-worker")))
 	defer func() {
 		if rec := recover(); rec != nil {
 			err = fmt.Errorf("exec.Worker panic: %s, %s", rec, dbg.Stack())
 			rw.logger.Warn("Worker failed", "err", err)
+		}
+	}()
+	// Ensure the worker's roTx is closed when Run exits, preventing
+	// MDBX reader slot leaks that block GC page reclamation.
+	defer func() {
+		if rw.background && rw.chainRoTx != nil {
+			rw.chainRoTx.Rollback()
+			rw.chainRoTx = nil
+			rw.chainTx = nil
 		}
 	}()
 
@@ -293,7 +389,7 @@ func (rw *Worker) RunTxTask(txTask Task) (result *TxResult) {
 		rw.notifier.Wait()
 	}
 
-	if rw.metrics != nil {
+	if rw.metrics != nil && dbg.KVReadLevelledMetrics {
 		rw.metrics.Active.Add(1)
 		start := time.Now()
 		defer func() {
@@ -309,7 +405,9 @@ func (rw *Worker) RunTxTask(txTask Task) (result *TxResult) {
 				rw.metrics.CodeReadCount.Add(rw.ibs.CodeReadCount())
 			}
 			if result != nil {
-				rw.metrics.GasUsed.Add(int64(result.ExecutionResult.GasUsed))
+				// EIP-8037: per-tx max(regular, state) overestimates vs the true block gas
+				// (max of sums, not sum of maxes), but is a safe upper bound for metrics.
+				rw.metrics.GasUsed.Add(int64(max(result.ExecutionResult.BlockRegularGasUsed, result.ExecutionResult.BlockStateGasUsed)))
 			}
 			rw.metrics.Active.Add(-1)
 		}()
@@ -323,18 +421,35 @@ func (rw *Worker) RunTxTask(txTask Task) (result *TxResult) {
 // like compute gas used for block and then to set state reader to continue processing on latest data.
 func (rw *Worker) SetReader(reader state.StateReader) {
 	rw.stateReader = reader
-	if resettable, ok := reader.(interface{ SetTx(kv.Tx) }); ok {
-		resettable.SetTx(rw.Tx())
+	type latest interface {
+		SetGetter(kv.TemporalGetter)
+	}
+
+	type historic interface {
+		SetTx(kv.TemporalTx)
+	}
+
+	switch typedReader := rw.stateReader.(type) {
+	case latest:
+		typedReader.SetGetter(rw.rs.Domains().AsGetter(rw.chainTx))
+	case historic:
+		typedReader.SetTx(rw.chainTx)
 	}
 	rw.ibs = state.New(rw.stateReader)
 
 	switch reader.(type) {
 	case *state.HistoryReaderV3:
 		rw.historyMode = true
-	case *state.ReaderV3:
-		rw.historyMode = false
 	default:
 		rw.historyMode = false
+	}
+}
+
+// SetBlockStateCache updates the block-level account cache on the worker's
+// CachedReaderV3. Called before each block's workers start execution.
+func (rw *Worker) SetBlockStateCache(cache *state.BlockStateCache) {
+	if cr, ok := rw.stateReader.(*state.CachedReaderV3); ok {
+		cr.SetBlockStateCache(cache)
 	}
 }
 
@@ -343,13 +458,21 @@ func (rw *Worker) RunTxTaskNoLock(txTask Task) *TxResult {
 		// in case if we cancelled execution and commitment happened in the middle of the block, we have to process block
 		// from the beginning until committed txNum and only then disable history mode.
 		// Needed to correctly evaluate spent gas and other things.
-		rw.SetReader(state.NewHistoryReaderV3())
-	} else if !txTask.IsHistoric() && rw.historyMode {
-		rw.SetReader(state.NewBufferedReader(rw.rs, state.NewReaderV3(rw.rs.Domains().AsGetter(rw.chainTx))))
+		// Chain sd.mem → chainTx so historic-mode reads see prior-tx writes
+		// from the current batch (same class as the record-vs-field fix in
+		// the coinbase race investigation).
+		rw.SetReader(state.NewHistoryReaderV3WithSharedDomains(rw.chainTx, rw.rs.Domains(), txTask.Version().TxNum))
+	} else if !txTask.IsHistoric() && (rw.stateReader == nil || rw.historyMode) {
+		rw.SetReader(state.NewCachedReaderV3(rw.rs.Domains().AsGetter(rw.chainTx), nil))
+	}
+
+	// Set the per-block committed state cache from the task.
+	if cache := txTask.GetBlockStateCache(); cache != nil {
+		rw.SetBlockStateCache(cache)
 	}
 
 	if rw.background && rw.chainTx == nil {
-		chainTx, err := rw.chainDb.(kv.TemporalRoDB).BeginTemporalRo(rw.ctx) //nolint
+		chainTx, err := rw.chainDb.BeginTemporalRo(rw.ctx) //nolint
 
 		if err != nil {
 			return &TxResult{
@@ -358,7 +481,12 @@ func (rw *Worker) RunTxTaskNoLock(txTask Task) *TxResult {
 			}
 		}
 
-		rw.resetTx(chainTx)
+		if err = rw.resetTx(chainTx); err != nil {
+			return &TxResult{
+				Task: txTask,
+				Err:  err,
+			}
+		}
 	}
 
 	txIndex := txTask.Version().TxIndex
@@ -378,6 +506,12 @@ func (rw *Worker) RunTxTaskNoLock(txTask Task) *TxResult {
 		}
 	}
 
+	// Override GetHash with a per-worker function that uses the worker's
+	// own chainTx. The shared blockTx from executeBlocks is not thread-safe.
+	if rw.background && rw.chainTx != nil && rw.blockReader != nil {
+		rw.installWorkerGetHash(txTask)
+	}
+
 	result := txTask.Execute(rw.evm, rw.engine, rw.genesis, rw.ibs, rw.stateWriter, rw.chainConfig, rw.chain, rw.dirs, true)
 
 	if result.Task == nil {
@@ -389,12 +523,19 @@ func (rw *Worker) RunTxTaskNoLock(txTask Task) *TxResult {
 		result.TraceTos = callTracer.Tos()
 	}
 
+	// Capture collector-format writes from LightCollector (parallel workers).
+	// MakeWriteSet already wrote to rw.stateWriter; extract the accumulated
+	// writes so finalize can use them directly without IBS reconstruction.
+	if lc, ok := rw.stateWriter.(*state.LightCollector); ok {
+		result.CollectorWrites = lc.TakeWrites()
+	}
+
 	return result
 }
 
-func NewWorkersPool(ctx context.Context, accumulator *shards.Accumulator, background bool, chainDb kv.RoDB,
+func NewWorkersPool(ctx context.Context, accumulator *shards.Accumulator, background bool, chainDb kv.TemporalRoDB,
 	rs *state.StateV3Buffered, stateReader state.StateReader, stateWriter state.StateWriter, in *QueueWithRetry, blockReader services.FullBlockReader, chainConfig *chain.Config, genesis *types.Genesis,
-	engine rules.Engine, workerCount int, metrics *WorkerMetrics, dirs datadir.Dirs, isMining bool, logger log.Logger) (reconWorkers []*Worker, applyWorker *Worker, rws *ResultsQueue, clear func(), wait func()) {
+	engine rules.Engine, workerCount int, metrics *WorkerMetrics, dirs datadir.Dirs, logger log.Logger) (reconWorkers []*Worker, applyWorker *Worker, rws *ResultsQueue, clear func(), wait func(), err error) {
 	reconWorkers = make([]*Worker, workerCount)
 
 	resultsSize := workerCount * 8
@@ -408,10 +549,12 @@ func NewWorkersPool(ctx context.Context, accumulator *shards.Accumulator, backgr
 			reader := stateReader
 
 			if reader == nil {
-				reader = state.NewBufferedReader(rs, state.NewReaderV3(rs.Domains().AsGetter(nil)))
+				reader = state.NewReaderV3(rs.Domains().AsGetter(nil))
 			}
 
-			reconWorkers[i].ResetState(rs, nil, reader, stateWriter, accumulator)
+			if err = reconWorkers[i].ResetState(rs, nil, reader, stateWriter, accumulator); err != nil {
+				return
+			}
 		}
 	}
 	if background {
@@ -431,11 +574,13 @@ func NewWorkersPool(ctx context.Context, accumulator *shards.Accumulator, backgr
 		clearDone = true
 		g.Wait()
 		for _, w := range reconWorkers {
-			w.ResetTx(nil)
+			if err = w.ResetTx(nil); err != nil {
+				return
+			}
 		}
 		//applyWorker.ResetTx(nil)
 	}
 	applyWorker = NewWorker(ctx, false, nil, chainDb, in, blockReader, chainConfig, genesis, rws, engine, dirs, logger)
 
-	return reconWorkers, applyWorker, rws, clear, wait
+	return reconWorkers, applyWorker, rws, clear, wait, err
 }

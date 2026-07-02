@@ -96,8 +96,17 @@ func (b *writeBuffer) reset() {
 
 func (b *writeBuffer) appendZero(n int) []byte {
 	offset := len(b.data)
+	newLen := offset + n
+	if cap(b.data) >= newLen {
+		// Grow in place and ensure the new region is zero-filled.
+		b.data = b.data[:newLen]
+		for i := offset; i < newLen; i++ {
+			b.data[i] = 0
+		}
+		return b.data[offset:newLen]
+	}
 	b.data = append(b.data, make([]byte, n)...)
-	return b.data[offset : offset+n]
+	return b.data[offset:newLen]
 }
 
 func (b *writeBuffer) Write(data []byte) (int, error) {
@@ -115,13 +124,4 @@ func putUint24(v uint32, b []byte) {
 	b[0] = byte(v >> 16)
 	b[1] = byte(v >> 8)
 	b[2] = byte(v)
-}
-
-// growslice ensures b has the wanted length by either expanding it to its capacity
-// or allocating a new slice if b has insufficient capacity.
-func growslice(b []byte, wantLength int) []byte {
-	if cap(b) >= wantLength {
-		return b[:wantLength]
-	}
-	return make([]byte, wantLength)
 }

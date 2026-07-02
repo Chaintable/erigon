@@ -25,7 +25,6 @@ import (
 	"google.golang.org/grpc"
 
 	"github.com/erigontech/erigon/common/log/v3"
-	"github.com/erigontech/erigon/execution/rlp"
 	"github.com/erigontech/erigon/node/gointerfaces/sentryproto"
 	"github.com/erigontech/erigon/p2p/sentry/libsentry"
 )
@@ -112,26 +111,15 @@ func (f *Send) AnnouncePooledTxns(types []byte, sizes []uint32, hashes Hashes, m
 	if len(types) == 0 {
 		return
 	}
-	prevI := 0
 	prevJ := 0
-	for prevI < len(hashes) || prevJ < len(types) {
-		// Prepare two versions of the announcement message, one for pre-eth/68 peers, another for post-eth/68 peers
-		i := prevI
-		for i < len(hashes) && rlp.HashesLen(hashes[prevI:i+32]) < p2pTxPacketLimit {
-			i += 32
-		}
+	for prevJ < len(types) {
 		j := prevJ
-		for j < len(types) && rlp.AnnouncementsLen(types[prevJ:j+1], sizes[prevJ:j+1], hashes[32*prevJ:32*j+32]) < p2pTxPacketLimit {
+		for j < len(types) && announcementsLen(types[prevJ:j+1], sizes[prevJ:j+1], hashes[32*prevJ:32*j+32]) < p2pTxPacketLimit {
 			j++
 		}
-		iSize := rlp.HashesLen(hashes[prevI:i])
-		jSize := rlp.AnnouncementsLen(types[prevJ:j], sizes[prevJ:j], hashes[32*prevJ:32*j])
-		iData := make([]byte, iSize)
+		jSize := announcementsLen(types[prevJ:j], sizes[prevJ:j], hashes[32*prevJ:32*j])
 		jData := make([]byte, jSize)
-		if s := rlp.EncodeHashes(hashes[prevI:i], iData); s != iSize {
-			panic(fmt.Sprintf("Serialised hashes encoding len mismatch, expected %d, got %d", iSize, s))
-		}
-		if s := rlp.EncodeAnnouncements(types[prevJ:j], sizes[prevJ:j], hashes[32*prevJ:32*j], jData); s != jSize {
+		if s := encodeAnnouncements(types[prevJ:j], sizes[prevJ:j], hashes[32*prevJ:32*j], jData); s != jSize {
 			panic(fmt.Sprintf("Serialised announcements encoding len mismatch, expected %d, got %d", jSize, s))
 		}
 		for _, sentryClient := range f.sentryClients {
@@ -167,9 +155,8 @@ func (f *Send) AnnouncePooledTxns(types []byte, sizes []uint32, hashes Hashes, m
 					}
 				}
 			}
-			prevI = i
-			prevJ = j
 		}
+		prevJ = j
 	}
 	return
 }
@@ -181,22 +168,17 @@ func (f *Send) PropagatePooledTxnsToPeersList(peers []PeerID, types []byte, size
 		return
 	}
 
-	prevI := 0
 	prevJ := 0
-	for prevI < len(hashes) || prevJ < len(types) {
+	for prevJ < len(types) {
 		// Prepare two versions of the annoucement message, one for pre-eth/68 peers, another for post-eth/68 peers
-		i := prevI
-		for i < len(hashes) && rlp.HashesLen(hashes[prevI:i+32]) < p2pTxPacketLimit {
-			i += 32
-		}
 		j := prevJ
-		for j < len(types) && rlp.AnnouncementsLen(types[prevJ:j+1], sizes[prevJ:j+1], hashes[32*prevJ:32*j+32]) < p2pTxPacketLimit {
+		for j < len(types) && announcementsLen(types[prevJ:j+1], sizes[prevJ:j+1], hashes[32*prevJ:32*j+32]) < p2pTxPacketLimit {
 			j++
 		}
 
-		jSize := rlp.AnnouncementsLen(types[prevJ:j], sizes[prevJ:j], hashes[32*prevJ:32*j])
+		jSize := announcementsLen(types[prevJ:j], sizes[prevJ:j], hashes[32*prevJ:32*j])
 		jData := make([]byte, jSize)
-		if s := rlp.EncodeAnnouncements(types[prevJ:j], sizes[prevJ:j], hashes[32*prevJ:32*j], jData); s != jSize {
+		if s := encodeAnnouncements(types[prevJ:j], sizes[prevJ:j], hashes[32*prevJ:32*j], jData); s != jSize {
 			panic(fmt.Sprintf("Serialised annoucements encoding len mismatch, expected %d, got %d", jSize, s))
 		}
 
@@ -229,7 +211,6 @@ func (f *Send) PropagatePooledTxnsToPeersList(peers []PeerID, types []byte, size
 				}
 			}
 		}
-		prevI = i
 		prevJ = j
 	}
 }

@@ -28,18 +28,10 @@ import (
 	"github.com/erigontech/erigon/execution/types"
 )
 
-// TxLookupEntry is a positional metadata to help looking up the data content of
-// a transaction or receipt given only its hash.
-type TxLookupEntry struct {
-	BlockHash  common.Hash
-	BlockIndex uint64
-	Index      uint64
-}
-
 // ReadTxLookupEntry retrieves the positional metadata associated with a transaction
 // hash to allow retrieving the transaction or receipt by hash.
 func ReadTxLookupEntry(db kv.Getter, txnHash common.Hash) (blockNumber *uint64, txNum *uint64, err error) {
-	data, err := db.GetOne(kv.TxLookup, txnHash.Bytes())
+	data, err := db.GetOne(kv.TxLookup, txnHash[:])
 	if err != nil {
 		return nil, nil, err
 	}
@@ -60,7 +52,8 @@ func WriteTxLookupEntries(db kv.Putter, block *types.Block, txNum uint64) {
 		binary.BigEndian.PutUint64(data[:8], block.NumberU64())
 		binary.BigEndian.PutUint64(data[8:], txNum+uint64(i)+1)
 
-		if err := db.Put(kv.TxLookup, txn.Hash().Bytes(), data); err != nil {
+		txHash := txn.Hash()
+		if err := db.Put(kv.TxLookup, txHash[:], data); err != nil {
 			log.Crit("Failed to store transaction lookup entry", "err", err)
 		}
 	}
@@ -68,5 +61,5 @@ func WriteTxLookupEntries(db kv.Putter, block *types.Block, txNum uint64) {
 
 // DeleteTxLookupEntry removes all transaction data associated with a hash.
 func DeleteTxLookupEntry(db kv.Putter, hash common.Hash) error {
-	return db.Delete(kv.TxLookup, hash.Bytes())
+	return db.Delete(kv.TxLookup, hash[:])
 }

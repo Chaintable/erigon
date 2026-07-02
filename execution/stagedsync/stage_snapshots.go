@@ -20,8 +20,6 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
-	"path/filepath"
-	"reflect"
 	"strings"
 	"time"
 
@@ -29,6 +27,7 @@ import (
 	"github.com/erigontech/erigon/common/estimate"
 	"github.com/erigontech/erigon/common/log/v3"
 	"github.com/erigontech/erigon/db/datadir"
+	"github.com/erigontech/erigon/db/downloader"
 	"github.com/erigontech/erigon/db/downloader/downloadercfg"
 	"github.com/erigontech/erigon/db/kv"
 	"github.com/erigontech/erigon/db/kv/prune"
@@ -36,37 +35,45 @@ import (
 	"github.com/erigontech/erigon/db/kv/temporal"
 	"github.com/erigontech/erigon/db/services"
 	"github.com/erigontech/erigon/db/snapshotsync"
-	"github.com/erigontech/erigon/db/snapshotsync/freezeblocks"
 	"github.com/erigontech/erigon/db/snaptype"
 	"github.com/erigontech/erigon/db/snaptype2"
 	"github.com/erigontech/erigon/db/state"
 	"github.com/erigontech/erigon/db/state/stats"
 	"github.com/erigontech/erigon/diagnostics/diaglib"
 	"github.com/erigontech/erigon/execution/chain"
+	"github.com/erigontech/erigon/execution/commitment/commitmentdb"
 	"github.com/erigontech/erigon/execution/stagedsync/rawdbreset"
 	"github.com/erigontech/erigon/execution/stagedsync/stages"
 	"github.com/erigontech/erigon/node/ethconfig"
-	"github.com/erigontech/erigon/node/gointerfaces/downloaderproto"
 	"github.com/erigontech/erigon/node/shards"
-	"github.com/erigontech/erigon/node/silkworm"
 )
 
 type SnapshotsCfg struct {
-	db          kv.TemporalRwDB
-	chainConfig *chain.Config
-	dirs        datadir.Dirs
-
+	db                 kv.TemporalRwDB
+	chainConfig        *chain.Config
+	dirs               datadir.Dirs
 	blockRetire        services.BlockRetire
-	snapshotDownloader downloaderproto.DownloaderClient
+	snapshotDownloader downloader.Client
 	blockReader        services.FullBlockReader
 	notifier           *shards.Notifications
+	caplin             bool
+	blobs              bool
+	caplinState        bool
+	syncConfig         ethconfig.Sync
+	prune              prune.Mode
+	// Called once after snapshot downloads complete on the first sync cycle.
+	afterDownload func(ctx context.Context) error
+	// manifestReady is closed when P2P manifest discovery completes (--snap.p2p-manifest).
+	// Nil when P2P manifest mode is not enabled.
+	manifestReady <-chan struct{}
+}
 
-	caplin      bool
-	blobs       bool
-	caplinState bool
-	silkworm    *silkworm.Silkworm
-	syncConfig  ethconfig.Sync
-	prune       prune.Mode
+// Returns a seeder client for block management, a noop implementation if no downloader is attached.
+func (me *SnapshotsCfg) getSeederClient() downloader.SeederClient {
+	if me.snapshotDownloader == nil {
+		return downloader.NoopSeederClient{}
+	}
+	return me.snapshotDownloader
 }
 
 func StageSnapshotsCfg(db kv.TemporalRwDB,
@@ -74,14 +81,15 @@ func StageSnapshotsCfg(db kv.TemporalRwDB,
 	syncConfig ethconfig.Sync,
 	dirs datadir.Dirs,
 	blockRetire services.BlockRetire,
-	snapshotDownloader downloaderproto.DownloaderClient,
+	snapshotDownloader downloader.Client,
 	blockReader services.FullBlockReader,
 	notifier *shards.Notifications,
 	caplin bool,
 	blobs bool,
 	caplinState bool,
-	silkworm *silkworm.Silkworm,
 	prune prune.Mode,
+	afterDownload func(ctx context.Context) error,
+	manifestReady <-chan struct{},
 ) SnapshotsCfg {
 	cfg := SnapshotsCfg{
 		db:                 db,
@@ -92,31 +100,18 @@ func StageSnapshotsCfg(db kv.TemporalRwDB,
 		blockReader:        blockReader,
 		notifier:           notifier,
 		caplin:             caplin,
-		silkworm:           silkworm,
 		syncConfig:         syncConfig,
 		blobs:              blobs,
 		prune:              prune,
 		caplinState:        caplinState,
+		afterDownload:      afterDownload,
+		manifestReady:      manifestReady,
 	}
 
 	return cfg
 }
 
-func SpawnStageSnapshots(
-	s *StageState,
-	ctx context.Context,
-	tx kv.RwTx,
-	cfg SnapshotsCfg,
-	logger log.Logger,
-) (err error) {
-	useExternalTx := tx != nil
-	if !useExternalTx {
-		tx, err = cfg.db.BeginRw(ctx)
-		if err != nil {
-			return err
-		}
-		defer tx.Rollback()
-	}
+func SpawnStageSnapshots(s *StageState, ctx context.Context, tx kv.RwTx, cfg SnapshotsCfg, logger log.Logger) (err error) {
 	if err := DownloadAndIndexSnapshotsIfNeed(s, ctx, tx, cfg, logger); err != nil {
 		return err
 	}
@@ -140,11 +135,6 @@ func SpawnStageSnapshots(
 			return err
 		}
 	}
-	if !useExternalTx {
-		if err := tx.Commit(); err != nil {
-			return err
-		}
-	}
 
 	// call this after the tx is commited otherwise observing
 	// components see an inconsistent db view
@@ -163,25 +153,38 @@ func DownloadAndIndexSnapshotsIfNeed(s *StageState, ctx context.Context, tx kv.R
 		return nil
 	}
 
-	diaglib.Send(diaglib.CurrentSyncStage{Stage: string(stages.Snapshots)})
-
 	cstate := snapshotsync.NoCaplin
 	if cfg.caplin {
 		cstate = snapshotsync.AlsoCaplin
 	}
 
-	subStages := diaglib.InitSubStagesFromList([]string{"Download header-chain", "Download snapshots", "E2 Indexing", "E3 Indexing", "Fill DB"})
-	diaglib.Send(diaglib.SetSyncSubStageList{
-		Stage: string(stages.Snapshots),
-		List:  subStages,
-	})
-
 	log.Info("[OtterSync] Starting Ottersync")
-	log.Info(snapshotsync.GreatOtterBanner)
 
-	diaglib.Send(diaglib.CurrentSyncSubStage{SubStage: "Download header-chain"})
+	// If P2P manifest mode is enabled, wait for chain.toml discovery before
+	// building download requests. Without this, the preverified registry is
+	// empty and OtterSync would complete instantly with nothing to download.
+	//
+	// Bounded wait: if discovery never succeeds (no peers with chain-toml ENR,
+	// unreachable info-hash, etc.) we fall through to the centralized preverified
+	// registry rather than stalling the sync indefinitely.
+	const manifestReadyTimeout = 5 * time.Minute
+	if cfg.manifestReady != nil {
+		log.Info(fmt.Sprintf("[%s] Waiting for P2P manifest discovery (timeout %s)...", s.LogPrefix(), manifestReadyTimeout))
+		select {
+		case <-cfg.manifestReady:
+			log.Info(fmt.Sprintf("[%s] P2P manifest ready, proceeding with download", s.LogPrefix()))
+		case <-time.After(manifestReadyTimeout):
+			log.Warn(fmt.Sprintf("[%s] P2P manifest discovery timed out after %s — falling back to preverified registry", s.LogPrefix(), manifestReadyTimeout))
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+
 	agg := cfg.db.(*temporal.DB).Agg().(*state.Aggregator)
 	// Download only the snapshots that are for the header chain.
+
+	// How do we get to the real Downloader if we need? Get the stack trace.
+	//panic("here")
 
 	if err := snapshotsync.SyncSnapshots(
 		ctx,
@@ -202,10 +205,16 @@ func DownloadAndIndexSnapshotsIfNeed(s *StageState, ctx context.Context, tx kv.R
 		return err
 	}
 
+	// Reload erigondb settings: the downloader should have provided the real erigondb.toml
+	// during header-chain phase, which may have a different stepSize than the default.
+	if err := agg.ReloadErigonDBSettings(cfg.snapshotDownloader == nil); err != nil {
+		return err
+	}
+
 	// Erigon can start on datadir with broken files `transactions.seg` files and Downloader will
 	// fix them, but only if Erigon call `.Add()` for broken files. But `headerchain` feature
 	// calling `.Add()` only for header/body files (not for `transactions.seg`) and `.OpenFolder()` will fail
-	if err := cfg.blockReader.Snapshots().OpenSegments([]snaptype.Type{snaptype2.Headers, snaptype2.Bodies}, true, false); err != nil {
+	if err := cfg.blockReader.Snapshots().OpenSegments([]snaptype.Type{snaptype2.Headers, snaptype2.Bodies}, false); err != nil {
 		err = fmt.Errorf("error opening segments after syncing header chain: %w", err)
 		return err
 	}
@@ -228,6 +237,12 @@ func DownloadAndIndexSnapshotsIfNeed(s *StageState, ctx context.Context, tx kv.R
 		agg.StepSize(),
 	); err != nil {
 		return err
+	}
+
+	if cfg.afterDownload != nil {
+		if err := cfg.afterDownload(ctx); err != nil {
+			return fmt.Errorf("after snapshot download: %w", err)
+		}
 	}
 
 	{ // Now can open all files
@@ -261,14 +276,16 @@ func DownloadAndIndexSnapshotsIfNeed(s *StageState, ctx context.Context, tx kv.R
 		cfg.notifier.Events.OnNewSnapshot()
 	}
 
-	diaglib.Send(diaglib.CurrentSyncSubStage{SubStage: "E2 Indexing"})
-	if err := cfg.blockRetire.BuildMissedIndicesIfNeed(ctx, s.LogPrefix(), cfg.notifier.Events); err != nil {
+	headersProgress, err := stages.GetStageProgress(tx, stages.Headers)
+	if err != nil {
+		return fmt.Errorf("getting headers progress for indexing decision: %w", err)
+	}
+
+	if err := buildOrDeferE2Indices(ctx, s, cfg, headersProgress); err != nil {
 		return err
 	}
 
-	indexWorkers := estimate.IndexSnapshot.Workers()
-	diaglib.Send(diaglib.CurrentSyncSubStage{SubStage: "E3 Indexing"})
-	if err := agg.BuildMissedAccessors(ctx, indexWorkers); err != nil {
+	if err := buildOrDeferE3Accessors(ctx, s, cfg, agg, headersProgress); err != nil {
 		return err
 	}
 
@@ -279,18 +296,6 @@ func DownloadAndIndexSnapshotsIfNeed(s *StageState, ctx context.Context, tx kv.R
 	// It's ok to notify before tx.Commit(), because RPCDaemon does read list of files by gRPC (not by reading from db)
 	if cfg.notifier.Events != nil {
 		cfg.notifier.Events.OnNewSnapshot()
-	}
-
-	if cfg.silkworm != nil {
-		repository := silkworm.NewSnapshotsRepository(
-			cfg.silkworm,
-			cfg.blockReader.Snapshots().(*freezeblocks.RoSnapshots),
-			agg,
-			logger,
-		)
-		if err := repository.Update(); err != nil {
-			return err
-		}
 	}
 
 	frozenBlocks := cfg.blockReader.FrozenBlocks()
@@ -310,16 +315,82 @@ func DownloadAndIndexSnapshotsIfNeed(s *StageState, ctx context.Context, tx kv.R
 		temporal.ForceReopenAggCtx() // otherwise next stages will not see just-indexed-files
 	}
 
+	// In E3, the post-execution state is in domain files. After FillDBFromSnapshots,
+	// snapshot domain state may be ahead of the Execution stage progress (which is 0
+	// on a fresh node until ExecV3 runs and self-corrects via SeekCommitment). During
+	// that startup window the RPC layer can resolve `latest` to genesis (exec=0) while
+	// the cached state reader serves snapshot-tip state — a state-vs-rules mismatch
+	// that crashed eth_call on Gnosis with "invalid opcode: SHR" (#21066).
+	// Bump Execution stage progress to the snapshot commitment block so RPC sees a
+	// consistent view immediately, matching what ExecV3 would set on its first run.
+	if commitBlock := readCommitmentBlockFromDB(ctx, cfg.db); commitBlock > 0 {
+		execProgress, err := stages.GetStageProgress(tx, stages.Execution)
+		if err != nil {
+			return fmt.Errorf("get Execution stage progress: %w", err)
+		}
+		if execProgress < commitBlock {
+			if err := stages.SaveStageProgress(tx, stages.Execution, commitBlock); err != nil {
+				return fmt.Errorf("advance Execution stage to snapshot commitment block: %w", err)
+			}
+		}
+	}
+
 	{
 		cfg.blockReader.Snapshots().LogStat("download")
-		txNumsReader := cfg.blockReader.TxnumReader(ctx)
+		txNumsReader := cfg.blockReader.TxnumReader()
 		aggtx := state.AggTx(tx)
 		stats.LogStats(aggtx, tx, logger, func(endTxNumMinimax uint64) (uint64, error) {
-			histBlockNumProgress, _, err := txNumsReader.FindBlockNum(tx, endTxNumMinimax)
+			histBlockNumProgress, _, err := txNumsReader.FindBlockNum(ctx, tx, endTxNumMinimax)
 			return histBlockNumProgress, err
 		})
 	}
 
+	return nil
+}
+
+// buildOrDeferE2Indices decides whether to build E2 block snapshot indices synchronously
+// or defer them to background processing.
+// On restart (headersProgress > 0), E2 indexing is skipped at startup. Missing indices
+// will be built in the background via RetireBlocksInBackground (called from SnapshotsPrune
+// on every sync cycle).
+// Exception: Bor chains always index synchronously because RetireBlocks has an early-exit
+// guard for Bor data readiness that may skip BuildMissedIndicesIfNeed.
+func buildOrDeferE2Indices(ctx context.Context, s *StageState, cfg SnapshotsCfg, headersProgress uint64) error {
+	isBor := cfg.chainConfig.Bor != nil
+	canDefer := headersProgress > 0 && !isBor
+
+	diaglib.Send(diaglib.CurrentSyncSubStage{SubStage: "E2 Indexing"})
+	if !canDefer {
+		if err := cfg.blockRetire.BuildMissedIndicesIfNeed(ctx, s.LogPrefix(), cfg.notifier.Events); err != nil {
+			return err
+		}
+	} else {
+		log.Debug(fmt.Sprintf("[%s] Deferring E2 indexing to background", s.LogPrefix()), "reason", "restart", "headersProgress", headersProgress)
+	}
+	return nil
+}
+
+// buildOrDeferE3Accessors decides whether to build E3 state accessors synchronously
+// or defer them to background processing.
+// On restart (headersProgress > 0), E3 indexing is skipped at startup. Missing accessors
+// will be built in the background via BuildMissedAccessorsInBackground (called from
+// SnapshotsPrune on every sync cycle).
+// Unindexed state files are safely excluded from visible files by checkForVisibility
+// (which checks accessor presence), so queries correctly reflect only indexed data.
+// Note: unlike E2, there is no Bor exception — the background path calls
+// BuildMissedAccessors directly without any Bor-specific early-exit guards.
+func buildOrDeferE3Accessors(ctx context.Context, s *StageState, cfg SnapshotsCfg, agg *state.Aggregator, headersProgress uint64) error {
+	canDefer := headersProgress > 0
+
+	indexWorkers := estimate.IndexSnapshot.Workers()
+	diaglib.Send(diaglib.CurrentSyncSubStage{SubStage: "E3 Indexing"})
+	if !canDefer {
+		if err := agg.BuildMissedAccessors(ctx, indexWorkers); err != nil {
+			return err
+		}
+	} else {
+		log.Debug(fmt.Sprintf("[%s] Deferring E3 indexing to background", s.LogPrefix()), "reason", "restart", "headersProgress", headersProgress)
+	}
 	return nil
 }
 
@@ -377,17 +448,11 @@ func pruneCanonicalMarkers(ctx context.Context, tx kv.RwTx, blockReader services
 
 // SnapshotsPrune moving block data from db into snapshots, removing old snapshots (if --prune.* enabled)
 func SnapshotsPrune(s *PruneState, cfg SnapshotsCfg, ctx context.Context, tx kv.RwTx, logger log.Logger) (err error) {
-	useExternalTx := tx != nil
-	if !useExternalTx {
-		tx, err = cfg.db.BeginRw(ctx)
-		if err != nil {
-			return err
-		}
-		defer tx.Rollback()
+	if dbg.NoPrune() {
+		return nil
 	}
-
 	freezingCfg := cfg.blockReader.FreezingCfg()
-	if freezingCfg.ProduceE2 {
+	if freezingCfg.ProduceE2 && !dbg.NoBackgroundMaintenance() {
 		//TODO: initialSync maybe save files progress here
 
 		var minBlockNumber uint64
@@ -398,32 +463,20 @@ func SnapshotsPrune(s *PruneState, cfg SnapshotsCfg, ctx context.Context, tx kv.
 			cfg.blockRetire.SetWorkers(1)
 		}
 
-		noDl := cfg.snapshotDownloader == nil || reflect.ValueOf(cfg.snapshotDownloader).IsNil()
 		started := cfg.blockRetire.RetireBlocksInBackground(
 			ctx,
 			minBlockNumber,
 			s.ForwardProgress,
 			log.LvlDebug,
-			func(downloadRequest []services.DownloadRequest) error {
-				if noDl {
-					return nil
-				}
-				return snapshotsync.RequestSnapshotsDownload(ctx, downloadRequest, cfg.snapshotDownloader, "")
-			}, func(l []string) error {
-				if noDl {
-					return nil
-				}
-				if _, err := cfg.snapshotDownloader.Delete(ctx, &downloaderproto.DeleteRequest{Paths: l}); err != nil {
-					return err
-				}
-				return nil
-			}, func() error {
+			cfg.getSeederClient(),
+			func() error {
 				filesDeleted, err := pruneBlockSnapshots(ctx, cfg, logger)
 				if filesDeleted && cfg.notifier != nil {
 					cfg.notifier.Events.OnNewSnapshot()
 				}
 				return err
-			}, func() {
+			},
+			func() {
 				if cfg.notifier != nil {
 					cfg.notifier.Events.OnRetirementDone()
 				}
@@ -431,8 +484,6 @@ func SnapshotsPrune(s *PruneState, cfg SnapshotsCfg, ctx context.Context, tx kv.
 		if cfg.notifier != nil {
 			cfg.notifier.Events.OnRetirementStart(started)
 		}
-
-		//	cfg.agg.BuildFilesInBackground()
 	}
 
 	pruneLimit := 10
@@ -447,13 +498,6 @@ func SnapshotsPrune(s *PruneState, cfg SnapshotsCfg, ctx context.Context, tx kv.
 	if err := pruneCanonicalMarkers(ctx, tx, cfg.blockReader); err != nil {
 		return err
 	}
-
-	if !useExternalTx {
-		if err := tx.Commit(); err != nil {
-			return err
-		}
-	}
-
 	return nil
 }
 
@@ -501,14 +545,9 @@ func pruneBlockSnapshots(ctx context.Context, cfg SnapshotsCfg, logger log.Logge
 		if info.To-info.From != snaptype.Erigon2MergeLimit {
 			continue
 		}
-		if cfg.snapshotDownloader != nil {
-			relativePathToFile := file
-			if filepath.IsAbs(file) {
-				relativePathToFile, _ = filepath.Rel(cfg.dirs.Snap, file)
-			}
-			if _, err := cfg.snapshotDownloader.Delete(ctx, &downloaderproto.DeleteRequest{Paths: []string{relativePathToFile}}); err != nil {
-				return filesDeleted, err
-			}
+		err = cfg.getSeederClient().Delete(ctx, []string{file})
+		if err != nil {
+			return filesDeleted, err
 		}
 		if err := cfg.blockReader.Snapshots().Delete(file); err != nil {
 			return filesDeleted, err
@@ -516,4 +555,21 @@ func pruneBlockSnapshots(ctx context.Context, cfg SnapshotsCfg, logger log.Logge
 		filesDeleted = true
 	}
 	return filesDeleted, nil
+}
+
+// readCommitmentBlockFromDB reads the commitment domain's "state" key via a
+// temporary RO tx. The RwTx from the snapshot stage is not temporal, so we
+// need a separate temporal RO tx to read domain data from snapshot files.
+// The value format: txNum(8 bytes) + blockNum(8 bytes) + trie state.
+func readCommitmentBlockFromDB(ctx context.Context, db kv.TemporalRwDB) uint64 {
+	roTx, err := db.BeginTemporalRo(ctx)
+	if err != nil {
+		return 0
+	}
+	defer roTx.Rollback()
+	v, _, err := roTx.GetLatest(kv.CommitmentDomain, commitmentdb.KeyCommitmentState)
+	if err != nil || len(v) < 16 {
+		return 0
+	}
+	return binary.BigEndian.Uint64(v[8:16])
 }

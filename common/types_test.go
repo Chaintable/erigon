@@ -119,7 +119,7 @@ func TestAddressUnmarshalJSON(t *testing.T) {
 			if test.ShouldErr {
 				t.Errorf("test #%d: expected error, got none", i)
 			}
-			if got := new(big.Int).SetBytes(v.Bytes()); got.Cmp(test.Output) != 0 {
+			if got := new(big.Int).SetBytes(v[:]); got.Cmp(test.Output) != 0 {
 				t.Errorf("test #%d: address mismatch: have %v, want %v", i, got, test.Output)
 			}
 		}
@@ -202,7 +202,7 @@ func TestMixedcaseAccount_Address(t *testing.T) {
 
 func TestHash_Scan(t *testing.T) {
 	type args struct {
-		src interface{}
+		src any
 	}
 	tests := []struct {
 		name    string
@@ -293,7 +293,7 @@ func TestHash_Value(t *testing.T) {
 
 func TestAddress_Scan(t *testing.T) {
 	type args struct {
-		src interface{}
+		src any
 	}
 	tests := []struct {
 		name    string

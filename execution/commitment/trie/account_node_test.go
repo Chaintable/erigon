@@ -21,11 +21,12 @@ import (
 	"reflect"
 	"testing"
 
+	keccak "github.com/erigontech/fastkeccak"
 	"github.com/holiman/uint256"
-	"golang.org/x/crypto/sha3"
 
 	"github.com/erigontech/erigon/common"
 	"github.com/erigontech/erigon/common/crypto"
+	"github.com/erigontech/erigon/common/u256"
 	"github.com/erigontech/erigon/db/kv/dbutils"
 	"github.com/erigontech/erigon/execution/types/accounts"
 )
@@ -34,15 +35,15 @@ func TestGetAccount(t *testing.T) {
 	acc1 := &accounts.Account{
 		Nonce:       1,
 		Incarnation: 1,
-		Balance:     *uint256.NewInt(100),
+		Balance:     u256.U64(100),
 		Root:        EmptyRoot,
 	}
 	acc2 := &accounts.Account{
 		Nonce:       2,
 		Incarnation: 2,
-		Balance:     *uint256.NewInt(200),
+		Balance:     u256.U64(200),
 		Root:        common.BytesToHash([]byte("0x1")),
-		CodeHash:    common.BytesToHash([]byte("0x01")),
+		CodeHash:    accounts.InternCodeHash(common.BytesToHash([]byte("0x01"))),
 	}
 	trie := newEmpty()
 	key1 := []byte("acc1")
@@ -70,9 +71,9 @@ func TestAddSomeValuesToAccountAndCheckDeepHashForThem(t *testing.T) {
 	acc := &accounts.Account{
 		Nonce:       2,
 		Incarnation: 2,
-		Balance:     *uint256.NewInt(200),
+		Balance:     u256.U64(200),
 		Root:        EmptyRoot,
-		CodeHash:    emptyState,
+		CodeHash:    accounts.InternCodeHash(emptyState),
 	}
 
 	_, _, addrHash, err := generateAcc()
@@ -89,8 +90,10 @@ func TestAddSomeValuesToAccountAndCheckDeepHashForThem(t *testing.T) {
 		t.Fatal("not equal", keyAcc)
 	}
 
-	value1 := common.HexToHash("0x3").Bytes()
-	value2 := common.HexToHash("0x5").Bytes()
+	value1Hash := common.HexToHash("0x3")
+	value2Hash := common.HexToHash("0x5")
+	value1 := value1Hash[:]
+	value2 := value2Hash[:]
 
 	storageKey1 := common.HexToHash("0x1")
 	storageKey2 := common.HexToHash("0x5")
@@ -102,10 +105,10 @@ func TestAddSomeValuesToAccountAndCheckDeepHashForThem(t *testing.T) {
 	trie.Update(fullStorageKey2, value2)
 
 	expectedTrie := newEmpty()
-	expectedTrie.Update(storageKey1.Bytes(), value1)
-	expectedTrie.Update(storageKey2.Bytes(), value2)
+	expectedTrie.Update(storageKey1[:], value1)
+	expectedTrie.Update(storageKey2[:], value2)
 
-	_, h1 := trie.DeepHash(addrHash.Bytes())
+	_, h1 := trie.DeepHash(addrHash[:])
 	h2 := expectedTrie.Hash()
 	if h1 != h2 {
 		t.Fatal("not equals", h1.String(), h2.String())
@@ -116,9 +119,9 @@ func TestHash(t *testing.T) {
 	addr1 := common.HexToAddress("0xa94f5374fce5edbc8e2a8697c15331677e6ebf0b")
 	acc1 := &accounts.Account{
 		Nonce:    1,
-		Balance:  *uint256.NewInt(209488),
+		Balance:  u256.U64(209488),
 		Root:     common.HexToHash("0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421"),
-		CodeHash: common.HexToHash("0xc5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470"),
+		CodeHash: accounts.InternCodeHash(common.HexToHash("0xc5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470")),
 	}
 
 	addr2 := common.HexToAddress("0xb94f5374fce5edbc8e2a8697c15331677e6ebf0b")
@@ -126,23 +129,23 @@ func TestHash(t *testing.T) {
 		Nonce:    0,
 		Balance:  uint256.Int{},
 		Root:     common.HexToHash("0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421"),
-		CodeHash: common.HexToHash("0xc5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470"),
+		CodeHash: accounts.InternCodeHash(common.HexToHash("0xc5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470")),
 	}
 
 	addr3 := common.HexToAddress("0xc94f5374fce5edbc8e2a8697c15331677e6ebf0b")
 	acc3 := &accounts.Account{
 		Nonce:    0,
-		Balance:  *uint256.NewInt(1010),
+		Balance:  u256.U64(1010),
 		Root:     common.HexToHash("0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421"),
-		CodeHash: common.HexToHash("0xc5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470"),
+		CodeHash: accounts.InternCodeHash(common.HexToHash("0xc5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470")),
 	}
 
 	trie := New(common.Hash{})
 	trie2 := NewTestRLPTrie(common.Hash{})
 
-	trie.UpdateAccount(addr1.Bytes(), acc1)
-	trie.UpdateAccount(addr2.Bytes(), acc2)
-	trie.UpdateAccount(addr3.Bytes(), acc3)
+	trie.UpdateAccount(addr1[:], acc1)
+	trie.UpdateAccount(addr2[:], acc2)
+	trie.UpdateAccount(addr3[:], acc3)
 
 	b1 := make([]byte, acc1.EncodingLengthForHashing())
 	b2 := make([]byte, acc2.EncodingLengthForHashing())
@@ -150,9 +153,9 @@ func TestHash(t *testing.T) {
 	acc1.EncodeForHashing(b1)
 	acc2.EncodeForHashing(b2)
 	acc3.EncodeForHashing(b3)
-	trie2.Update(addr1.Bytes(), b1)
-	trie2.Update(addr2.Bytes(), b2)
-	trie2.Update(addr3.Bytes(), b3)
+	trie2.Update(addr1[:], b1)
+	trie2.Update(addr2[:], b2)
+	trie2.Update(addr3[:], b3)
 
 	if trie.Hash().String() != trie2.Hash().String() {
 		t.FailNow()
@@ -174,7 +177,7 @@ func generateAcc() (*ecdsa.PrivateKey, common.Address, common.Hash, error) {
 }
 
 func hashVal(v []byte) (common.Hash, error) {
-	sha := sha3.NewLegacyKeccak256().(keccakState)
+	sha := keccak.NewFastKeccak()
 	sha.Reset()
 	_, err := sha.Write(v)
 	if err != nil {

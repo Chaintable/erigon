@@ -17,32 +17,35 @@
 package ethapi
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"math/big"
+	"sort"
 
 	"github.com/holiman/uint256"
 
-	"github.com/erigontech/erigon/common"
 	"github.com/erigontech/erigon/execution/chain"
 	"github.com/erigontech/erigon/execution/state"
 	"github.com/erigontech/erigon/execution/tracing"
+	"github.com/erigontech/erigon/execution/types/accounts"
 	"github.com/erigontech/erigon/execution/vm"
 )
 
-type StateOverrides map[common.Address]Account
+type StateOverrides map[accounts.Address]Account
 
-func (so *StateOverrides) Override(ibs *state.IntraBlockState) error {
-	for addr, account := range *so {
+func (so *StateOverrides) override(ibs *state.IntraBlockState, addrs []accounts.Address) error {
+	for _, addr := range addrs {
+		account := (*so)[addr]
 		// Override account nonce.
 		if account.Nonce != nil {
-			if err := ibs.SetNonce(addr, uint64(*account.Nonce)); err != nil {
+			if err := ibs.SetNonce(addr, uint64(*account.Nonce), tracing.NonceChangeUnspecified); err != nil {
 				return err
 			}
 		}
 		// Override account (contract) code.
 		if account.Code != nil {
-			if err := ibs.SetCode(addr, *account.Code); err != nil {
+			if err := ibs.SetCode(addr, *account.Code, tracing.CodeChangeUnspecified); err != nil {
 				return err
 			}
 		}
@@ -57,14 +60,14 @@ func (so *StateOverrides) Override(ibs *state.IntraBlockState) error {
 			}
 		}
 		if account.State != nil && account.StateDiff != nil {
-			return fmt.Errorf("account %s has both 'state' and 'stateDiff'", addr.Hex())
+			return fmt.Errorf("account %s has both 'state' and 'stateDiff'", addr)
 		}
 		// Replace entire state if caller requires.
 		if account.State != nil {
-			intState := map[common.Hash]uint256.Int{}
+			intState := map[accounts.StorageKey]uint256.Int{}
 			for key, value := range *account.State {
-				intValue := new(uint256.Int).SetBytes32(value.Bytes())
-				intState[key] = *intValue
+				intValue := *new(uint256.Int).SetBytes32(value[:])
+				intState[accounts.InternKey(key)] = intValue
 			}
 			if err := ibs.SetStorage(addr, intState); err != nil {
 				return err
@@ -73,8 +76,8 @@ func (so *StateOverrides) Override(ibs *state.IntraBlockState) error {
 		// Apply state diff into specified accounts.
 		if account.StateDiff != nil {
 			for key, value := range *account.StateDiff {
-				intValue := new(uint256.Int).SetBytes32(value.Bytes())
-				if err := ibs.SetState(addr, key, *intValue); err != nil {
+				intValue := *new(uint256.Int).SetBytes32(value[:])
+				if err := ibs.SetState(addr, accounts.InternKey(key), intValue); err != nil {
 					return err
 				}
 			}
@@ -84,43 +87,65 @@ func (so *StateOverrides) Override(ibs *state.IntraBlockState) error {
 	return nil
 }
 
-func (so *StateOverrides) OverrideAndCommit(ibs *state.IntraBlockState, rules *chain.Rules) error {
-	err := so.Override(ibs)
-	if err != nil {
-		return err
+func (so *StateOverrides) Override(ibs *state.IntraBlockState, precompiles vm.PrecompiledContracts, rules *chain.Rules) error {
+	if precompiles == nil {
+		precompiles = make(vm.PrecompiledContracts)
 	}
-	return ibs.CommitBlock(rules, state.NewNoopWriter())
-}
+	// Sort addresses for deterministic iteration order across both loops (map iteration is random in Go).
+	addrs := make([]accounts.Address, 0, len(*so))
+	for addr := range *so {
+		addrs = append(addrs, addr)
+	}
+	sort.Slice(addrs, func(i, j int) bool {
+		ai, aj := addrs[i].Value(), addrs[j].Value()
+		return bytes.Compare(ai[:], aj[:]) < 0
+	})
 
-func (so *StateOverrides) OverrideWithPrecompiles(state *state.IntraBlockState, precompiles vm.PrecompiledContracts) error {
-	err := so.Override(state)
+	err := so.override(ibs, addrs)
 	if err != nil {
 		return err
 	}
+
 	// Tracks destinations of precompiles that were moved.
-	dirtyAddresses := make(map[common.Address]struct{})
-	for addr, account := range *so {
+	dirtyAddresses := make(map[accounts.Address]struct{})
+	for _, addr := range addrs {
+		account := (*so)[addr]
 		// If a precompile was moved to this address already, it can't be overridden.
 		if _, ok := dirtyAddresses[addr]; ok {
-			return fmt.Errorf("account %s has already been overridden by a precompile", addr.Hex())
+			return fmt.Errorf("account %s has already been overridden by a precompile", addr)
 		}
 		p, isPrecompile := precompiles[addr]
 		// The MovePrecompileTo feature makes it possible to move a precompile code to another address. If the target address
 		// is another precompile, the code for the latter is lost for this session. Note the destination account is not cleared upon move.
 		if account.MovePrecompileTo != nil {
 			if !isPrecompile {
-				return fmt.Errorf("account %s is not a precompile", addr.Hex())
+				return fmt.Errorf("account %s is not a precompile", addr)
 			}
 			// Refuse to move a precompile to an address that has been or will be overridden.
-			if _, ok := (*so)[*account.MovePrecompileTo]; ok {
-				return fmt.Errorf("account %s is already overridden", account.MovePrecompileTo.Hex())
+			precompileMoveTo := accounts.InternAddress(*account.MovePrecompileTo)
+			if _, ok := (*so)[precompileMoveTo]; ok {
+				return fmt.Errorf("account %s is already overridden", account.MovePrecompileTo)
 			}
-			precompiles[*account.MovePrecompileTo] = p
-			dirtyAddresses[*account.MovePrecompileTo] = struct{}{}
+			precompiles[precompileMoveTo] = p
+			dirtyAddresses[precompileMoveTo] = struct{}{}
 		}
 		if isPrecompile {
 			delete(precompiles, addr)
 		}
 	}
-	return nil
+
+	// Disable EIP-161 empty-account removal when finalizing state overrides.
+	// FinalizeTx with a NoopWriter commits dirty storage into originStorage
+	// (needed for correct SSTORE gas), but EIP-161 would also mark any account
+	// that becomes empty (nonce=0, code=0x, balance=0) as deleted in the IBS —
+	// even though the deletion is never written to the DB.  That spurious
+	// deleted=true flag causes IntraBlockState.HasStorage to short-circuit to
+	// false before reaching the state reader, breaking EIP-7610 collision
+	// detection in multi-block eth_simulateV1 when a prior simulated block
+	// deployed a contract at the overridden address.
+	// State overrides are simulation-only mutations and must not trigger
+	// consensus rules like EIP-161.
+	noEIP161Rules := *rules
+	noEIP161Rules.IsSpuriousDragon = false
+	return ibs.FinalizeTx(&noEIP161Rules, state.NewNoopWriter())
 }
