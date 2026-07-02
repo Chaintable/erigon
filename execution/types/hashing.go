@@ -33,7 +33,7 @@ import (
 
 // encodeBufferPool holds temporary encoder buffers for DeriveSha and TX encoding.
 var encodeBufferPool = sync.Pool{
-	New: func() interface{} { return new(bytes.Buffer) },
+	New: func() any { return new(bytes.Buffer) },
 }
 
 type DerivableList interface {
@@ -166,33 +166,39 @@ func intsize(i uint) (size int) {
 	}
 }
 
-func RawRlpHash(rawRlpData rlp.RawValue) (h common.Hash) {
+func RawRlpHash(rawRlpData rlp.RawValue) common.Hash {
+	return crypto.HashData(rawRlpData)
+}
+
+func RlpHash(x any) common.Hash {
 	sha := crypto.NewKeccakState()
-	sha.Write(rawRlpData) //nolint:errcheck
-	sha.Read(h[:])        //nolint:errcheck
+	rlp.Encode(sha, x) //nolint:errcheck
+	h := crypto.FinalizeHash(sha)
 	crypto.ReturnToPool(sha)
 	return h
 }
 
-func rlpHash(x interface{}) (h common.Hash) {
-	sha := crypto.NewKeccakState()
-	rlp.Encode(sha, x) //nolint:errcheck
-	sha.Read(h[:])     //nolint:errcheck
-	crypto.ReturnToPool(sha)
-	return h
+// prefixSlices contains one-byte slices for all possible prefix values (0–255).
+// Each entry is pre-allocated once during init so we can write a single prefix
+// byte into the hasher without creating a new slice every time.
+// This avoids per-call heap allocations when hashing typed transactions.
+var prefixSlices [256][]byte
+
+func init() {
+	for i := range prefixSlices {
+		prefixSlices[i] = []byte{byte(i)}
+	}
 }
 
 // prefixedRlpHash writes the prefix into the hasher before rlp-encoding the
 // given interface. It's used for typed transactions.
-func prefixedRlpHash(prefix byte, x interface{}) (h common.Hash) {
+func prefixedRlpHash(prefix byte, x any) common.Hash {
 	sha := crypto.NewKeccakState()
-	//nolint:errcheck
-	sha.Write([]byte{prefix})
+	sha.Write(prefixSlices[prefix]) //nolint:errcheck
 	if err := rlp.Encode(sha, x); err != nil {
 		panic(err)
 	}
-	//nolint:errcheck
-	sha.Read(h[:])
+	h := crypto.FinalizeHash(sha)
 	crypto.ReturnToPool(sha)
 	return h
 }

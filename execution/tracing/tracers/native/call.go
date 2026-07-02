@@ -33,6 +33,7 @@ import (
 	"github.com/erigontech/erigon/execution/tracing"
 	"github.com/erigontech/erigon/execution/tracing/tracers"
 	"github.com/erigontech/erigon/execution/types"
+	"github.com/erigontech/erigon/execution/types/accounts"
 	"github.com/erigontech/erigon/execution/vm"
 )
 
@@ -43,7 +44,7 @@ func init() {
 }
 
 type callLog struct {
-	Index    uint64         `json:"index"`
+	Index    hexutil.Uint64 `json:"index"`
 	Address  common.Address `json:"address"`
 	Topics   []common.Hash  `json:"topics"`
 	Data     hexutil.Bytes  `json:"data"`
@@ -76,7 +77,7 @@ func (f *callFrame) failed() bool {
 }
 
 func (f *callFrame) processOutput(output []byte, err error) {
-	output = common.CopyBytes(output)
+	output = common.Copy(output)
 	if err == nil {
 		f.Output = output
 		return
@@ -111,8 +112,8 @@ type callTracer struct {
 	config      callTracerConfig
 	gasLimit    uint64
 	depth       int
-	interrupt   atomic.Bool // Atomic flag to signal execution interruption
-	reason      error       // Textual reason for the interruption
+	interrupt   atomic.Bool           // Atomic flag to signal execution interruption
+	reason      atomic.Pointer[error] // Reason for the interruption, populated by Stop
 	logIndex    uint64
 	logGaps     map[uint64]int
 	precompiles []bool // keep track of whether scopes are for pre-compiles or not
@@ -156,17 +157,20 @@ func newCallTracer(ctx *tracers.Context, cfg json.RawMessage) (*tracers.Tracer, 
 }
 
 // CaptureStart implements the EVMLogger interface to initialize the tracing operation.
-func (t *callTracer) CaptureStart(env *vm.EVM, from common.Address, to common.Address, precompile bool, create bool, input []byte, gas uint64, value *uint256.Int, code []byte) {
+func (t *callTracer) CaptureStart(env *vm.EVM, from accounts.Address, to accounts.Address, precompile bool, create bool, input []byte, gas uint64, value *uint256.Int, code []byte) {
 	t.precompiles = append(t.precompiles, precompile)
 	if precompile && !t.config.IncludePrecompiles {
 		return
 	}
-
+	var toValue common.Address
+	if !to.IsNil() {
+		toValue = to.Value()
+	}
 	t.callstack[0] = callFrame{
 		Type:  vm.CALL,
-		From:  from,
-		To:    to,
-		Input: common.CopyBytes(input),
+		From:  from.Value(),
+		To:    toValue,
+		Input: common.Copy(input),
 		Gas:   t.gasLimit, // gas has intrinsicGas already subtracted
 	}
 	if value != nil {
@@ -190,7 +194,7 @@ func (t *callTracer) CaptureEnd(output []byte, gasUsed uint64, err error) {
 }
 
 // CaptureEnter is called when EVM enters a new scope (via call, create or selfdestruct).
-func (t *callTracer) OnEnter(depth int, typ byte, from common.Address, to common.Address, precompile bool, input []byte, gas uint64, value uint256.Int, code []byte) {
+func (t *callTracer) OnEnter(depth int, typ byte, from accounts.Address, to accounts.Address, precompile bool, input []byte, gas uint64, value uint256.Int, code []byte) {
 	t.depth = depth
 	t.precompiles = append(t.precompiles, precompile)
 	if t.config.OnlyTopCall && depth > 0 {
@@ -204,11 +208,15 @@ func (t *callTracer) OnEnter(depth int, typ byte, from common.Address, to common
 		return
 	}
 
+	var toValue common.Address
+	if !to.IsNil() {
+		toValue = to.Value()
+	}
 	call := callFrame{
 		Type:  vm.OpCode(typ),
-		From:  from,
-		To:    to,
-		Input: common.CopyBytes(input),
+		From:  from.Value(),
+		To:    toValue,
+		Input: common.Copy(input),
 		Gas:   gas,
 	}
 
@@ -264,7 +272,7 @@ func (t *callTracer) captureEnd(output []byte, gasUsed uint64, err error, revert
 	t.callstack[0].processOutput(output, err)
 }
 
-func (t *callTracer) OnTxStart(env *tracing.VMContext, tx types.Transaction, from common.Address) {
+func (t *callTracer) OnTxStart(env *tracing.VMContext, tx types.Transaction, from accounts.Address) {
 	t.gasLimit = tx.GetGasLimit()
 	t.logIndex = 0
 	t.logGaps = make(map[uint64]int)
@@ -305,7 +313,7 @@ func (t *callTracer) OnLog(log *types.Log) {
 	if t.interrupt.Load() {
 		return
 	}
-	t.callstack[len(t.callstack)-1].Logs = append(t.callstack[len(t.callstack)-1].Logs, callLog{Address: log.Address, Topics: log.Topics, Data: log.Data, Index: t.logIndex, Position: hexutil.Uint(len(t.callstack[len(t.callstack)-1].Calls))})
+	t.callstack[len(t.callstack)-1].Logs = append(t.callstack[len(t.callstack)-1].Logs, callLog{Address: log.Address, Topics: log.Topics, Data: log.Data, Index: hexutil.Uint64(t.logIndex), Position: hexutil.Uint(len(t.callstack[len(t.callstack)-1].Calls))})
 	t.logIndex++
 }
 
@@ -325,12 +333,15 @@ func (t *callTracer) GetResult() (json.RawMessage, error) {
 	if err != nil {
 		return nil, err
 	}
-	return res, t.reason
+	if p := t.reason.Load(); p != nil {
+		return res, *p
+	}
+	return res, nil
 }
 
 // Stop terminates execution of the tracer at the first opportune moment.
 func (t *callTracer) Stop(err error) {
-	t.reason = err
+	t.reason.Store(&err)
 	t.interrupt.Store(true)
 }
 
@@ -341,7 +352,7 @@ func clearFailedLogs(cf *callFrame, parentFailed bool, logGaps map[uint64]int) {
 	if failed {
 		lastIdx := len(cf.Logs) - 1
 		if lastIdx >= 0 && logGaps != nil {
-			idx := cf.Logs[lastIdx].Index
+			idx := uint64(cf.Logs[lastIdx].Index)
 			logGaps[idx] = len(cf.Logs)
 		}
 		// Clear own logs
@@ -376,7 +387,7 @@ func fixLogIndexGap(cf *callFrame, cumulativeGaps []uint64) {
 	}
 	if len(cf.Logs) > 0 {
 		for i := range cf.Logs {
-			cf.Logs[i].Index -= cumulativeGaps[cf.Logs[i].Index]
+			cf.Logs[i].Index = hexutil.Uint64(uint64(cf.Logs[i].Index) - cumulativeGaps[cf.Logs[i].Index])
 		}
 	}
 	for i := range cf.Calls {

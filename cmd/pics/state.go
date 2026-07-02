@@ -41,8 +41,8 @@ import (
 	"github.com/erigontech/erigon/execution/abi/bind/backends"
 	"github.com/erigontech/erigon/execution/chain"
 	"github.com/erigontech/erigon/execution/commitment/trie"
+	"github.com/erigontech/erigon/execution/execmodule/execmoduletester"
 	"github.com/erigontech/erigon/execution/tests/blockgen"
-	"github.com/erigontech/erigon/execution/tests/mock"
 	"github.com/erigontech/erigon/execution/types"
 )
 
@@ -86,17 +86,14 @@ import (
 }*/
 
 var bucketLabels = map[string]string{
-	kv.Headers:                  "Headers",
-	kv.HeaderCanonical:          "Canonical headers",
-	kv.HeaderTD:                 "Headers TD",
-	kv.BlockBody:                "Block Bodies",
-	kv.HeaderNumber:             "Header Numbers",
-	kv.TxLookup:                 "Transaction Index",
-	kv.SyncStageProgress:        "Sync Progress",
-	kv.PlainState:               "Plain State",
-	kv.HashedAccountsDeprecated: "Hashed Accounts",
-	kv.HashedStorageDeprecated:  "Hashed Storage",
-	kv.Senders:                  "Transaction Senders",
+	kv.Headers:           "Headers",
+	kv.HeaderCanonical:   "Canonical headers",
+	kv.HeaderTD:          "Headers TD",
+	kv.BlockBody:         "Block Bodies",
+	kv.HeaderNumber:      "Header Numbers",
+	kv.TxLookup:          "Transaction Index",
+	kv.SyncStageProgress: "Sync Progress",
+	kv.Senders:           "Transaction Senders",
 }
 
 /*dbutils.PlainContractCode,
@@ -289,7 +286,7 @@ func initialState1() error {
 		// this code generates a log
 		signer = types.MakeSigner(chain.AllProtocolChanges, 1, 0)
 	)
-	m := mock.MockWithGenesis(nil, gspec, key, false)
+	m := execmoduletester.New(nil, execmoduletester.WithGenesisSpec(gspec), execmoduletester.WithKey(key))
 	defer m.DB.Close()
 
 	contractBackend := backends.NewSimulatedBackendWithConfig(nil, gspec.Alloc, gspec.Config, gspec.GasLimit)
@@ -418,7 +415,7 @@ func initialState1() error {
 	if err != nil {
 		return err
 	}
-	m2 := mock.MockWithGenesis(nil, gspec, key, false)
+	m2 := execmoduletester.New(nil, execmoduletester.WithGenesisSpec(gspec), execmoduletester.WithKey(key))
 	defer m2.DB.Close()
 
 	if err = hexPalette(); err != nil {

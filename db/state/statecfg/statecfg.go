@@ -20,6 +20,8 @@ type DomainCfg struct {
 	// for commitment domain only
 	ReplaceKeysInValues bool
 
+	BuildAccessorsWorkers int // parallel workers for building .kvi accessors (recsplit)
+
 	FileVersion DomainVersionTypes
 }
 
@@ -64,6 +66,8 @@ type HistCfg struct {
 	Compression   seg.FileCompression // defines type of Compression for history files
 	HistoryIdx    kv.InvertedIdx
 
+	BuildAccessorsWorkers int // parallel workers for building .vi accessors (recsplit)
+
 	FileVersion HistVersionTypes
 }
 
@@ -87,17 +91,18 @@ type InvIdxCfg struct {
 	Compression   seg.FileCompression // compression type for inverted index keys and values
 	CompressorCfg seg.Cfg             // advanced configuration for compressor encodings
 
-	Accessors Accessors
+	Accessors             Accessors
+	BuildAccessorsWorkers int // parallel workers for building .efi accessors (recsplit)
 }
 
 type BlockDataFilesCfg struct {
-	Version BlockDataVersionTypes
-	Name    string
+	FileVersion BlockDataVersionTypes
+	Name        string
 }
 
 type BlockIdxFilesCfg struct {
-	Version BlockIdxVersionTypes
-	Name    string
+	FileVersion BlockIdxVersionTypes
+	Name        string
 }
 
 func (ii InvIdxCfg) GetVersions() VersionTypes {
@@ -147,16 +152,16 @@ type BlockIdxVersionTypes struct {
 
 func (b BlockDataFilesCfg) GetVersions() VersionTypes {
 	return VersionTypes{
-		BlockData: &b.Version,
+		BlockData: &b.FileVersion,
 		BlockIdx: &BlockIdxVersionTypes{
-			b.Version.AccessorIdx,
+			b.FileVersion.AccessorIdx,
 		},
 	}
 }
 
 func (b BlockIdxFilesCfg) GetVersions() VersionTypes {
 	return VersionTypes{
-		BlockIdx: &b.Version,
+		BlockIdx: &b.FileVersion,
 	}
 }
 

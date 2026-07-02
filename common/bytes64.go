@@ -28,7 +28,7 @@ import (
 )
 
 var (
-	bytes64T = reflect.TypeOf(Bytes64{})
+	bytes64T = reflect.TypeFor[Bytes64]()
 )
 
 type Bytes64 [length.Bytes64]byte
@@ -50,7 +50,7 @@ func (b *Bytes64) UnmarshalText(input []byte) error {
 func (b Bytes64) MarshalText() ([]byte, error) {
 	bl := b[:]
 	result := make([]byte, len(b)*2+2)
-	copy(result, hexPrefix)
+	copy(result, hexutil.HexPrefix)
 	hex.Encode(result[2:], bl)
 	return result, nil
 }

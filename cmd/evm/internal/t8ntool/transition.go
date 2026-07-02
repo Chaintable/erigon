@@ -35,8 +35,8 @@ import (
 
 	"github.com/erigontech/erigon/common"
 	"github.com/erigontech/erigon/common/crypto"
+	"github.com/erigontech/erigon/common/dir"
 	"github.com/erigontech/erigon/common/hexutil"
-	"github.com/erigontech/erigon/common/length"
 	"github.com/erigontech/erigon/common/log/v3"
 	"github.com/erigontech/erigon/common/math"
 	"github.com/erigontech/erigon/db/consensuschain"
@@ -120,10 +120,10 @@ func Main(ctx *cli.Context) error {
 	if ctx.Bool(TraceFlag.Name) {
 		// Configure the EVM logger
 		logConfig := &trace_logger.LogConfig{
-			DisableStack:      ctx.Bool(TraceDisableStackFlag.Name),
-			DisableMemory:     ctx.Bool(TraceDisableMemoryFlag.Name),
-			DisableReturnData: ctx.Bool(TraceDisableReturnDataFlag.Name),
-			Debug:             true,
+			DisableStack:     ctx.Bool(TraceDisableStackFlag.Name),
+			EnableMemory:     !ctx.Bool(TraceDisableMemoryFlag.Name),
+			EnableReturnData: !ctx.Bool(TraceDisableReturnDataFlag.Name),
+			Debug:            true,
 		}
 		var prevFile *os.File
 		// This one closes the last file
@@ -208,7 +208,7 @@ func Main(ctx *cli.Context) error {
 		vmConfig.ExtraEips = extraEips
 	}
 	// Set the chain id
-	chainConfig.ChainID = big.NewInt(ctx.Int64(ChainIDFlag.Name))
+	chainConfig.ChainID = new(uint256.Int).SetUint64(ctx.Uint64(ChainIDFlag.Name))
 
 	var txsWithKeys []*txWithKey
 	if txStr != stdinSelector {
@@ -232,7 +232,7 @@ func Main(ctx *cli.Context) error {
 	}
 
 	eip1559 := chainConfig.IsLondon(prestate.Env.Number)
-	// Sanity check, to not `panic` in state_transition
+	// Sanity check, to not `panic` in txn_executor
 	if eip1559 {
 		if prestate.Env.BaseFee == nil {
 			return NewError(ErrorVMConfig, errors.New("EIP-1559 config but missing 'currentBaseFee' in env section"))
@@ -270,33 +270,41 @@ func Main(ctx *cli.Context) error {
 				env.Timestamp, env.ParentTimestamp))
 		}
 		prestate.Env.Difficulty = calcDifficulty(chainConfig, env.Number, env.Timestamp,
-			env.ParentTimestamp, env.ParentDifficulty, env.ParentUncleHash)
+			env.ParentTimestamp, *env.ParentDifficulty, env.ParentUncleHash)
 	}
 
 	// manufacture block from above inputs
 	header := NewHeader(prestate.Env)
 
 	var ommerHeaders = make([]*types.Header, len(prestate.Env.Ommers))
-	header.Number.Add(header.Number, big.NewInt(int64(len(prestate.Env.Ommers))))
+	header.Number.AddUint64(&header.Number, uint64(len(prestate.Env.Ommers)))
 	for i, ommer := range prestate.Env.Ommers {
-		var ommerN big.Int
+		var ommerN uint256.Int
 		ommerN.SetUint64(header.Number.Uint64() - ommer.Delta)
-		ommerHeaders[i] = &types.Header{Coinbase: ommer.Address, Number: &ommerN}
+		ommerHeaders[i] = &types.Header{Coinbase: ommer.Address, Number: ommerN}
 	}
 	block := types.NewBlock(header, txs, ommerHeaders, nil /* receipts */, prestate.Env.Withdrawals)
 
+	var missingBlockHash bool
 	getHash := func(num uint64) (common.Hash, error) {
 		if prestate.Env.BlockHashes == nil {
+			missingBlockHash = true
 			return common.Hash{}, fmt.Errorf("getHash(%d) invoked, no blockhashes provided", num)
 		}
 		h, ok := prestate.Env.BlockHashes[math.HexOrDecimal64(num)]
 		if !ok {
+			missingBlockHash = true
 			return common.Hash{}, fmt.Errorf("getHash(%d) invoked, blockhash for that block not provided", num)
 		}
 		return h, nil
 	}
 
-	db := temporaltest.NewTestDB(nil, datadir.New(""))
+	tmpDir, err := os.MkdirTemp("", "erigon-t8n-*")
+	if err != nil {
+		return err
+	}
+	defer dir.RemoveAll(tmpDir)
+	db := temporaltest.NewTestDB(nil, datadir.New(tmpDir))
 	defer db.Close()
 
 	tx, err := db.BeginTemporalRw(context.Background())
@@ -305,19 +313,15 @@ func Main(ctx *cli.Context) error {
 	}
 	defer tx.Rollback()
 
-	sd, err := execctx.NewSharedDomains(tx, log.New())
+	sd, err := execctx.NewSharedDomains(context.Background(), tx, log.New())
 	if err != nil {
 		return err
 	}
 	defer sd.Close()
 
 	blockNum, txNum := uint64(0), uint64(0)
-	sd.SetTxNum(txNum)
-	sd.SetBlockNum(blockNum)
 	reader, writer := MakePreState((&evmtypes.BlockContext{}).Rules(chainConfig), tx, sd, prestate.Pre, blockNum, txNum)
 	blockNum, txNum = uint64(1), uint64(2)
-	sd.SetTxNum(txNum)
-	sd.SetBlockNum(blockNum)
 
 	// Merge engine can be used for pre-merge blocks as well, as it
 	// redirects to the ethash engine based on the block number
@@ -327,23 +331,42 @@ func Main(ctx *cli.Context) error {
 	chainReader := consensuschain.NewReader(chainConfig, tx, nil, t8logger)
 	result, err := protocol.ExecuteBlockEphemerally(chainConfig, &vmConfig, getHash, engine, block, reader, writer, chainReader, getTracer, t8logger)
 
+	// A blockhash requested during execution but not supplied in the env input is a
+	// hard input error (t8n exit code 4), not a per-transaction rejection.
+	if missingBlockHash {
+		return NewError(ErrorMissingBlockhash, errors.New("getHash invoked for a block whose hash was not provided in the env input"))
+	}
 	if err != nil {
 		return fmt.Errorf("error on EBE: %w", err)
 	}
 
 	// state root calculation
-	root, err := CalculateStateRoot(tx, blockNum, txNum)
+	root, err := CalculateStateRoot(sd, tx, blockNum, txNum)
 	if err != nil {
 		return err
 	}
 	result.StateRoot = *root
 
+	// Persist the post-execution state so the alloc dumper (which reads tx) sees it.
+	if err = sd.Flush(context.Background(), tx); err != nil {
+		return err
+	}
+	// Record the block→txNum mapping the dumper needs to read the post-state as-of.
+	if err = rawdbv3.TxNums.Append(tx, blockNum, txNum); err != nil {
+		return err
+	}
+
+	// Match the reference t8n output, which emits null (not []) when empty.
+	if len(result.Receipts) == 0 {
+		result.Receipts = nil
+	}
+
 	// Dump the execution result
 	body, _ := rlp.EncodeToBytes(txs)
 	collector := make(Alloc)
 
-	dumper := state.NewDumper(tx, rawdbv3.TxNums, prestate.Env.Number)
-	dumper.DumpToCollector(collector, false, false, common.Address{}, 0)
+	dumper := state.NewDumper(tx, rawdbv3.TxNums, blockNum)
+	dumper.DumpToCollector(context.Background(), collector, false, false, common.Address{}, 0)
 	return dispatchOutput(ctx, baseDir, result, collector, body)
 }
 
@@ -391,7 +414,7 @@ func (t *txWithKey) UnmarshalJSON(input []byte) error {
 func getTransaction(txJson ethapi.RPCTransaction) (types.Transaction, error) {
 	gasPrice, value := uint256.NewInt(0), uint256.NewInt(0)
 	var overflow bool
-	var chainId *uint256.Int
+	var chainId uint256.Int
 
 	if txJson.Value != nil {
 		value, overflow = uint256.FromBig(txJson.Value.ToInt())
@@ -408,34 +431,47 @@ func getTransaction(txJson ethapi.RPCTransaction) (types.Transaction, error) {
 	}
 
 	if txJson.ChainID != nil {
-		chainId, overflow = uint256.FromBig(txJson.ChainID.ToInt())
+		cid, overflow := uint256.FromBig(txJson.ChainID.ToInt())
 		if overflow {
 			return nil, errors.New("chainId field caused an overflow (uint256)")
 		}
+		chainId = *cid
 	}
 
-	commonTx := types.CommonTx{
-		Nonce:    uint64(txJson.Nonce),
-		To:       txJson.To,
-		Value:    value,
-		GasLimit: uint64(txJson.Gas),
-		Data:     txJson.Input,
+	sig := func(name string, b *hexutil.Big) (uint256.Int, error) {
+		var out uint256.Int
+		if b != nil && out.SetFromBig(b.ToInt()) {
+			return out, fmt.Errorf("%s field caused an overflow (uint256)", name)
+		}
+		return out, nil
+	}
+	v, err := sig("v", txJson.V)
+	if err != nil {
+		return nil, err
+	}
+	r, err := sig("r", txJson.R)
+	if err != nil {
+		return nil, err
+	}
+	s, err := sig("s", txJson.S)
+	if err != nil {
+		return nil, err
 	}
 
-	commonTx.V.SetFromBig(txJson.V.ToInt())
-	commonTx.R.SetFromBig(txJson.R.ToInt())
-	commonTx.S.SetFromBig(txJson.S.ToInt())
 	if txJson.Type == types.LegacyTxType || txJson.Type == types.AccessListTxType {
 		if txJson.Type == types.LegacyTxType {
 			return &types.LegacyTx{
 				CommonTx: types.CommonTx{
 					Nonce:    uint64(txJson.Nonce),
 					To:       txJson.To,
-					Value:    value,
+					Value:    *value,
 					GasLimit: uint64(txJson.Gas),
 					Data:     txJson.Input,
+					V:        v,
+					R:        r,
+					S:        s,
 				},
-				GasPrice: gasPrice,
+				GasPrice: *gasPrice,
 			}, nil
 		}
 
@@ -444,30 +480,34 @@ func getTransaction(txJson ethapi.RPCTransaction) (types.Transaction, error) {
 				CommonTx: types.CommonTx{
 					Nonce:    uint64(txJson.Nonce),
 					To:       txJson.To,
-					Value:    value,
+					Value:    *value,
 					GasLimit: uint64(txJson.Gas),
 					Data:     txJson.Input,
+					V:        v,
+					R:        r,
+					S:        s,
 				},
-				GasPrice: gasPrice,
+				GasPrice: *gasPrice,
 			},
 			ChainID:    chainId,
 			AccessList: *txJson.Accesses,
 		}, nil
 	} else if txJson.Type == types.DynamicFeeTxType || txJson.Type == types.SetCodeTxType {
-		var tipCap *uint256.Int
-		var feeCap *uint256.Int
+		var tipCap, feeCap uint256.Int
 		if txJson.MaxPriorityFeePerGas != nil {
-			tipCap, overflow = uint256.FromBig(txJson.MaxPriorityFeePerGas.ToInt())
+			tc, overflow := uint256.FromBig(txJson.MaxPriorityFeePerGas.ToInt())
 			if overflow {
 				return nil, errors.New("maxPriorityFeePerGas field caused an overflow (uint256)")
 			}
+			tipCap = *tc
 		}
 
 		if txJson.MaxFeePerGas != nil {
-			feeCap, overflow = uint256.FromBig(txJson.MaxFeePerGas.ToInt())
+			fc, overflow := uint256.FromBig(txJson.MaxFeePerGas.ToInt())
 			if overflow {
 				return nil, errors.New("maxFeePerGas field caused an overflow (uint256)")
 			}
+			feeCap = *fc
 		}
 
 		if txJson.Type == types.DynamicFeeTxType {
@@ -475,9 +515,12 @@ func getTransaction(txJson ethapi.RPCTransaction) (types.Transaction, error) {
 				CommonTx: types.CommonTx{
 					Nonce:    uint64(txJson.Nonce),
 					To:       txJson.To,
-					Value:    value,
+					Value:    *value,
 					GasLimit: uint64(txJson.Gas),
 					Data:     txJson.Input,
+					V:        v,
+					R:        r,
+					S:        s,
 				},
 				ChainID:    chainId,
 				TipCap:     tipCap,
@@ -501,9 +544,12 @@ func getTransaction(txJson ethapi.RPCTransaction) (types.Transaction, error) {
 				CommonTx: types.CommonTx{
 					Nonce:    uint64(txJson.Nonce),
 					To:       txJson.To,
-					Value:    value,
+					Value:    *value,
 					GasLimit: uint64(txJson.Gas),
 					Data:     txJson.Input,
+					V:        v,
+					R:        r,
+					S:        s,
 				},
 				ChainID:    chainId,
 				TipCap:     tipCap,
@@ -573,7 +619,7 @@ func (g Alloc) OnAccount(addr common.Address, dumpAccount state.DumpAccount) {
 }
 
 // saveFile marshalls the object to the given file
-func saveFile(baseDir, filename string, data interface{}) error {
+func saveFile(baseDir, filename string, data any) error {
 	b, err := json.MarshalIndent(data, "", " ")
 	if err != nil {
 		return NewError(ErrorJson, fmt.Errorf("failed marshalling output: %v", err))
@@ -589,9 +635,9 @@ func saveFile(baseDir, filename string, data interface{}) error {
 // dispatchOutput writes the output data to either stderr or stdout, or to the specified
 // files
 func dispatchOutput(ctx *cli.Context, baseDir string, result *protocol.EphemeralExecResult, alloc Alloc, body hexutil.Bytes) error {
-	stdOutObject := make(map[string]interface{})
-	stdErrObject := make(map[string]interface{})
-	dispatch := func(baseDir, fName, name string, obj interface{}) error {
+	stdOutObject := make(map[string]any)
+	stdErrObject := make(map[string]any)
+	dispatch := func(baseDir, fName, name string, obj any) error {
 		switch fName {
 		case "stdout":
 			stdOutObject[name] = obj
@@ -635,9 +681,11 @@ func dispatchOutput(ctx *cli.Context, baseDir string, result *protocol.Ephemeral
 func NewHeader(env stEnv) *types.Header {
 	var header types.Header
 	header.Coinbase = env.Coinbase
-	header.Difficulty = env.Difficulty
+	if env.Difficulty != nil {
+		header.Difficulty = *env.Difficulty
+	}
 	header.GasLimit = env.GasLimit
-	header.Number = new(big.Int).SetUint64(env.Number)
+	header.Number.SetUint64(env.Number)
 	header.Time = env.Timestamp
 	header.BaseFee = env.BaseFee
 	header.MixDigest = env.MixDigest
@@ -649,54 +697,11 @@ func NewHeader(env stEnv) *types.Header {
 	return &header
 }
 
-func CalculateStateRoot(tx kv.TemporalRwTx, blockNum uint64, txNum uint64) (*common.Hash, error) {
-	// Generate hashed state
-	c, err := tx.RwCursor(kv.PlainState)
-	if err != nil {
-		return nil, err
-	}
-	defer c.Close()
-	h := common.NewHasher()
-	defer common.ReturnHasherToPool(h)
-	domains, err := execctx.NewSharedDomains(tx, log.New())
-	if err != nil {
-		return nil, fmt.Errorf("NewSharedDomains: %w", err)
-	}
-	defer domains.Close()
-
-	for k, v, err := c.First(); k != nil; k, v, err = c.Next() {
-		if err != nil {
-			return nil, fmt.Errorf("interate over plain state: %w", err)
-		}
-		var newK []byte
-		if len(k) == length.Addr {
-			newK = make([]byte, length.Hash)
-		} else {
-			newK = make([]byte, length.Hash*2+length.Incarnation)
-		}
-		h.Sha.Reset()
-		//nolint:errcheck
-		h.Sha.Write(k[:length.Addr])
-		//nolint:errcheck
-		h.Sha.Read(newK[:length.Hash])
-		if len(k) > length.Addr {
-			copy(newK[length.Hash:], k[length.Addr:length.Addr+length.Incarnation])
-			h.Sha.Reset()
-			//nolint:errcheck
-			h.Sha.Write(k[length.Addr+length.Incarnation:])
-			//nolint:errcheck
-			h.Sha.Read(newK[length.Hash+length.Incarnation:])
-			if err = tx.Put(kv.HashedStorageDeprecated, newK, common.CopyBytes(v)); err != nil {
-				return nil, fmt.Errorf("insert hashed key: %w", err)
-			}
-		} else {
-			if err = tx.Put(kv.HashedAccountsDeprecated, newK, common.CopyBytes(v)); err != nil {
-				return nil, fmt.Errorf("insert hashed key: %w", err)
-			}
-		}
-	}
-	c.Close()
-	root, err := domains.ComputeCommitment(context.Background(), tx, true, blockNum, txNum, "", nil)
+func CalculateStateRoot(sd *execctx.SharedDomains, tx kv.TemporalRwTx, blockNum uint64, txNum uint64) (*common.Hash, error) {
+	// Compute the commitment on the SharedDomains that executed the block: it holds
+	// the touched-key set (prestate + execution) that ComputeCommitment needs. A
+	// fresh SharedDomains would see no changes and return the empty-trie root.
+	root, err := sd.ComputeCommitment(context.Background(), tx, true, blockNum, txNum, "", nil)
 	if err != nil {
 		return nil, err
 	}

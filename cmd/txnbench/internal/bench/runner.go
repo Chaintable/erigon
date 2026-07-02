@@ -2,7 +2,6 @@ package bench
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"github.com/erigontech/erigon/cmd/txnbench/internal/rpcclient"
 	"math"
@@ -15,7 +14,10 @@ import (
 const repeats = 10
 
 func RunBenchmark(ctx context.Context, c *rpcclient.Client, name string) (BenchOutput, error) {
-	const benchFile = "benchdata.toml"
+	benchFile := "benchdata.toml"
+	if os.Getenv("BENCH_DATA_FILE") != "" {
+		benchFile = os.Getenv("BENCH_DATA_FILE")
+	}
 	content, err := os.ReadFile(benchFile)
 	if err != nil {
 		return BenchOutput{}, fmt.Errorf("read %s: %w", benchFile, err)
@@ -99,8 +101,4 @@ func meanStd(xs []float64) (mean, std float64) {
 		std = math.Sqrt(s2 / float64(len(xs)-1))
 	}
 	return
-}
-
-func isNonNullJSON(raw json.RawMessage) bool {
-	return len(raw) > 0 && string(raw) != "null"
 }

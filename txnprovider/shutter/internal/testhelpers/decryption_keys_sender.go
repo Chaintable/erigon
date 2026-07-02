@@ -18,6 +18,7 @@ package testhelpers
 
 import (
 	"context"
+	"slices"
 	"strconv"
 	"time"
 
@@ -86,10 +87,8 @@ func (dks DecryptionKeysSender) WaitExternalPeerConnection(ctx context.Context, 
 			return ctx.Err()
 		case <-ticker.C:
 			peers := dks.host.Network().Peers()
-			for _, p := range peers {
-				if p == peerId {
-					return nil
-				}
+			if slices.Contains(peers, peerId) {
+				return nil
 			}
 		}
 	}
@@ -133,7 +132,8 @@ func DecryptionKeysPublishMsgEnveloped(
 		return nil, err
 	}
 
-	ipsWithSlot := shutter.IdentityPreimages{slotIp}
+	ipsWithSlot := make(shutter.IdentityPreimages, 0, 1+len(ips))
+	ipsWithSlot = append(ipsWithSlot, slotIp)
 	ipsWithSlot = append(ipsWithSlot, ips...)
 	keys, err := ekg.DecryptionKeys(signers, ipsWithSlot)
 	if err != nil {

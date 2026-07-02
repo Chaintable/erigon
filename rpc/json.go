@@ -68,10 +68,6 @@ func (msg *jsonrpcMessage) hasVersion() bool {
 	return msg.Version != ""
 }
 
-func (msg *jsonrpcMessage) hasMethod() bool {
-	return msg.Method != ""
-}
-
 func (msg *jsonrpcMessage) isCall() bool {
 	return msg.hasValidID() && msg.Method != ""
 }
@@ -93,8 +89,8 @@ func (msg *jsonrpcMessage) isUnsubscribe() bool {
 }
 
 func (msg *jsonrpcMessage) namespace() string {
-	elem := strings.SplitN(msg.Method, serviceMethodSeparator, 2)
-	return elem[0]
+	ns, _, _ := strings.Cut(msg.Method, serviceMethodSeparator)
+	return ns
 }
 
 func (msg *jsonrpcMessage) String() string {
@@ -108,8 +104,21 @@ func (msg *jsonrpcMessage) errorResponse(err error) *jsonrpcMessage {
 	return resp
 }
 
+// fastJSONResult lets an RPC result implement fast JSON marshalling where needed — e.g. large payloads that benefit from skipping the reflection-based path.
+type fastJSONResult interface {
+	MarshalFastJSON() ([]byte, error)
+}
+
 func (msg *jsonrpcMessage) response(result any) *jsonrpcMessage {
-	enc, err := json.Marshal(result)
+	var (
+		enc []byte
+		err error
+	)
+	if fm, ok := result.(fastJSONResult); ok {
+		enc, err = fm.MarshalFastJSON()
+	} else {
+		enc, err = json.Marshal(result)
+	}
 	if err != nil {
 		// TODO: wrap with 'internal server error'
 		return msg.errorResponse(err)
@@ -142,16 +151,16 @@ func (err *jsonError) ErrorData() any {
 	return err.Data
 }
 
-func NewJsonError(code int, message string, data interface{}) interface{} {
+func NewJsonError(code int, message string, data any) any {
 	return &jsonError{Code: code, Message: message, Data: data}
 }
 
-func NewJsonErrorFromErr(err error) interface{} {
+func NewJsonErrorFromErr(err error) any {
 	return newJsonError(err)
 }
 
 func newJsonError(err error) *jsonError {
-	jsonErr := &jsonError{Code: defaultErrorCode, Message: err.Error()}
+	jsonErr := &jsonError{Code: ErrCodeDefault, Message: err.Error()}
 	var ec Error
 	ok := errors.As(err, &ec)
 	if ok {
@@ -211,13 +220,28 @@ func NewFuncCodec(conn deadlineCloser, encode, decode func(v any) error) ServerC
 	return codec
 }
 
+// rawResponse is a pre-assembled, already-valid JSON response the codec writes verbatim,
+// skipping json.Encoder's redundant appendCompact re-scan; a distinct type keeps that path opt-in.
+type rawResponse []byte
+
+// MarshalJSON emits the bytes verbatim so json.Marshal-based transports don't base64-encode the []byte.
+func (r rawResponse) MarshalJSON() ([]byte, error) { return r, nil }
+
 // NewCodec creates a codec on the given connection. If conn implements ConnRemoteAddr, log
 // messages will use it to include the remote address of the connection.
 func NewCodec(conn Conn) ServerCodec {
 	enc := json.NewEncoder(conn)
 	dec := json.NewDecoder(conn)
 	dec.UseNumber()
-	return NewFuncCodec(conn, enc.Encode, dec.Decode)
+	encode := func(v any) error {
+		raw, ok := v.(rawResponse)
+		if !ok {
+			return enc.Encode(v)
+		}
+		_, err := conn.Write(append(raw, '\n'))
+		return err
+	}
+	return NewFuncCodec(conn, encode, dec.Decode)
 }
 
 func (c *jsonCodec) remoteAddr() string {
@@ -332,7 +356,7 @@ func parsePositionalArguments(rawArgs json.RawMessage, types []reflect.Type) ([]
 	}
 	// Set any missing args to nil.
 	for i := len(args); i < len(types); i++ {
-		if types[i].Kind() != reflect.Ptr {
+		if types[i].Kind() != reflect.Pointer {
 			return nil, fmt.Errorf("missing value for required argument %d", i)
 		}
 		args = append(args, reflect.Zero(types[i]))
@@ -350,7 +374,7 @@ func parseArgumentArray(dec *json.Decoder, types []reflect.Type) ([]reflect.Valu
 		if err := dec.Decode(argval.Interface()); err != nil {
 			return args, fmt.Errorf("invalid argument %d: %w", i, err)
 		}
-		if argval.IsNil() && types[i].Kind() != reflect.Ptr {
+		if argval.IsNil() && types[i].Kind() != reflect.Pointer {
 			return args, fmt.Errorf("missing value for required argument %d", i)
 		}
 		args = append(args, argval.Elem())

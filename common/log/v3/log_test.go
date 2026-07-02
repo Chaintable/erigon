@@ -109,13 +109,13 @@ func TestJson(t *testing.T) {
 	l, buf := testFormatter(JsonFormat())
 	l.Error("some message", "x", 1, "y", 3.2)
 
-	var v map[string]interface{}
+	var v map[string]any
 	decoder := json.NewDecoder(buf)
 	if err := decoder.Decode(&v); err != nil {
 		t.Fatalf("Error decoding JSON: %v", v)
 	}
 
-	validate := func(key string, expected interface{}) {
+	validate := func(key string, expected any) {
 		if v[key] != expected {
 			t.Fatalf("Got %v expected %v for %v", v[key], expected, key)
 		}
@@ -128,7 +128,7 @@ func TestJson(t *testing.T) {
 }
 
 func TestJSONMap(t *testing.T) {
-	m := map[string]interface{}{
+	m := map[string]any{
 		"name":     "gopher",
 		"age":      float64(5),
 		"language": "go",
@@ -137,19 +137,19 @@ func TestJSONMap(t *testing.T) {
 	l, buf := testFormatter(JsonFormat())
 	l.Error("logging structs", "struct", m)
 
-	var v map[string]interface{}
+	var v map[string]any
 	decoder := json.NewDecoder(buf)
 	if err := decoder.Decode(&v); err != nil {
 		t.Fatalf("Error decoding JSON: %v", v)
 	}
 
-	checkMap := func(key string, expected interface{}) {
+	checkMap := func(key string, expected any) {
 		if m[key] != expected {
 			t.Fatalf("Got %v expected %v for %v", m[key], expected, key)
 		}
 	}
 
-	mv := v["struct"].(map[string]interface{})
+	mv := v["struct"].(map[string]any)
 	checkMap("name", mv["name"])
 	checkMap("age", mv["age"])
 	checkMap("language", mv["language"])
@@ -177,6 +177,29 @@ func TestLogfmt(t *testing.T) {
 	expected := []byte(`lvl=eror msg="some message" x=1 y=3.200 equals="=" quote="\"" nil=nil carriage_return="bang\rfoo" tab="bar\tbaz" newline="foo\nbar"` + "\n")
 	if !bytes.Equal(got, expected) {
 		t.Fatalf("Got %s, expected %s", got, expected)
+	}
+}
+
+func TestTerminalFormatNoColor(t *testing.T) {
+	t.Parallel()
+
+	l, buf := testFormatter(TerminalFormatNoColor())
+	l.Info("some message", "x", 1, "y", "foo")
+
+	// skip the "[INFO] [timestamp] " prefix: "[INFO] " is 7 chars, timestamp
+	// "[01-02|15:04:05.000] " is 21 chars, total 28.
+	const prefixLen = 7 + 21
+	if buf.Len() < prefixLen {
+		t.Fatalf("output too short: %q", buf.String())
+	}
+	if got, want := string(buf.Bytes()[:7]), "[INFO] "; got != want {
+		t.Fatalf("level prefix: got %q, want %q", got, want)
+	}
+	got := buf.Bytes()[prefixLen:]
+	// short messages are right-padded to termMsgJust (40) chars
+	expected := []byte("some message                             x=1 y=foo\n")
+	if !bytes.Equal(got, expected) {
+		t.Fatalf("Got %q, expected %q", got, expected)
 	}
 }
 
@@ -288,12 +311,11 @@ func TestLvlFilterHandler(t *testing.T) {
 }
 
 func TestNetHandler(t *testing.T) {
-	t.Skip()
 	t.Parallel()
 
 	l, err := net.Listen("tcp", "localhost:0") //nolint:noctx
 	if err != nil {
-		t.Fatalf("Failed to listen: %v", l)
+		t.Fatalf("Failed to listen: %v", err)
 	}
 
 	errs := make(chan error)
@@ -528,7 +550,6 @@ func TestCallerFuncHandler(t *testing.T) {
 
 // https://github.com/inconshreveable/log15/issues/27
 func TestCallerStackHandler(t *testing.T) {
-	t.Skip("fix me")
 	t.Parallel()
 
 	l := New()
@@ -590,7 +611,7 @@ func TestConcurrent(t *testing.T) {
 	// go to allocate extra capacity in the logger's context slice which
 	// was necessary to trigger the bug
 	const ctxLen = 34
-	l := root.New(make([]interface{}, ctxLen)...)
+	l := root.New(make([]any, ctxLen)...)
 	const goroutines = 8
 	var res [goroutines]int
 	l.SetHandler(SyncHandler(concurrentCaptureTestHandler{res: res[:], ctxLen: ctxLen}))

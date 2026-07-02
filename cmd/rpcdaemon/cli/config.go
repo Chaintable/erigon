@@ -21,15 +21,16 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
-	"math/big"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
+	"github.com/holiman/uint256"
 	"github.com/spf13/cobra"
 	"golang.org/x/sync/errgroup"
 	"golang.org/x/sync/semaphore"
@@ -46,7 +47,6 @@ import (
 	"github.com/erigontech/erigon/common"
 	"github.com/erigontech/erigon/common/hexutil"
 	"github.com/erigontech/erigon/common/log/v3"
-	"github.com/erigontech/erigon/db/config3"
 	"github.com/erigontech/erigon/db/datadir"
 	"github.com/erigontech/erigon/db/kv"
 	"github.com/erigontech/erigon/db/kv/dbcfg"
@@ -68,6 +68,7 @@ import (
 	"github.com/erigontech/erigon/execution/state"
 	"github.com/erigontech/erigon/execution/tracing"
 	"github.com/erigontech/erigon/execution/types"
+	"github.com/erigontech/erigon/execution/types/accounts"
 	"github.com/erigontech/erigon/execution/vm/evmtypes"
 	"github.com/erigontech/erigon/node"
 	"github.com/erigontech/erigon/node/debug"
@@ -81,6 +82,7 @@ import (
 	"github.com/erigontech/erigon/node/logging"
 	"github.com/erigontech/erigon/node/nodecfg"
 	"github.com/erigontech/erigon/node/paths"
+	"github.com/erigontech/erigon/node/shards"
 	"github.com/erigontech/erigon/polygon/bor"
 	"github.com/erigontech/erigon/polygon/bor/borcfg"
 	"github.com/erigontech/erigon/polygon/bridge"
@@ -129,7 +131,10 @@ func RootCommand() (*cobra.Command, *httpcfg.HttpCfg) {
 	rootCmd.PersistentFlags().BoolVar(&cfg.RpcStreamingDisable, utils.RpcStreamingDisableFlag.Name, false, utils.RpcStreamingDisableFlag.Usage)
 	rootCmd.PersistentFlags().BoolVar(&cfg.DebugSingleRequest, utils.HTTPDebugSingleFlag.Name, false, utils.HTTPDebugSingleFlag.Usage)
 	rootCmd.PersistentFlags().IntVar(&cfg.DBReadConcurrency, utils.DBReadConcurrencyFlag.Name, utils.DBReadConcurrencyFlag.Value, utils.DBReadConcurrencyFlag.Usage)
+	rootCmd.PersistentFlags().IntVar(&cfg.RpcMaxConcurrentRequests, utils.RpcMaxConcurrentRequestsFlag.Name, utils.RpcMaxConcurrentRequestsFlag.Value, utils.RpcMaxConcurrentRequestsFlag.Usage)
+	rootCmd.PersistentFlags().IntVar(&cfg.WsMaxConnections, utils.WsMaxConnectionsFlag.Name, utils.WsMaxConnectionsFlag.Value, utils.WsMaxConnectionsFlag.Usage)
 	rootCmd.PersistentFlags().BoolVar(&cfg.TraceCompatibility, "trace.compat", false, "Bug for bug compatibility with OE for trace_ routines")
+	rootCmd.PersistentFlags().BoolVar(&cfg.GethCompatibility, "rpc.gethcompat", false, "Enables Geth-compatible storage iteration order for debug_storageRangeAt (sorted by keccak256 hash). Disabled by default for performance.")
 	rootCmd.PersistentFlags().StringVar(&cfg.TxPoolApiAddr, "txpool.api.addr", "", "txpool api network address, for example: 127.0.0.1:9090 (default: use value of --private.api.addr)")
 
 	rootCmd.PersistentFlags().StringVar(&stateCacheStr, "state.cache", "0MB", "Amount of data to store in StateCache (enabled if no --datadir set). Set 0 to disable StateCache. Defaults to 0MB RAM")
@@ -142,7 +147,7 @@ func RootCommand() (*cobra.Command, *httpcfg.HttpCfg) {
 	rootCmd.PersistentFlags().StringVar(&cfg.TLSKeyFile, "tls.key", "", "key file for client side TLS handshake for GRPC")
 	rootCmd.PersistentFlags().StringVar(&cfg.TLSCACert, "tls.cacert", "", "CA certificate for client side TLS handshake for GRPC")
 
-	rootCmd.PersistentFlags().StringSliceVar(&cfg.API, "http.api", []string{"eth", "erigon"}, "API's offered over the RPC interface: eth,erigon,web3,net,debug,trace,txpool,db. Supported methods: https://github.com/erigontech/erigon/tree/main/cmd/rpcdaemon")
+	rootCmd.PersistentFlags().StringSliceVar(&cfg.API, "http.api", []string{"eth", "erigon"}, "API's offered over the RPC interface: eth,erigon,web3,net,debug,trace,txpool,db,testing. Supported methods: https://github.com/erigontech/erigon/tree/main/cmd/rpcdaemon")
 
 	rootCmd.PersistentFlags().BoolVar(&cfg.HttpServerEnabled, "http.enabled", true, "Enable HTTP server")
 	rootCmd.PersistentFlags().StringVar(&cfg.HttpListenAddress, "http.addr", nodecfg.DefaultHTTPHost, "HTTP server listening interface")
@@ -176,16 +181,16 @@ func RootCommand() (*cobra.Command, *httpcfg.HttpCfg) {
 	rootCmd.PersistentFlags().IntVar(&cfg.RpcFiltersConfig.RpcSubscriptionFiltersMaxTxs, "rpc.subscription.filters.maxtxs", rpchelper.DefaultFiltersConfig.RpcSubscriptionFiltersMaxTxs, "Maximum number of transactions to store per subscription.")
 	rootCmd.PersistentFlags().IntVar(&cfg.RpcFiltersConfig.RpcSubscriptionFiltersMaxAddresses, "rpc.subscription.filters.maxaddresses", rpchelper.DefaultFiltersConfig.RpcSubscriptionFiltersMaxAddresses, "Maximum number of addresses per subscription to filter logs by.")
 	rootCmd.PersistentFlags().IntVar(&cfg.RpcFiltersConfig.RpcSubscriptionFiltersMaxTopics, "rpc.subscription.filters.maxtopics", rpchelper.DefaultFiltersConfig.RpcSubscriptionFiltersMaxTopics, "Maximum number of topics per subscription to filter logs by.")
+	rootCmd.PersistentFlags().IntVar(&cfg.BlockRangeLimit, utils.RpcBlockRangeLimit.Name, utils.RpcBlockRangeLimit.Value, utils.RpcBlockRangeLimit.Usage)
+	rootCmd.PersistentFlags().IntVar(&cfg.GetLogsMaxResults, utils.RpcGetLogsMaxResults.Name, utils.RpcGetLogsMaxResults.Value, utils.RpcGetLogsMaxResults.Usage)
 	rootCmd.PersistentFlags().IntVar(&cfg.BatchLimit, utils.RpcBatchLimit.Name, utils.RpcBatchLimit.Value, utils.RpcBatchLimit.Usage)
 	rootCmd.PersistentFlags().IntVar(&cfg.ReturnDataLimit, utils.RpcReturnDataLimit.Name, utils.RpcReturnDataLimit.Value, utils.RpcReturnDataLimit.Usage)
-	rootCmd.PersistentFlags().IntVar(&cfg.BlockRangeLimit, utils.RpcBlockRangeLimit.Name, utils.RpcBlockRangeLimit.Value, utils.RpcBlockRangeLimit.Usage)
 	rootCmd.PersistentFlags().BoolVar(&cfg.AllowUnprotectedTxs, utils.AllowUnprotectedTxs.Name, utils.AllowUnprotectedTxs.Value, utils.AllowUnprotectedTxs.Usage)
 	rootCmd.PersistentFlags().Uint64Var(&cfg.OtsMaxPageSize, utils.OtsSearchMaxCapFlag.Name, utils.OtsSearchMaxCapFlag.Value, utils.OtsSearchMaxCapFlag.Usage)
 	rootCmd.PersistentFlags().DurationVar(&cfg.RPCSlowLogThreshold, utils.RPCSlowFlag.Name, utils.RPCSlowFlag.Value, utils.RPCSlowFlag.Usage)
 	rootCmd.PersistentFlags().IntVar(&cfg.WebsocketSubscribeLogsChannelSize, utils.WSSubscribeLogsChannelSize.Name, utils.WSSubscribeLogsChannelSize.Value, utils.WSSubscribeLogsChannelSize.Usage)
-
-	rootCmd.PersistentFlags().Uint64Var(&cfg.ErigonDBStepSize, utils.ErigonDBStepSizeFlag.Name, utils.ErigonDBStepSizeFlag.Value, utils.ErigonDBStepSizeFlag.Usage)
-	rootCmd.PersistentFlags().Uint64Var(&cfg.ErigonDBStepsInFrozenFile, utils.ErigonDBStepsInFrozenFileFlag.Name, utils.ErigonDBStepsInFrozenFileFlag.Value, utils.ErigonDBStepsInFrozenFileFlag.Usage)
+	rootCmd.PersistentFlags().DurationVar(&cfg.RpcTxSyncDefaultTimeout, utils.RpcTxSyncDefaultTimeoutFlag.Name, utils.RpcTxSyncDefaultTimeoutFlag.Value, utils.RpcTxSyncDefaultTimeoutFlag.Usage)
+	rootCmd.PersistentFlags().DurationVar(&cfg.RpcTxSyncMaxTimeout, utils.RpcTxSyncMaxTimeoutFlag.Name, utils.RpcTxSyncMaxTimeoutFlag.Value, utils.RpcTxSyncMaxTimeoutFlag.Usage)
 
 	if err := rootCmd.MarkPersistentFlagFilename("rpc.accessList", "json"); err != nil {
 		panic(err)
@@ -239,13 +244,18 @@ func subscribeToStateChangesLoop(ctx context.Context, client StateChangesClient,
 		for {
 			select {
 			case <-ctx.Done():
+				log.Warn("[rpcdaemon subscribeToStateChanges] ctx done", "err", ctx.Err())
 				return
 			default:
 			}
 			if err := subscribeToStateChanges(ctx, client, cache); err != nil {
 				if grpcutil.IsRetryLater(err) || grpcutil.IsEndOfStream(err) {
-					time.Sleep(3 * time.Second)
-					continue
+					// ctx-aware retry delay so callers cancelling ctx don't have to
+					// wait up to 3s for the next retry cycle.
+					err = common.Sleep(ctx, 3*time.Second)
+					if err == nil {
+						continue
+					}
 				}
 				log.Warn("[rpcdaemon subscribeToStateChanges]", "err", err)
 			}
@@ -311,16 +321,19 @@ func EmbeddedServices(ctx context.Context,
 	rpcFiltersConfig rpchelper.FiltersConfig,
 	blockReader services.FullBlockReader, ethBackendServer remoteproto.ETHBACKENDServer, txPoolServer txpoolproto.TxpoolServer,
 	miningServer txpoolproto.MiningServer, stateDiffClient StateChangesClient,
-	logger log.Logger,
+	logger log.Logger, events *shards.Events,
 ) (eth rpchelper.ApiBackend, txPool txpoolproto.TxpoolClient, mining txpoolproto.MiningClient, stateCache kvcache.Cache, ff *rpchelper.Filters) {
-	if stateCacheCfg.CacheSize > 0 {
-		// notification about new blocks (state stream) doesn't work now inside erigon - because
-		// erigon does send this stream to privateAPI (erigon with enabled rpc, still have enabled privateAPI).
-		// without this state stream kvcache can't work and only slow-down things
-		// ... adding back in place to see about the above statement
+	if stateCacheCfg.LocalCache != nil {
+		// In-process: read state directly from SharedDomains overlay.
+		// This replaces the coherent cache (kvcache) for embedded mode —
+		// the overlay is always current, has zero memory overhead, and
+		// doesn't need the StateChanges gRPC stream to stay coherent.
+		stateCache = stateCacheCfg.LocalCache
+	} else if stateCacheCfg.CacheSize > 0 {
+		// Remote RPCDaemon: use coherent cache fed by StateChanges stream.
 		stateCache = kvcache.New(stateCacheCfg)
 	} else {
-		stateCache = kvcache.NewDummy()
+		stateCache = kvcache.NewSimple()
 	}
 
 	subscribeToStateChangesLoop(ctx, stateDiffClient, stateCache)
@@ -331,7 +344,7 @@ func EmbeddedServices(ctx context.Context,
 
 	txPool = direct.NewTxPoolClient(txPoolServer)
 	mining = direct.NewMiningClient(miningServer)
-	ff = rpchelper.New(ctx, rpcFiltersConfig, eth, txPool, mining, func() {}, logger)
+	ff = rpchelper.New(ctx, rpcFiltersConfig, eth, txPool, mining, func() {}, logger, events)
 
 	return
 }
@@ -427,24 +440,17 @@ func RemoteServices(ctx context.Context, cfg *httpcfg.HttpCfg, logger log.Logger
 		heimdallStore = heimdall.NewSnapshotStore(heimdall.NewMdbxStore(logger, cfg.Dirs.DataDir, true, roTxLimit), allBorSnapshots)
 		bridgeStore = bridge.NewSnapshotStore(bridge.NewMdbxStore(cfg.Dirs.DataDir, logger, true, roTxLimit), allBorSnapshots, cc.Bor)
 		blockReader = freezeblocks.NewBlockReader(allSnapshots, allBorSnapshots)
-		txNumsReader := blockReader.TxnumReader(ctx)
+		txNumsReader := blockReader.TxnumReader()
 
 		if err := dbstate.CheckSnapshotsCompatibility(cfg.Dirs); err != nil {
 			return nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, err
 		}
 
-		if cfg.ErigonDBStepSize == config3.DefaultStepSize {
-			logger.Info("Using default step size", "size", cfg.ErigonDBStepSize)
-		} else {
-			logger.Warn("OVERRIDING STEP SIZE; if you did this on purpose, you can safely ignore this warning, otherwise that may lead to a non functioning node", "size", cfg.ErigonDBStepSize, "default", config3.DefaultStepSize)
+		erigonDBSettings, err := dbstate.ResolveErigonDBSettings(cfg.Dirs, logger, false)
+		if err != nil {
+			return nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, err
 		}
-		if cfg.ErigonDBStepsInFrozenFile == config3.DefaultStepsInFrozenFile {
-			logger.Info("Using default number of steps in frozen files", "steps", cfg.ErigonDBStepsInFrozenFile)
-		} else {
-			logger.Warn("OVERRIDING NUMBER OF STEPS IN FROZEN FILES; if you did this on purpose, you can safely ignore this warning, otherwise that may lead to a non functioning node", "steps", cfg.ErigonDBStepsInFrozenFile, "default", config3.DefaultStepsInFrozenFile)
-		}
-
-		agg, err := dbstate.New(cfg.Dirs).Logger(logger).StepSize(cfg.ErigonDBStepSize).StepsInFrozenFile(cfg.ErigonDBStepsInFrozenFile).Open(ctx, rawDB)
+		agg, err := dbstate.New(cfg.Dirs).Logger(logger).WithErigonDBSettings(erigonDBSettings).Open(ctx, rawDB)
 		if err != nil {
 			return nil, nil, nil, nil, nil, nil, nil, ff, nil, nil, fmt.Errorf("create aggregator: %w", err)
 		}
@@ -470,7 +476,7 @@ func RemoteServices(ctx context.Context, cfg *httpcfg.HttpCfg, logger log.Logger
 				aggTx := agg.BeginFilesRo()
 				defer aggTx.Close()
 				stats.LogStats(aggTx, tx, logger, func(endTxNumMinimax uint64) (uint64, error) {
-					histBlockNumProgress, _, err := txNumsReader.FindBlockNum(tx, endTxNumMinimax)
+					histBlockNumProgress, _, err := txNumsReader.FindBlockNum(ctx, tx, endTxNumMinimax)
 					return histBlockNumProgress, err
 				})
 				return nil
@@ -504,7 +510,7 @@ func RemoteServices(ctx context.Context, cfg *httpcfg.HttpCfg, logger log.Logger
 						ac := agg.BeginFilesRo()
 						defer ac.Close()
 						stats.LogStats(ac, tx, logger, func(endTxNumMinimax uint64) (uint64, error) {
-							histBlockNumProgress, _, err := txNumsReader.FindBlockNum(tx, endTxNumMinimax)
+							histBlockNumProgress, _, err := txNumsReader.FindBlockNum(ctx, tx, endTxNumMinimax)
 							return histBlockNumProgress, err
 						})
 						return nil
@@ -519,7 +525,7 @@ func RemoteServices(ctx context.Context, cfg *httpcfg.HttpCfg, logger log.Logger
 		if err != nil {
 			return nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, err
 		}
-		stateCache = kvcache.NewDummy()
+		stateCache = kvcache.NewSimple()
 	}
 	// If DB can't be configured - used PrivateApiAddr as remote DB
 	if db == nil {
@@ -530,7 +536,7 @@ func RemoteServices(ctx context.Context, cfg *httpcfg.HttpCfg, logger log.Logger
 		if cfg.StateCache.CacheSize > 0 {
 			stateCache = kvcache.New(cfg.StateCache)
 		} else {
-			stateCache = kvcache.NewDummy()
+			stateCache = kvcache.NewSimple()
 		}
 		logger.Info("if you run RPCDaemon on same machine with Erigon add --datadir option")
 	}
@@ -648,7 +654,7 @@ func RemoteServices(ctx context.Context, cfg *httpcfg.HttpCfg, logger log.Logger
 		}
 	}()
 
-	ff = rpchelper.New(ctx, cfg.RpcFiltersConfig, eth, txPool, mining, onNewSnapshot, logger)
+	ff = rpchelper.New(ctx, cfg.RpcFiltersConfig, eth, txPool, mining, onNewSnapshot, logger, nil)
 	return db, eth, txPool, mining, stateCache, blockReader, engine, ff, bridgeReader, heimdallReader, err
 }
 
@@ -707,19 +713,29 @@ func startRegularRpcServer(ctx context.Context, cfg *httpcfg.HttpCfg, rpcAPI []r
 
 	var apiFlags []string
 	for _, flag := range cfg.API {
-		if flag != "engine" {
-			apiFlags = append(apiFlags, flag)
+		if flag == "engine" || flag == "testing" {
+			continue
 		}
+		apiFlags = append(apiFlags, flag)
+	}
+	// testing_ is only present in defaultAPIList when the caller (embedded mode)
+	// appended an implementation; re-admit it to the whitelist only then.
+	if slices.ContainsFunc(defaultAPIList, func(a rpc.API) bool { return a.Namespace == "testing" }) {
+		apiFlags = append(apiFlags, "testing")
+	} else if slices.Contains(cfg.API, "testing") {
+		logger.Warn("testing_ namespace is not available in standalone rpcdaemon (requires embedded execution service); ignoring")
 	}
 
 	if err := node.RegisterApisFromWhitelist(defaultAPIList, apiFlags, srv, false, logger); err != nil {
 		return fmt.Errorf("could not start register RPC apis: %w", err)
 	}
 
-	info := []interface{}{
+	info := []any{
 		"grpc", cfg.GRPCServerEnabled,
 		"http", cfg.HttpServerEnabled,
 		"ws", cfg.WebsocketEnabled,
+		"rpc.blockrange.limit", cfg.BlockRangeLimit,
+		"rpc.logs.maxresults", cfg.GetLogsMaxResults,
 	}
 
 	if cfg.SocketServerEnabled {
@@ -744,10 +760,26 @@ func startRegularRpcServer(ctx context.Context, cfg *httpcfg.HttpCfg, rpcAPI []r
 		logger.Info("Socket Endpoint opened", "url", socketUrl)
 	}
 
-	httpHandler := node.NewHTTPHandlerStack(srv, cfg.HttpCORSDomain, cfg.HttpVirtualHost, cfg.HttpCompression)
+	// RPC admission limit: -1 = unlimited, 0 = use db.read.concurrency, >0 = explicit limit.
+	var rpcConcurrencyLimit int64
+	switch {
+	case cfg.RpcMaxConcurrentRequests == -1:
+		rpcConcurrencyLimit = 0 // disabled
+	case cfg.RpcMaxConcurrentRequests > 0:
+		rpcConcurrencyLimit = int64(cfg.RpcMaxConcurrentRequests)
+	default:
+		rpcConcurrencyLimit = int64(cfg.DBReadConcurrency)
+	}
+	if rpcConcurrencyLimit == 0 {
+		logger.Info("RPC admission control disabled (unlimited concurrent requests)")
+	} else {
+		logger.Info("RPC admission control enabled", "max_concurrent_requests", rpcConcurrencyLimit, "db.read.concurrency", cfg.DBReadConcurrency)
+	}
+	httpHandler := node.NewHTTPHandlerStack(srv, cfg.HttpCORSDomain, cfg.HttpVirtualHost, cfg.HttpCompression, rpcConcurrencyLimit, true)
 	var wsHandler http.Handler
 	if cfg.WebsocketEnabled {
-		wsHandler = srv.WebsocketHandler([]string{"*"}, nil, cfg.WebsocketCompression, logger)
+		wsHandler = node.NewWSConnectionLimiter(int64(cfg.WsMaxConnections),
+			srv.WebsocketHandler([]string{"*"}, nil, cfg.WebsocketCompression, logger))
 	}
 	graphQLHandler := graphql.CreateHandler(defaultAPIList)
 	apiHandler, err := createHandler(cfg, defaultAPIList, httpHandler, wsHandler, graphQLHandler, nil)
@@ -783,6 +815,7 @@ func startRegularRpcServer(ctx context.Context, cfg *httpcfg.HttpCfg, rpcAPI []r
 		}
 		listener, httpAddr, err := node.StartHTTPEndpoint(httpEndpoint, &node.HttpEndpointConfig{
 			Timeouts: cfg.HTTPTimeouts,
+			Listener: cfg.HttpListener,
 		}, apiHandler)
 		if err != nil {
 			return fmt.Errorf("could not start RPC api: %w", err)
@@ -933,11 +966,20 @@ func createHandler(cfg *httpcfg.HttpCfg, apiList []rpc.API, httpHandler http.Han
 			return
 		}
 
+		if jwtSecret != nil && AuthenticatedEngineRESTHandler != nil && strings.HasPrefix(r.URL.Path, "/engine/") {
+			AuthenticatedEngineRESTHandler.ServeHTTP(w, r)
+			return
+		}
+
 		httpHandler.ServeHTTP(w, r)
 	})
 
 	return handler, nil
 }
+
+// AuthenticatedEngineRESTHandler is installed by the in-process Engine API
+// server and is invoked only after the same JWT check as authenticated JSON-RPC.
+var AuthenticatedEngineRESTHandler http.Handler
 
 func createEngineListener(cfg *httpcfg.HttpCfg, engineApi []rpc.API, logger log.Logger) (*http.Server, *rpc.Server, string, error) {
 	engineHttpEndpoint := fmt.Sprintf("tcp://%s:%d", cfg.AuthRpcHTTPListenAddress, cfg.AuthRpcPort)
@@ -955,7 +997,9 @@ func createEngineListener(cfg *httpcfg.HttpCfg, engineApi []rpc.API, logger log.
 
 	wsHandler := engineSrv.WebsocketHandler([]string{"*"}, jwtSecret, cfg.WebsocketCompression, logger)
 
-	engineHttpHandler := node.NewHTTPHandlerStack(engineSrv, nil /* authCors */, cfg.AuthRpcVirtualHost, cfg.HttpCompression)
+	// Engine API (auth) is the CL↔EL protocol — not user RPC. Do not tag with TxPriorityRPC
+	// so execution-engine DB operations use blocking Acquire instead of fail-fast TryAcquire.
+	engineHttpHandler := node.NewHTTPHandlerStack(engineSrv, nil /* authCors */, cfg.AuthRpcVirtualHost, cfg.HttpCompression, 0, false)
 
 	graphQLHandler := graphql.CreateHandler(engineApi)
 
@@ -966,18 +1010,19 @@ func createEngineListener(cfg *httpcfg.HttpCfg, engineApi []rpc.API, logger log.
 
 	engineListener, engineAddr, err := node.StartHTTPEndpoint(engineHttpEndpoint, &node.HttpEndpointConfig{
 		Timeouts: cfg.AuthRpcTimeouts,
+		Listener: cfg.AuthRpcListener,
 	}, engineApiHandler)
 	if err != nil {
 		return nil, nil, "", fmt.Errorf("could not start RPC api: %w", err)
 	}
 
-	engineInfo := []interface{}{"url", engineAddr}
+	engineInfo := []any{"url", engineAddr}
 	logger.Info("HTTP endpoint opened for Engine API", engineInfo...)
 
 	return engineListener, engineSrv, engineAddr.String(), nil
 }
 
-var remoteRulesEngineNotReadyErr = errors.New("remote rules engine not ready")
+var errRemoteRulesEngineNotReady = errors.New("remote rules engine not ready")
 
 type remoteRulesEngine struct {
 	engine rules.Engine
@@ -995,7 +1040,7 @@ func (e *remoteRulesEngine) Engine() rules.EngineReader {
 
 func (e *remoteRulesEngine) validateEngineReady() error {
 	if !e.HasEngine() {
-		return remoteRulesEngineNotReadyErr
+		return errRemoteRulesEngineNotReady
 	}
 
 	return nil
@@ -1028,8 +1073,6 @@ func (e *remoteRulesEngine) init(db kv.RoDB, blockReader services.FullBlockReade
 		}
 	} else if cc.Bor != nil {
 		eng = bor.NewRo(cc, blockReader, logger)
-	} else if cc.Clique != nil {
-		return errors.New("clique remoteRulesEngine is not supported")
 	} else {
 		eng = ethash.NewFaker()
 	}
@@ -1042,15 +1085,15 @@ func (e *remoteRulesEngine) init(db kv.RoDB, blockReader services.FullBlockReade
 	return nil
 }
 
-func (e *remoteRulesEngine) Author(header *types.Header) (common.Address, error) {
+func (e *remoteRulesEngine) Author(header *types.Header) (accounts.Address, error) {
 	if err := e.validateEngineReady(); err != nil {
-		return common.Address{}, err
+		return accounts.NilAddress, err
 	}
 
 	return e.engine.Author(header)
 }
 
-func (e *remoteRulesEngine) IsServiceTransaction(sender common.Address, syscall rules.SystemCall) bool {
+func (e *remoteRulesEngine) IsServiceTransaction(sender accounts.Address, syscall rules.SystemCall) bool {
 	if err := e.validateEngineReady(); err != nil {
 		panic(err)
 	}
@@ -1117,7 +1160,7 @@ func (e *remoteRulesEngine) Prepare(_ rules.ChainHeaderReader, _ *types.Header, 
 	panic("remoteRulesEngine.Prepare not supported")
 }
 
-func (e *remoteRulesEngine) Finalize(_ *chain.Config, _ *types.Header, _ *state.IntraBlockState, _ types.Transactions, _ []*types.Header, _ types.Receipts, _ []*types.Withdrawal, _ rules.ChainReader, _ rules.SystemCall, skipReceiptsEval bool, _ log.Logger) (types.FlatRequests, error) {
+func (e *remoteRulesEngine) Finalize(_ *chain.Config, _ *types.Header, _ *state.IntraBlockState, _ []*types.Header, _ types.Receipts, _ []*types.Withdrawal, _ rules.ChainReader, _ rules.SystemCall, skipReceiptsEval bool, _ log.Logger) (types.FlatRequests, error) {
 	panic("remoteRulesEngine.Finalize not supported")
 }
 
@@ -1133,7 +1176,7 @@ func (e *remoteRulesEngine) SealHash(_ *types.Header) common.Hash {
 	panic("remoteRulesEngine.SealHash not supported")
 }
 
-func (e *remoteRulesEngine) CalcDifficulty(_ rules.ChainHeaderReader, _ uint64, _ uint64, _ *big.Int, _ uint64, _ common.Hash, _ common.Hash, _ uint64) *big.Int {
+func (e *remoteRulesEngine) CalcDifficulty(_ rules.ChainHeaderReader, _ uint64, _ uint64, _ uint256.Int, _ uint64, _ common.Hash, _ common.Hash, _ uint64) uint256.Int {
 	panic("remoteRulesEngine.CalcDifficulty not supported")
 }
 

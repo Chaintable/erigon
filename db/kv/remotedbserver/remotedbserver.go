@@ -135,7 +135,7 @@ func (s *KvServer) begin(ctx context.Context) (id uint64, err error) {
 	}
 	s.txsMapLock.Lock()
 	defer s.txsMapLock.Unlock()
-	tx, errBegin := s.kv.BeginTemporalRo(ctx) //nolint:gocritic
+	tx, errBegin := s.kv.BeginTemporalRo(ctx) //nolint:gocritic // tx is stored in s.txs and rolled back by rollback(); defer would close it prematurely
 	if errBegin != nil {
 		return 0, errBegin
 	}
@@ -157,7 +157,7 @@ func (s *KvServer) renew(ctx context.Context, id uint64) (err error) {
 		defer tx.Unlock()
 		tx.Rollback()
 	}
-	newTx, errBegin := s.kv.BeginTemporalRo(ctx) //nolint:gocritic
+	newTx, errBegin := s.kv.BeginTemporalRo(ctx) //nolint:gocritic // tx is stored in s.txs and rolled back by rollback(); defer would close it prematurely
 	if errBegin != nil {
 		return fmt.Errorf("kvserver: %w", errBegin)
 	}
@@ -260,8 +260,8 @@ func (s *KvServer) Tx(stream remoteproto.KV_TxServer) error {
 				if err != nil {
 					return fmt.Errorf("kvserver: %w", err)
 				}
-				c.k = common.CopyBytes(k)
-				c.v = common.CopyBytes(v)
+				c.k = common.Copy(k)
+				c.v = common.Copy(v)
 			}
 
 			if err := s.renew(stream.Context(), id); err != nil {
@@ -393,16 +393,10 @@ func handleOp(c kv.Cursor, stream remoteproto.KV_TxServer, in *remoteproto.Curso
 		k, v, err = c.(kv.CursorDupSort).NextNoDup()
 	case remoteproto.Op_PREV:
 		k, v, err = c.Prev()
-	//case remoteproto.Op_PREV_DUP:
-	//	k, v, err = c.(ethdb.CursorDupSort).Prev()
-	//	if err != nil {
-	//		return err
-	//	}
-	//case remoteproto.Op_PREV_NO_DUP:
-	//	k, v, err = c.Prev()
-	//	if err != nil {
-	//		return err
-	//	}
+	case remoteproto.Op_PREV_DUP:
+		k, v, err = c.(kv.CursorDupSort).PrevDup()
+	case remoteproto.Op_PREV_NO_DUP:
+		k, v, err = c.(kv.CursorDupSort).PrevNoDup()
 	case remoteproto.Op_SEEK_EXACT:
 		k, v, err = c.SeekExact(in.K)
 	case remoteproto.Op_SEEK_BOTH_EXACT:
@@ -421,9 +415,20 @@ func handleOp(c kv.Cursor, stream remoteproto.KV_TxServer, in *remoteproto.Curso
 	return nil
 }
 
+// SubscriptionReadyNotifier is an optional interface that KV_StateChangesServer
+// implementations can satisfy to be notified when their pub/sub subscription
+// is fully registered. This eliminates the timing hole between starting the
+// server goroutine and the subscription becoming active.
+type SubscriptionReadyNotifier interface {
+	NotifySubscribed()
+}
+
 func (s *KvServer) StateChanges(_ *remoteproto.StateChangeRequest, server remoteproto.KV_StateChangesServer) error {
 	ch, remove := s.stateChangeStreams.Sub()
 	defer remove()
+	if n, ok := server.(SubscriptionReadyNotifier); ok {
+		n.NotifySubscribed()
+	}
 	for {
 		select {
 		case reply := <-ch:
@@ -656,8 +661,8 @@ func (s *KvServer) HistoryRange(_ context.Context, req *remoteproto.HistoryRange
 			if err != nil {
 				return err
 			}
-			key := common.CopyBytes(k)
-			value := common.CopyBytes(v)
+			key := common.Copy(k)
+			value := common.Copy(v)
 			reply.Keys = append(reply.Keys, key)
 			reply.Values = append(reply.Values, value)
 		}
@@ -697,8 +702,8 @@ func (s *KvServer) RangeAsOf(_ context.Context, req *remoteproto.RangeAsOfReq) (
 			if err != nil {
 				return err
 			}
-			key := common.CopyBytes(k)
-			value := common.CopyBytes(v)
+			key := common.Copy(k)
+			value := common.Copy(v)
 			reply.Keys = append(reply.Keys, key)
 			reply.Values = append(reply.Values, value)
 			limit--

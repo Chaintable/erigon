@@ -42,11 +42,6 @@ import (
 )
 
 var stateBuckets = []string{
-	kv.HashedAccountsDeprecated,
-	kv.HashedStorageDeprecated,
-	kv.PlainState,
-	kv.E2AccountsHistory,
-	kv.E2StorageHistory,
 	kv.TxLookup,
 }
 
@@ -372,10 +367,6 @@ MainLoop:
 		if err != nil {
 			panic(err)
 		}
-		err = fileScanner.Err()
-		if err != nil {
-			panic(err)
-		}
 		if bucket == "" {
 			panic("bucket not parse")
 		}
@@ -390,7 +381,7 @@ MainLoop:
 			if !fileScanner.Scan() {
 				break MainLoop
 			}
-			k := common.CopyBytes(fileScanner.Bytes())
+			k := common.Copy(fileScanner.Bytes())
 			if bytes.Equal(k, endData) {
 				break
 			}
@@ -398,7 +389,7 @@ MainLoop:
 			if !fileScanner.Scan() {
 				break MainLoop
 			}
-			v := common.CopyBytes(fileScanner.Bytes())
+			v := common.Copy(fileScanner.Bytes())
 			v = common.FromHex(string(v[1:]))
 
 			if casted, ok := c.(kv.RwCursorDupSort); ok {

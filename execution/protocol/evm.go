@@ -21,7 +21,6 @@ package protocol
 
 import (
 	"fmt"
-	"math/big"
 	"sync"
 
 	lru "github.com/hashicorp/golang-lru/v2"
@@ -30,42 +29,40 @@ import (
 	"github.com/erigontech/erigon/common"
 	"github.com/erigontech/erigon/common/dbg"
 	"github.com/erigontech/erigon/execution/chain"
+	"github.com/erigontech/erigon/execution/protocol/misc"
 	"github.com/erigontech/erigon/execution/protocol/rules"
 	"github.com/erigontech/erigon/execution/protocol/rules/merge"
-	"github.com/erigontech/erigon/execution/protocol/rules/misc"
 	"github.com/erigontech/erigon/execution/types"
+	"github.com/erigontech/erigon/execution/types/accounts"
 	"github.com/erigontech/erigon/execution/vm/evmtypes"
 )
 
 // NewEVMBlockContext creates a new context for use in the EVM.
 func NewEVMBlockContext(header *types.Header, blockHashFunc func(n uint64) (common.Hash, error),
-	engine rules.EngineReader, author *common.Address, config *chain.Config) evmtypes.BlockContext {
+	engine rules.EngineReader, author accounts.Address, config *chain.Config) evmtypes.BlockContext {
 	// If we don't have an explicit author (i.e. not mining), extract from the header
-	var beneficiary common.Address
-	if author == nil {
+	var beneficiary accounts.Address
+	if author.IsNil() {
 		if config.Bor != nil && config.Bor.IsRio(header.Number.Uint64()) {
 			beneficiary = config.Bor.CalculateCoinbase(header.Number.Uint64())
 
 			// In case the coinbase is not set post Rio, use the default coinbase
-			if beneficiary == (common.Address{}) {
+			if beneficiary.IsNil() {
 				beneficiary, _ = engine.Author(header)
 			}
 		} else {
 			beneficiary, _ = engine.Author(header) // Ignore error, we're past header validation
 		}
 	} else {
-		beneficiary = *author
+		beneficiary = author
 	}
 	var baseFee uint256.Int
 	if header.BaseFee != nil {
-		overflow := baseFee.SetFromBig(header.BaseFee)
-		if overflow {
-			panic("header.BaseFee higher than 2^256-1")
-		}
+		baseFee.Set(header.BaseFee)
 	}
 
 	var prevRandDao *common.Hash
-	if header.Difficulty != nil && header.Difficulty.Cmp(merge.ProofOfStakeDifficulty) == 0 {
+	if header.Difficulty.Cmp(merge.ProofOfStakeDifficulty) == 0 {
 		// EIP-4399. We use ProofOfStakeDifficulty (i.e. 0) as a telltale of Proof-of-Stake blocks.
 		prevRandDao = new(common.Hash)
 		*prevRandDao = header.MixDigest
@@ -86,9 +83,15 @@ func NewEVMBlockContext(header *types.Header, blockHashFunc func(n uint64) (comm
 		transferFunc = engine.GetTransferFunc()
 		postApplyMessageFunc = engine.GetPostApplyMessageFunc()
 	} else {
-		transferFunc = rules.Transfer
-		postApplyMessageFunc = nil
+		transferFunc = misc.Transfer
+		postApplyMessageFunc = misc.LogSelfDestructedAccounts
 	}
+
+	var slotNumber uint64
+	if header.SlotNumber != nil {
+		slotNumber = *header.SlotNumber
+	}
+
 	blockContext := evmtypes.BlockContext{
 		CanTransfer:      CanTransfer,
 		Transfer:         transferFunc,
@@ -97,13 +100,12 @@ func NewEVMBlockContext(header *types.Header, blockHashFunc func(n uint64) (comm
 		Coinbase:         beneficiary,
 		BlockNumber:      header.Number.Uint64(),
 		Time:             header.Time,
+		Difficulty:       header.Difficulty,
 		BaseFee:          baseFee,
 		GasLimit:         header.GasLimit,
 		PrevRanDao:       prevRandDao,
 		BlobBaseFee:      blobBaseFee,
-	}
-	if header.Difficulty != nil {
-		blockContext.Difficulty = new(big.Int).Set(header.Difficulty)
+		SlotNumber:       slotNumber,
 	}
 	return blockContext
 }
@@ -201,14 +203,15 @@ func GetHashFn(ref *types.Header, getHeader func(hash common.Hash, number uint64
 
 // CanTransfer checks whether there are enough funds in the address' account to make a transfer.
 // This does not take the necessary gas in to account to make the transfer valid.
-func CanTransfer(db evmtypes.IntraBlockState, addr common.Address, amount uint256.Int) (can bool, err error) {
+func CanTransfer(db evmtypes.IntraBlockState, addr accounts.Address, amount uint256.Int) (can bool, err error) {
 	balance, err := db.GetBalance(addr)
 
-	if dbg.TraceTransactionIO && db.Trace() || dbg.TraceAccount(addr) {
+	if dbg.TraceTransactionIO && db.Trace() || dbg.TraceAccount(addr.Handle()) {
+		amount := amount   // avoid capture allocation unless we're tracing
 		balance := balance // avoid capture allocation unless we're tracing
 		defer func() {
 			if !can {
-				fmt.Printf("%d (%d.%d) Can't transfer %d from %x: %d\n", db.BlockNumber(), db.TxIndex(), db.Incarnation(), amount, addr, &balance)
+				fmt.Printf("%d (%d.%d) Can't transfer %s from %x: %s\n", db.BlockNumber(), db.TxIndex(), db.Incarnation(), amount.String(), addr, balance.String())
 			}
 		}()
 	}

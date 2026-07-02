@@ -20,20 +20,20 @@
 package ethash
 
 import (
+	"crypto/subtle"
 	"encoding/binary"
 	"hash"
 	"math/big"
-	"reflect"
 	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
 	"unsafe"
 
+	keccak "github.com/erigontech/fastkeccak"
 	"golang.org/x/crypto/sha3"
 
 	"github.com/erigontech/erigon/common"
-	"github.com/erigontech/erigon/common/bitutil"
 	"github.com/erigontech/erigon/common/crypto"
 	"github.com/erigontech/erigon/common/dbg"
 	"github.com/erigontech/erigon/common/length"
@@ -163,7 +163,7 @@ func seedHashOld(block uint64) []byte {
 	if block < epochLength {
 		return seed
 	}
-	keccak256 := makeHasher(sha3.NewLegacyKeccak256())
+	keccak256 := makeHasher(keccak.NewFastKeccak())
 	for i := 0; i < int(block/epochLength); i++ {
 		keccak256(seed, seed)
 	}
@@ -191,12 +191,7 @@ func generateCache(dest []uint32, epoch uint64, seed []byte) {
 		logFn("Generated ethash verification cache", "elapsed", common.PrettyDuration(elapsed))
 	}()
 	// Convert our destination slice to a byte buffer
-	var cache []byte
-	cacheHdr := (*reflect.SliceHeader)(unsafe.Pointer(&cache))
-	dstHdr := (*reflect.SliceHeader)(unsafe.Pointer(&dest))
-	cacheHdr.Data = dstHdr.Data
-	cacheHdr.Len = dstHdr.Len * 4
-	cacheHdr.Cap = dstHdr.Cap * 4
+	cache := unsafe.Slice((*byte)(unsafe.Pointer(unsafe.SliceData(dest))), len(dest)*4)
 
 	// Calculate the number of theoretical rows (we'll store in one buffer nonetheless)
 	size := uint64(len(cache))
@@ -239,7 +234,7 @@ func generateCache(dest []uint32, epoch uint64, seed []byte) {
 				dstOff = j * hashBytes
 				xorOff = (binary.LittleEndian.Uint32(cache[dstOff:]) % uint32(rows)) * hashBytes
 			)
-			bitutil.XORBytes(temp, cache[srcOff:srcOff+hashBytes], cache[xorOff:xorOff+hashBytes])
+			subtle.XORBytes(temp, cache[srcOff:srcOff+hashBytes], cache[xorOff:xorOff+hashBytes])
 			keccak512(cache[dstOff:], temp)
 
 			atomic.AddUint32(&progress, 1)
@@ -282,13 +277,13 @@ func fnvHash32(mix []uint32, data []uint32) {
 }
 
 var bytes64Pool = sync.Pool{
-	New: func() interface{} {
+	New: func() any {
 		buf := make([]byte, hashBytes)
 		return &buf
 	},
 }
 var bytes40Pool = sync.Pool{
-	New: func() interface{} {
+	New: func() any {
 		buf := make([]byte, 40)
 		return &buf
 	},
@@ -351,12 +346,7 @@ func generateDataset(dest []uint32, epoch uint64, cache []uint32) {
 	swapped := !isLittleEndian()
 
 	// Convert our destination slice to a byte buffer
-	var dataset []byte
-	datasetHdr := (*reflect.SliceHeader)(unsafe.Pointer(&dataset))
-	destHdr := (*reflect.SliceHeader)(unsafe.Pointer(&dest))
-	datasetHdr.Data = destHdr.Data
-	datasetHdr.Len = destHdr.Len * 4
-	datasetHdr.Cap = destHdr.Cap * 4
+	dataset := unsafe.Slice((*byte)(unsafe.Pointer(unsafe.SliceData(dest))), len(dest)*4)
 
 	// Generate the dataset on many goroutines since it takes a while
 	threads := runtime.GOMAXPROCS(-1)

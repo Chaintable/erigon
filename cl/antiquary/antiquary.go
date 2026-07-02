@@ -19,8 +19,7 @@ package antiquary
 import (
 	"context"
 	"math"
-	"os"
-	"strings"
+
 	"sync/atomic"
 	"time"
 
@@ -34,11 +33,11 @@ import (
 	"github.com/erigontech/erigon/cl/phase1/core/state"
 	"github.com/erigontech/erigon/common/log/v3"
 	"github.com/erigontech/erigon/db/datadir"
+	"github.com/erigontech/erigon/db/downloader"
 	"github.com/erigontech/erigon/db/kv"
 	"github.com/erigontech/erigon/db/snapshotsync"
 	"github.com/erigontech/erigon/db/snapshotsync/freezeblocks"
 	"github.com/erigontech/erigon/db/snaptype"
-	"github.com/erigontech/erigon/node/gointerfaces/downloaderproto"
 )
 
 const safetyMargin = 20_000 // We retire snapshots 10k blocks after the finalized head
@@ -48,7 +47,7 @@ type Antiquary struct {
 	mainDB                         kv.RwDB                  // this is the main DB
 	blobStorage                    blob_storage.BlobStorage // this is the blob storage
 	dirs                           datadir.Dirs
-	downloader                     downloaderproto.DownloaderClient
+	downloader                     downloader.Client
 	logger                         log.Logger
 	sn                             *freezeblocks.CaplinSnapshots
 	stateSn                        *snapshotsync.CaplinStateSnapshots
@@ -68,7 +67,7 @@ type Antiquary struct {
 	balances32   []byte
 }
 
-func NewAntiquary(ctx context.Context, blobStorage blob_storage.BlobStorage, genesisState *state.CachingBeaconState, validatorsTable *state_accessors.StaticValidatorTable, cfg *clparams.BeaconChainConfig, dirs datadir.Dirs, downloader downloaderproto.DownloaderClient, mainDB kv.RwDB, stateSn *snapshotsync.CaplinStateSnapshots, sn *freezeblocks.CaplinSnapshots, reader freezeblocks.BeaconSnapshotReader, syncedData synced_data.SyncedData, logger log.Logger, states, blocks, blobs, snapgen bool, snBuildSema *semaphore.Weighted) *Antiquary {
+func NewAntiquary(ctx context.Context, blobStorage blob_storage.BlobStorage, genesisState *state.CachingBeaconState, validatorsTable *state_accessors.StaticValidatorTable, cfg *clparams.BeaconChainConfig, dirs datadir.Dirs, downloaderClient downloader.Client, mainDB kv.RwDB, stateSn *snapshotsync.CaplinStateSnapshots, sn *freezeblocks.CaplinSnapshots, reader freezeblocks.BeaconSnapshotReader, syncedData synced_data.SyncedData, logger log.Logger, states, blocks, blobs, snapgen bool, snBuildSema *semaphore.Weighted) *Antiquary {
 	backfilled := &atomic.Bool{}
 	blobBackfilled := &atomic.Bool{}
 	backfilled.Store(false)
@@ -77,7 +76,7 @@ func NewAntiquary(ctx context.Context, blobStorage blob_storage.BlobStorage, gen
 		mainDB:          mainDB,
 		blobStorage:     blobStorage,
 		dirs:            dirs,
-		downloader:      downloader,
+		downloader:      downloaderClient,
 		logger:          logger,
 		sn:              sn,
 		ctx:             ctx,
@@ -95,25 +94,6 @@ func NewAntiquary(ctx context.Context, blobStorage blob_storage.BlobStorage, gen
 		stateSn:         stateSn,
 		syncedData:      syncedData,
 	}
-}
-
-// Check if the snapshot directory has beacon blocks files aka "contains beaconblock" and has a ".seg" extension over its first layer
-func doesSnapshotDirHaveBeaconBlocksFiles(snapshotDir string) bool {
-	// Iterate over the files in the snapshot directory
-	files, err := os.ReadDir(snapshotDir)
-	if err != nil {
-		return false
-	}
-	for _, file := range files {
-		// Check if the file has a ".seg" extension
-		if file.IsDir() {
-			continue
-		}
-		if strings.Contains(file.Name(), "beaconblock") && strings.HasSuffix(file.Name(), ".seg") {
-			return true
-		}
-	}
-	return false
 }
 
 // Antiquate is the function that starts transactions seeding and shit, very cool but very shit too as a name.
@@ -139,13 +119,9 @@ func (a *Antiquary) Loop() error {
 		for !time.Now().Add(completionEpoch).Before(progress) && !a.backfilled.Load() {
 			select {
 			case <-reCheckTicker.C:
-				completedReply, err := a.downloader.Completed(a.ctx, &downloaderproto.CompletedRequest{})
-				if err != nil {
-					return err
-				}
-				if !completedReply.Completed {
-					progress = time.Now() // reset the progress if we are not completed
-				}
+				// We were waiting here previously for torrents to be completed, but they should be already
+				// completed when added.
+				progress = time.Now() // reset the progress if we are not completed
 			case <-a.ctx.Done():
 			}
 		}
@@ -184,7 +160,7 @@ func (a *Antiquary) Loop() error {
 	// Now write the snapshots as indicies
 	for i := from; i < a.sn.BlocksAvailable(); i++ {
 		// read the snapshot
-		header, elBlockNumber, elBlockHash, err := a.sn.ReadHeader(i)
+		header, elBlockNumber, elBlockHash, err := a.sn.ReadHeader(i, tx)
 		if err != nil {
 			return err
 		}
@@ -342,15 +318,9 @@ func (a *Antiquary) antiquate() error {
 	}
 
 	paths := a.sn.SegFileNames(from, to)
-	downloadItems := make([]*downloaderproto.AddItem, len(paths))
-	for i, path := range paths {
-		downloadItems[i] = &downloaderproto.AddItem{
-			Path: path,
-		}
-	}
 	if a.downloader != nil {
 		// Notify bittorent to seed the new snapshots
-		if _, err := a.downloader.Add(a.ctx, &downloaderproto.AddRequest{Items: downloadItems}); err != nil {
+		if err := a.downloader.Seed(a.ctx, paths); err != nil {
 			a.logger.Warn("[Antiquary] Failed to add items to bittorent", "err", err)
 		}
 	}
@@ -402,14 +372,18 @@ func (a *Antiquary) antiquateBlobs() error {
 	roTx.Rollback()
 	a.logger.Info("[Antiquary] Antiquating blobs", "from", currentBlobsProgress, "to", to)
 	blobCountFn := func(slot uint64) (uint64, error) {
-		blindedBlock, err := a.snReader.ReadBlindedBlockBySlot(a.ctx, nil, slot)
+		block, err := a.snReader.ReadBeaconBlockBodyBySlot(a.ctx, nil, slot)
 		if err != nil {
 			return 0, err
 		}
-		if blindedBlock == nil {
+		if block == nil {
 			return 0, nil
 		}
-		return uint64(blindedBlock.Block.Body.BlobKzgCommitments.Len()), nil
+		commitments := block.Block.Body.GetBlobKzgCommitments()
+		if commitments == nil {
+			return 0, nil
+		}
+		return uint64(commitments.Len()), nil
 	}
 
 	// now, we need to retire the blobs
@@ -423,15 +397,9 @@ func (a *Antiquary) antiquateBlobs() error {
 	}
 
 	paths := a.sn.SegFileNames(currentBlobsProgress, to)
-	downloadItems := make([]*downloaderproto.AddItem, len(paths))
-	for i, path := range paths {
-		downloadItems[i] = &downloaderproto.AddItem{
-			Path: path,
-		}
-	}
 	if a.downloader != nil {
 		// Notify bittorent to seed the new snapshots
-		if _, err := a.downloader.Add(a.ctx, &downloaderproto.AddRequest{Items: downloadItems}); err != nil {
+		if err := a.downloader.Seed(a.ctx, paths); err != nil {
 			a.logger.Warn("[Antiquary] Failed to add items to bittorent", "err", err)
 		}
 	}

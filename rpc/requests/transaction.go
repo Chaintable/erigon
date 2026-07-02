@@ -23,9 +23,9 @@ import (
 	"fmt"
 	"math/big"
 
-	ethereum "github.com/erigontech/erigon"
 	"github.com/erigontech/erigon/common"
 	"github.com/erigontech/erigon/common/hexutil"
+	"github.com/erigontech/erigon/execution/abi/bind"
 	"github.com/erigontech/erigon/execution/types"
 	"github.com/erigontech/erigon/rpc"
 	"github.com/erigontech/erigon/rpc/ethapi"
@@ -36,7 +36,7 @@ type ETHEstimateGas struct {
 	Number hexutil.Uint64 `json:"result"`
 }
 
-func (reqGen *requestGenerator) EstimateGas(args ethereum.CallMsg, blockRef BlockNumber) (uint64, error) {
+func (reqGen *requestGenerator) EstimateGas(args bind.CallMsg, blockRef BlockNumber) (uint64, error) {
 	var b ETHEstimateGas
 
 	gas := hexutil.Uint64(args.Gas)
@@ -154,6 +154,21 @@ func (reqGen *requestGenerator) SendTransaction(signedTx types.Transaction) (com
 
 	if zeroHash {
 		return common.Hash{}, fmt.Errorf("hash: %s, nonce  %d: returned a zero transaction hash", signedTx.Hash().Hex(), signedTx.GetNonce())
+	}
+
+	return result, nil
+}
+
+func (reqGen *requestGenerator) SendRawTransactionSync(signedTx types.Transaction, timeoutMs *uint64) (*types.Receipt, error) {
+	var result *types.Receipt
+
+	var buf bytes.Buffer
+	if err := signedTx.MarshalBinary(&buf); err != nil {
+		return nil, fmt.Errorf("failed to marshal binary: %v", err)
+	}
+
+	if err := reqGen.rpcCallOnce(context.Background(), &result, Methods.ETHSendRawTransactionSync, hexutil.Bytes(buf.Bytes()), timeoutMs); err != nil {
+		return nil, err
 	}
 
 	return result, nil

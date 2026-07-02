@@ -18,18 +18,19 @@ package kvcache
 
 import (
 	"bytes"
+
 	"context"
 	"encoding/binary"
 	"fmt"
 	"hash"
-	"sort"
+
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/c2h5oh/datasize"
+	keccak "github.com/erigontech/fastkeccak"
 	btree2 "github.com/tidwall/btree"
-	"golang.org/x/crypto/sha3"
 
 	"github.com/erigontech/erigon/common"
 	"github.com/erigontech/erigon/db/kv"
@@ -141,6 +142,9 @@ type CoherentView struct {
 func (c *CoherentView) Get(k []byte) ([]byte, error) {
 	return c.cache.Get(k, c.tx, c.stateVersionID)
 }
+func (c *CoherentView) GetAsOf(key []byte, ts uint64) (v []byte, ok bool, err error) {
+	return nil, false, nil
+}
 func (c *CoherentView) GetCode(k []byte) ([]byte, error) {
 	return c.cache.GetCode(k, c.tx, c.stateVersionID)
 }
@@ -172,6 +176,7 @@ type CoherentConfig struct {
 	MetricsLabel    string
 	NewBlockWait    time.Duration // how long wait
 	KeepViews       uint64        // keep in memory up to this amount of views, evict older
+	LocalCache      Cache
 }
 
 var DefaultCoherentConfig = CoherentConfig{
@@ -193,7 +198,7 @@ func New(cfg CoherentConfig) *Coherent {
 		roots:        map[uint64]*CoherentRoot{},
 		stateEvict:   &ThreadSafeEvictionList{l: NewList()},
 		codeEvict:    &ThreadSafeEvictionList{l: NewList()},
-		hasher:       sha3.NewLegacyKeccak256(),
+		hasher:       keccak.NewFastKeccak(),
 		cfg:          cfg,
 		miss:         metrics.GetOrCreateCounter(fmt.Sprintf(`cache_total{result="miss",name="%s"}`, cfg.MetricsLabel)),
 		hits:         metrics.GetOrCreateCounter(fmt.Sprintf(`cache_total{result="hit",name="%s"}`, cfg.MetricsLabel)),
@@ -218,8 +223,8 @@ func (c *Coherent) selectOrCreateRoot(versionID uint64) *CoherentRoot {
 
 	r = &CoherentRoot{
 		ready:     make(chan struct{}),
-		cache:     btree2.NewBTreeG[*Element](Less),
-		codeCache: btree2.NewBTreeG[*Element](Less),
+		cache:     btree2.NewBTreeG(Less),
+		codeCache: btree2.NewBTreeG(Less),
 	}
 	c.roots[versionID] = r
 	return r
@@ -248,8 +253,8 @@ func (c *Coherent) advanceRoot(stateVersionID uint64) (r *CoherentRoot) {
 		c.codeEvict.Init()
 		if r.cache == nil {
 			//log.Info("advance: new", "to", viewID)
-			r.cache = btree2.NewBTreeG[*Element](Less)
-			r.codeCache = btree2.NewBTreeG[*Element](Less)
+			r.cache = btree2.NewBTreeG(Less)
+			r.codeCache = btree2.NewBTreeG(Less)
 		} else {
 			r.cache.Walk(func(items []*Element) bool {
 				for _, i := range items {
@@ -298,8 +303,7 @@ func (c *Coherent) OnNewBlock(stateChanges *remoteproto.StateChangeBatch) {
 				c.add(addr[:], v, r, id)
 				c.hasher.Reset()
 				c.hasher.Write(sc.Changes[i].Code)
-				k := make([]byte, 32)
-				c.hasher.Sum(k)
+				k := c.hasher.Sum(nil)
 				c.addCode(k, sc.Changes[i].Code, r, id)
 			case remoteproto.Action_REMOVE:
 				addr := gointerfaces.ConvertH160toAddress(sc.Changes[i].Address)
@@ -309,8 +313,7 @@ func (c *Coherent) OnNewBlock(stateChanges *remoteproto.StateChangeBatch) {
 			case remoteproto.Action_CODE:
 				c.hasher.Reset()
 				c.hasher.Write(sc.Changes[i].Code)
-				k := make([]byte, 32)
-				c.hasher.Sum(k)
+				k := c.hasher.Sum(nil)
 				c.addCode(k, sc.Changes[i].Code, r, id)
 			default:
 				panic("not implemented yet")
@@ -630,69 +633,6 @@ func (c *Coherent) clearCaches(r *CoherentRoot) {
 	r.codeCache.Clear()
 }
 
-type Stat struct {
-	BlockNum  uint64
-	BlockHash [32]byte
-	Lenght    int
-}
-
-func DebugStats(cache Cache) []Stat {
-	res := []Stat{}
-	casted, ok := cache.(*Coherent)
-	if !ok {
-		return res
-	}
-	casted.lock.Lock()
-	for root, r := range casted.roots {
-		res = append(res, Stat{
-			BlockNum: root,
-			Lenght:   r.cache.Len(),
-		})
-	}
-	casted.lock.Unlock()
-	sort.Slice(res, func(i, j int) bool { return res[i].BlockNum < res[j].BlockNum })
-	return res
-}
-func AssertCheckValues(ctx context.Context, tx kv.TemporalTx, cache Cache) (int, error) {
-	defer func(t time.Time) { fmt.Printf("AssertCheckValues:327: %s\n", time.Since(t)) }(time.Now())
-	view, err := cache.View(ctx, tx)
-	if err != nil {
-		return 0, err
-	}
-	castedView, ok := view.(*CoherentView)
-	if !ok {
-		return 0, nil
-	}
-	casted, ok := cache.(*Coherent)
-	if !ok {
-		return 0, nil
-	}
-	checked := 0
-	casted.lock.Lock()
-	defer casted.lock.Unlock()
-	//log.Info("AssertCheckValues start", "db_id", tx.ViewID(), "mem_id", casted.id.Load(), "len", casted.cache.Len())
-	root, ok := casted.roots[castedView.stateVersionID]
-	if !ok {
-		return 0, nil
-	}
-	root.cache.Walk(func(items []*Element) bool {
-		for _, i := range items {
-			k, v := i.K, i.V
-			var dbV []byte
-			dbV, err = tx.GetOne(kv.PlainState, k)
-			if err != nil {
-				return false
-			}
-			if !bytes.Equal(dbV, v) {
-				err = fmt.Errorf("key: %x, has different values: %x != %x", k, v, dbV)
-				return false
-			}
-			checked++
-		}
-		return true
-	})
-	return checked, err
-}
 func (c *Coherent) evictRoots() {
 	if c.latestStateVersionID <= c.cfg.KeepViews {
 		return

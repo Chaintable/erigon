@@ -27,6 +27,8 @@ import (
 	"math/big"
 	"strings"
 
+	"github.com/holiman/uint256"
+
 	"github.com/erigontech/erigon/execution/rlp"
 )
 
@@ -39,7 +41,7 @@ type RLPTest struct {
 	// For other JSON values, In is treated as a driver for
 	// calls to rlp.Stream. The test also verifies that encoding
 	// In produces the bytes in Out.
-	In interface{}
+	In any
 
 	// Out is a hex-encoded RLP value.
 	Out string
@@ -85,7 +87,7 @@ func (t *RLPTest) Run() error {
 }
 
 func checkDecodeInterface(b []byte, isValid bool) error {
-	err := rlp.DecodeBytes(b, new(interface{}))
+	err := rlp.DecodeBytes(b, new(any))
 	switch {
 	case isValid && err != nil:
 		return fmt.Errorf("decoding failed: %w", err)
@@ -96,21 +98,30 @@ func checkDecodeInterface(b []byte, isValid bool) error {
 }
 
 // translateJSON makes test json values encodable with RLP.
-func translateJSON(v interface{}) interface{} {
+func translateJSON(v any) any {
 	switch v := v.(type) {
 	case float64:
 		return uint64(v)
 	case string:
 		if len(v) > 0 && v[0] == '#' { // # starts a faux big int.
-			big, ok := new(big.Int).SetString(v[1:], 10)
+			b, ok := new(big.Int).SetString(v[1:], 10)
 			if !ok {
 				panic(fmt.Errorf("bad test: bad big int: %q", v))
 			}
-			return big
+			// Erigon's RLP layer only supports integers up to 2^256-1, which
+			// covers every value Ethereum encodes on-chain (EIP-7702 caps
+			// chainID at < 2^256, EIP-2294 (stagnant) proposes ~2^63 for
+			// chainID). Test vectors with larger values are filtered out at
+			// the test-runner level.
+			u, overflow := uint256.FromBig(b)
+			if overflow {
+				panic(fmt.Errorf("test value %q exceeds 2^256-1; skip via TestMatcher", v))
+			}
+			return u
 		}
 		return []byte(v)
-	case []interface{}:
-		newJson := make([]interface{}, len(v))
+	case []any:
+		newJson := make([]any, len(v))
 		for i := range v {
 			newJson[i] = translateJSON(v[i])
 		}
@@ -124,23 +135,23 @@ func translateJSON(v interface{}) interface{} {
 // Stream by invoking decoding operations (Uint, Big, List, ...) based
 // on the type of each value. The value decoded from the RLP stream
 // must match the JSON value.
-func checkDecodeFromJSON(s *rlp.Stream, exp interface{}) error {
+func checkDecodeFromJSON(s *rlp.Stream, exp any) error {
 	switch exp := exp.(type) {
 	case uint64:
-		i, err := s.Uint()
+		i, err := s.Uint64()
 		if err != nil {
 			return addStack("Uint", exp, err)
 		}
 		if i != exp {
 			return addStack("Uint", exp, fmt.Errorf("result mismatch: got %d", i))
 		}
-	case *big.Int:
-		big := new(big.Int)
-		if err := s.Decode(&big); err != nil {
-			return addStack("Big", exp, err)
+	case *uint256.Int:
+		u := new(uint256.Int)
+		if err := s.Decode(&u); err != nil {
+			return addStack("Uint256", exp, err)
 		}
-		if big.Cmp(exp) != 0 {
-			return addStack("Big", exp, fmt.Errorf("result mismatch: got %d", big))
+		if u.Cmp(exp) != 0 {
+			return addStack("Uint256", exp, fmt.Errorf("result mismatch: got %d", u))
 		}
 	case []byte:
 		b, err := s.Bytes()
@@ -150,7 +161,7 @@ func checkDecodeFromJSON(s *rlp.Stream, exp interface{}) error {
 		if !bytes.Equal(b, exp) {
 			return addStack("Bytes", exp, fmt.Errorf("result mismatch: got %x", b))
 		}
-	case []interface{}:
+	case []any:
 		if _, err := s.List(); err != nil {
 			return addStack("List", exp, err)
 		}
@@ -168,7 +179,7 @@ func checkDecodeFromJSON(s *rlp.Stream, exp interface{}) error {
 	return nil
 }
 
-func addStack(op string, val interface{}, err error) error {
+func addStack(op string, val any, err error) error {
 	lines := strings.Split(err.Error(), "\n")
 	lines = append(lines, fmt.Sprintf("\t%s: %v", op, val))
 	return errors.New(strings.Join(lines, "\n"))

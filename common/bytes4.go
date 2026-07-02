@@ -29,7 +29,7 @@ import (
 )
 
 var (
-	bytes4T = reflect.TypeOf(Bytes4{})
+	bytes4T = reflect.TypeFor[Bytes4]()
 )
 
 type Bytes4 [length.Bytes4]byte
@@ -51,7 +51,7 @@ func (b *Bytes4) UnmarshalText(input []byte) error {
 func (b Bytes4) MarshalText() ([]byte, error) {
 	bl := b[:]
 	result := make([]byte, len(b)*2+2)
-	copy(result, hexPrefix)
+	copy(result, hexutil.HexPrefix)
 	hex.Encode(result[2:], bl)
 	return result, nil
 }

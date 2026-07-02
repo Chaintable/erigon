@@ -25,7 +25,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"math/big"
 	"os"
 	goruntime "runtime"
 	"runtime/pprof"
@@ -40,6 +39,7 @@ import (
 	"github.com/erigontech/erigon/cmd/utils/flags"
 	"github.com/erigontech/erigon/common"
 	"github.com/erigontech/erigon/common/dbg"
+	"github.com/erigontech/erigon/common/dir"
 	"github.com/erigontech/erigon/common/hexutil"
 	"github.com/erigontech/erigon/common/log/v3"
 	"github.com/erigontech/erigon/db/datadir"
@@ -49,10 +49,11 @@ import (
 	"github.com/erigontech/erigon/execution/chain"
 	"github.com/erigontech/erigon/execution/state"
 	"github.com/erigontech/erigon/execution/state/genesiswrite"
+	"github.com/erigontech/erigon/execution/tracing"
 	"github.com/erigontech/erigon/execution/tracing/tracers"
 	"github.com/erigontech/erigon/execution/tracing/tracers/logger"
 	"github.com/erigontech/erigon/execution/types"
-	"github.com/erigontech/erigon/execution/vm"
+	"github.com/erigontech/erigon/execution/types/accounts"
 	"github.com/erigontech/erigon/execution/vm/evmtypes"
 	"github.com/erigontech/erigon/execution/vm/runtime"
 )
@@ -111,8 +112,14 @@ func timedExec(bench bool, execFunc func() ([]byte, uint64, error)) (output []by
 				if haveGasUsed != gasUsed {
 					panic(fmt.Sprintf("gas differs, have %v want %v", haveGasUsed, gasUsed))
 				}
-				if haveErr != err {
-					panic(fmt.Sprintf("err differs, have %v want %v", haveErr, err))
+				// Compare errors by their string representation because struct-based
+				// errors (e.g. &ErrStackUnderflow{stackLen: n, required: m}) are
+				// distinct pointer allocations on each call, so direct == fails.
+				if (haveErr == nil) != (err == nil) {
+					panic(fmt.Sprintf("err differs in nil-ness, have %v want %v", haveErr, err))
+				}
+				if haveErr != nil && err != nil && haveErr.Error() != err.Error() {
+					panic(fmt.Sprintf("err differs, have %q want %q", haveErr.Error(), err.Error()))
 				}
 			}
 		})
@@ -145,11 +152,11 @@ func runCmd(ctx *cli.Context) error {
 		log.Root().SetHandler(log.LvlFilterHandler(log.Lvl(ctx.Int(VerbosityFlag.Name)), log.StderrHandler))
 	}
 	logconfig := &logger.LogConfig{
-		DisableMemory:     ctx.Bool(DisableMemoryFlag.Name),
-		DisableStack:      ctx.Bool(DisableStackFlag.Name),
-		DisableStorage:    ctx.Bool(DisableStorageFlag.Name),
-		DisableReturnData: ctx.Bool(DisableReturnDataFlag.Name),
-		Debug:             ctx.Bool(DebugFlag.Name),
+		EnableMemory:     !ctx.Bool(DisableMemoryFlag.Name),
+		DisableStack:     ctx.Bool(DisableStackFlag.Name),
+		DisableStorage:   ctx.Bool(DisableStorageFlag.Name),
+		EnableReturnData: !ctx.Bool(DisableReturnDataFlag.Name),
+		Debug:            ctx.Bool(DebugFlag.Name),
 	}
 
 	var (
@@ -157,8 +164,8 @@ func runCmd(ctx *cli.Context) error {
 		debugLogger   *logger.StructLogger
 		statedb       *state.IntraBlockState
 		chainConfig   *chain.Config
-		sender        = common.BytesToAddress([]byte("sender"))
-		receiver      = common.BytesToAddress([]byte("receiver"))
+		sender        = accounts.InternAddress(common.BytesToAddress([]byte("sender")))
+		receiver      = accounts.InternAddress(common.BytesToAddress([]byte("receiver")))
 		genesisConfig *types.Genesis
 	)
 	if machineFriendlyOutput {
@@ -169,11 +176,16 @@ func runCmd(ctx *cli.Context) error {
 	} else {
 		debugLogger = logger.NewStructLogger(logconfig)
 	}
-	db := temporaltest.NewTestDB(nil, datadir.New(os.TempDir()))
+	tmpDir, err := os.MkdirTemp("", "erigon-evm-run-*")
+	if err != nil {
+		return err
+	}
+	defer dir.RemoveAll(tmpDir)
+	db := temporaltest.NewTestDB(nil, datadir.New(tmpDir))
 	defer db.Close()
 	if ctx.String(GenesisFlag.Name) != "" {
 		gen := readGenesis(ctx.String(GenesisFlag.Name))
-		genesiswrite.MustCommitGenesis(gen, db, datadir.New(""), log.Root())
+		genesiswrite.MustCommitGenesis(gen, db, datadir.New(tmpDir), log.Root())
 		genesisConfig = gen
 		chainConfig = gen.Config
 	} else {
@@ -186,7 +198,7 @@ func runCmd(ctx *cli.Context) error {
 	}
 	defer tx.Rollback()
 
-	sd, err := execctx.NewSharedDomains(tx, log.Root())
+	sd, err := execctx.NewSharedDomains(context.Background(), tx, log.Root())
 	if err != nil {
 		return err
 	}
@@ -194,12 +206,12 @@ func runCmd(ctx *cli.Context) error {
 	stateReader := state.NewReaderV3(sd.AsGetter(tx))
 	statedb = state.New(stateReader)
 	if ctx.String(SenderFlag.Name) != "" {
-		sender = common.HexToAddress(ctx.String(SenderFlag.Name))
+		sender = accounts.InternAddress(common.HexToAddress(ctx.String(SenderFlag.Name)))
 	}
 	statedb.CreateAccount(sender, true)
 
 	if ctx.String(ReceiverFlag.Name) != "" {
-		receiver = common.HexToAddress(ctx.String(ReceiverFlag.Name))
+		receiver = accounts.InternAddress(common.HexToAddress(ctx.String(ReceiverFlag.Name)))
 	}
 
 	var code []byte
@@ -259,15 +271,14 @@ func runCmd(ctx *cli.Context) error {
 		GasPrice:    *gasPrice,
 		Value:       *value,
 		Difficulty:  genesisConfig.Difficulty,
-		Time:        new(big.Int).SetUint64(genesisConfig.Timestamp),
-		Coinbase:    genesisConfig.Coinbase,
-		BlockNumber: new(big.Int).SetUint64(genesisConfig.Number),
+		Time:        genesisConfig.Timestamp,
+		Coinbase:    accounts.InternAddress(genesisConfig.Coinbase),
+		BlockNumber: genesisConfig.Number,
 	}
 
 	if tracer != nil {
 		runtimeConfig.EVMConfig.Tracer = tracer.Hooks
 	}
-	runtimeConfig.EVMConfig.JumpDestCache = vm.NewJumpDestCache(16)
 
 	if cpuProfilePath := ctx.String(CPUProfileFlag.Name); cpuProfilePath != "" {
 		f, err := os.Create(cpuProfilePath)
@@ -305,15 +316,15 @@ func runCmd(ctx *cli.Context) error {
 		input = append(code, input...)
 		execFunc = func() ([]byte, uint64, error) {
 			output, _, gasLeft, err := runtime.Create(input, &runtimeConfig, 0)
-			return output, gasLeft, err
+			return output, initialGas - gasLeft.Total(), err
 		}
 	} else {
 		if len(code) > 0 {
-			statedb.SetCode(receiver, code)
+			statedb.SetCode(receiver, code, tracing.CodeChangeUnspecified)
 		}
 		execFunc = func() ([]byte, uint64, error) {
 			output, gasLeft, err := runtime.Call(receiver, input, &runtimeConfig)
-			return output, initialGas - gasLeft, err
+			return output, initialGas - gasLeft.Total(), err
 		}
 	}
 
@@ -324,8 +335,8 @@ func runCmd(ctx *cli.Context) error {
 		rules := &chain.Rules{}
 		if chainConfig != nil {
 			blockContext := evmtypes.BlockContext{
-				BlockNumber: runtimeConfig.BlockNumber.Uint64(),
-				Time:        runtimeConfig.Time.Uint64(),
+				BlockNumber: runtimeConfig.BlockNumber,
+				Time:        runtimeConfig.Time,
 			}
 			rules = blockContext.Rules(chainConfig)
 		}

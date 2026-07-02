@@ -34,14 +34,15 @@ import (
 	"sync"
 	"time"
 
-	"github.com/gorilla/websocket"
+	"github.com/coder/websocket"
+	"github.com/coder/websocket/wsjson"
+	"github.com/holiman/uint256"
 
 	"github.com/erigontech/erigon/common"
 	"github.com/erigontech/erigon/common/log/v3"
 	"github.com/erigontech/erigon/db/kv"
 	"github.com/erigontech/erigon/db/rawdb"
 	"github.com/erigontech/erigon/db/services"
-	"github.com/erigontech/erigon/execution/protocol/rules"
 	"github.com/erigontech/erigon/execution/stagedsync/stages"
 	"github.com/erigontech/erigon/execution/types"
 	"github.com/erigontech/erigon/node"
@@ -66,7 +67,6 @@ type Service struct {
 	servers   []*sentry.GrpcServer // Peer-to-peer server to retrieve networking infos
 	chaindb   kv.RoDB
 	networkid uint64
-	engine    rules.Engine // Rules engine to retrieve variadic block fields
 
 	node string // Name of the node to display on the monitoring page
 	pass string // Password to authorize access to the monitoring page
@@ -85,15 +85,10 @@ type Service struct {
 // connWrapper is a wrapper to prevent concurrent-write or concurrent-read on the
 // websocket.
 //
-// From Gorilla websocket docs:
-//
-//	Connections support one concurrent reader and one concurrent writer.
-//	Applications are responsible for ensuring that no more than one goroutine calls the write methods
-//	  - NextWriter, SetWriteDeadline, WriteMessage, WriteJSON, EnableWriteCompression, SetCompressionLevel
-//	concurrently and that no more than one goroutine calls the read methods
-//	  - NextReader, SetReadDeadline, ReadMessage, ReadJSON, SetPongHandler, SetPingHandler
-//	concurrently.
-//	The Close and WriteControl methods can be called concurrently with all other methods.
+// coder/websocket docs: connections support one concurrent reader and one concurrent
+// writer. Applications are responsible for ensuring no more than one goroutine calls
+// write methods concurrently and no more than one goroutine calls read methods
+// concurrently.
 type connWrapper struct {
 	conn *websocket.Conn
 
@@ -106,34 +101,32 @@ func newConnectionWrapper(conn *websocket.Conn) *connWrapper {
 }
 
 // WriteJSON wraps corresponding method on the websocket but is safe for concurrent calling
-func (w *connWrapper) WriteJSON(v interface{}) error {
+func (w *connWrapper) WriteJSON(v any) error {
 	if w.conn == nil {
 		return nil
 	}
 	w.wlock.Lock()
 	defer w.wlock.Unlock()
 
-	return w.conn.WriteJSON(v)
+	return wsjson.Write(context.Background(), w.conn, v)
 }
 
 // ReadJSON wraps corresponding method on the websocket but is safe for concurrent calling
-func (w *connWrapper) ReadJSON(v interface{}) error {
+func (w *connWrapper) ReadJSON(v any) error {
 	w.rlock.Lock()
 	defer w.rlock.Unlock()
 
-	return w.conn.ReadJSON(v)
+	return wsjson.Read(context.Background(), w.conn, v)
 }
 
 // Close wraps corresponding method on the websocket but is safe for concurrent calling
 func (w *connWrapper) Close() error {
-	// The Close and WriteControl methods can be called concurrently with all other methods,
-	// so the mutex is not used here
-	return w.conn.Close()
+	return w.conn.Close(websocket.StatusNormalClosure, "")
 }
 
 // New returns a monitoring service ready for stats reporting.
 func New(node *node.Node, servers []*sentry.GrpcServer, chainDB kv.RoDB, blockReader services.FullBlockReader,
-	engine rules.Engine, url string, networkid uint64, quitCh <-chan struct{}, headCh chan [][]byte, txPoolRpcClient txpoolproto.TxpoolClient) error {
+	url string, networkid uint64, quitCh <-chan struct{}, headCh chan [][]byte, txPoolRpcClient txpoolproto.TxpoolClient) error {
 	// Parse the netstats connection url
 	parts := urlRegex.FindStringSubmatch(url)
 	if len(parts) != 5 {
@@ -141,7 +134,6 @@ func New(node *node.Node, servers []*sentry.GrpcServer, chainDB kv.RoDB, blockRe
 	}
 	ethstats := &Service{
 		blockReader: blockReader,
-		engine:      engine,
 		servers:     servers,
 		node:        parts[1],
 		pass:        parts[3],
@@ -198,16 +190,20 @@ func (s *Service) loop() {
 				conn *connWrapper
 				err  error
 			)
-			dialer := websocket.Dialer{HandshakeTimeout: 5 * time.Second}
 			header := make(http.Header)
 			header.Set("origin", "http://localhost")
 			for _, url := range urls {
-				//nolint
-				c, _, err := dialer.Dial(url, header)
-				if err == nil {
-					conn = newConnectionWrapper(c)
-					break
+				dialCtx, dialCancel := context.WithTimeout(context.Background(), 5*time.Second)
+				c, resp, dialErr := websocket.Dial(dialCtx, url, &websocket.DialOptions{HTTPHeader: header})
+				dialCancel()
+				if dialErr != nil {
+					if resp != nil {
+						resp.Body.Close()
+					}
+					continue
 				}
+				conn = newConnectionWrapper(c)
+				break
 			}
 			if conn == nil {
 				log.Warn("Stats server unreachable")
@@ -288,7 +284,7 @@ func (s *Service) readLoop(conn *connWrapper) {
 			continue
 		}
 		// Not a system ping, try to decode an actual state message
-		var msg map[string][]interface{}
+		var msg map[string][]any
 		if err := json.Unmarshal(blob, &msg); err != nil {
 			log.Warn("Failed to decode stats server message", "err", err)
 			return
@@ -318,7 +314,7 @@ func (s *Service) readLoop(conn *connWrapper) {
 		// If the message is a history request, forward to the event processor
 		if len(msg["emit"]) == 2 && command == "history" {
 			// Make sure the request is valid and doesn't crash us
-			request, ok := msg["emit"][1].(map[string]interface{})
+			request, ok := msg["emit"][1].(map[string]any)
 			if !ok {
 				log.Warn("Invalid stats history request", "msg", msg["emit"][1])
 				select {
@@ -327,7 +323,7 @@ func (s *Service) readLoop(conn *connWrapper) {
 				}
 				continue
 			}
-			list, ok := request["list"].([]interface{})
+			list, ok := request["list"].([]any)
 			if !ok {
 				log.Warn("Invalid stats history block list", "list", request["list"])
 				return
@@ -411,7 +407,7 @@ func (s *Service) login(conn *connWrapper) error {
 		},
 		Secret: s.pass,
 	}
-	login := map[string][]interface{}{
+	login := map[string][]any{
 		"emit": {"hello", auth},
 	}
 	if err := conn.WriteJSON(login); err != nil {
@@ -450,7 +446,7 @@ func (s *Service) reportLatency(conn *connWrapper) error {
 	// Send the current time to the ethstats server
 	start := time.Now()
 
-	ping := map[string][]interface{}{
+	ping := map[string][]any{
 		"emit": {"node-ping", map[string]string{
 			"id":         s.node,
 			"clientTime": start.String(),
@@ -472,7 +468,7 @@ func (s *Service) reportLatency(conn *connWrapper) error {
 	// Send back the measured latency
 	log.Trace("Sending measured latency to ethstats", "latency", latency)
 
-	stats := map[string][]interface{}{
+	stats := map[string][]any{
 		"emit": {"latency", map[string]string{
 			"id":      s.node,
 			"latency": latency,
@@ -483,7 +479,7 @@ func (s *Service) reportLatency(conn *connWrapper) error {
 
 // blockStats is the information to report about individual blocks.
 type blockStats struct {
-	Number     *big.Int       `json:"number"`
+	Number     uint256.Int    `json:"number"`
 	Hash       common.Hash    `json:"hash"`
 	ParentHash common.Hash    `json:"parentHash"`
 	Timestamp  *big.Int       `json:"timestamp"`
@@ -541,11 +537,11 @@ func (s *Service) reportBlock(conn *connWrapper) error {
 	// Assemble the block report and send it to the server
 	log.Trace("Sending new block to ethstats", "number", details.Number, "hash", details.Hash)
 
-	stats := map[string]interface{}{
+	stats := map[string]any{
 		"id":    s.node,
 		"block": details,
 	}
-	report := map[string][]interface{}{
+	report := map[string][]any{
 		"emit": {"block", stats},
 	}
 	return conn.WriteJSON(report)
@@ -553,9 +549,9 @@ func (s *Service) reportBlock(conn *connWrapper) error {
 
 // assembleBlockStats retrieves any required metadata to report a single block
 // and assembles the block stats. If block is nil, the current head is processed.
-func (s *Service) assembleBlockStats(block *types.Block, td *big.Int) *blockStats {
+func (s *Service) assembleBlockStats(block *types.Block, td *uint256.Int) *blockStats {
 	if td == nil {
-		td = common.Big0
+		td = new(uint256.Int)
 	}
 	// Gather the block infos from the local blockchain
 	txs := make([]txStats, 0, len(block.Transactions()))
@@ -633,11 +629,11 @@ func (s *Service) reportHistory(conn *connWrapper, list []uint64) error {
 	} else {
 		log.Trace("No history to send to stats server")
 	}
-	stats := map[string]interface{}{
+	stats := map[string]any{
 		"id":      s.node,
 		"history": history,
 	}
-	report := map[string][]interface{}{
+	report := map[string][]any{
 		"emit": {"history", stats},
 	}
 	return conn.WriteJSON(report)
@@ -658,13 +654,13 @@ func (s *Service) reportPending(conn *connWrapper) error {
 	}
 	log.Trace("Sending pending transactions to ethstats", "count", status.PendingCount)
 
-	stats := map[string]interface{}{
+	stats := map[string]any{
 		"id": s.node,
 		"stats": &pendStats{
 			Pending: int(status.PendingCount),
 		},
 	}
-	report := map[string][]interface{}{
+	report := map[string][]any{
 		"emit": {"pending", stats},
 	}
 	return conn.WriteJSON(report)
@@ -705,7 +701,7 @@ func (s *Service) reportStats(conn *connWrapper) error {
 			peerCount += count
 		}
 	}
-	stats := map[string]interface{}{
+	stats := map[string]any{
 		"id": s.node,
 		"stats": &nodeStats{
 			Active:    true,
@@ -717,7 +713,7 @@ func (s *Service) reportStats(conn *connWrapper) error {
 			Uptime:    100,
 		},
 	}
-	report := map[string][]interface{}{
+	report := map[string][]any{
 		"emit": {"stats", stats},
 	}
 	return conn.WriteJSON(report)

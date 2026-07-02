@@ -3,8 +3,6 @@ package state
 import (
 	"context"
 	"fmt"
-	"path"
-	"path/filepath"
 
 	"golang.org/x/sync/errgroup"
 
@@ -102,7 +100,7 @@ func (a *ProtoForkable) BuildFile(ctx context.Context, from, to RootNum, db kv.R
 	}
 
 	log.Debug(fmt.Sprintf("freezing %s from step %d to %d", Registry.Name(a.id), calcFrom.Uint64()/a.StepSize(), calcTo.Uint64()/a.StepSize()))
-	path := a.fschema.DataFile(version.V1_0, calcFrom, calcTo)
+	path, _ := a.fschema.DataFile(version.V1_0, calcFrom, calcTo)
 
 	var exists bool
 	exists, err = dir.FileExist(path)
@@ -111,8 +109,7 @@ func (a *ProtoForkable) BuildFile(ctx context.Context, from, to RootNum, db kv.R
 	}
 
 	if !exists {
-		segCfg := seg.DefaultCfg
-
+		segCfg := seg.DefaultCfg.WithValuesOnCompressedPage(a.cfg.ValuesOnCompressedPage)
 		segCfg.Workers = compressionWorkers
 		segCfg.ExpectMetadata = true
 		sn, err := seg.NewCompressor(ctx, "Snapshot "+Registry.Name(a.id), path, a.dirs.Tmp, segCfg, log.LvlTrace, a.logger)
@@ -123,7 +120,7 @@ func (a *ProtoForkable) BuildFile(ctx context.Context, from, to RootNum, db kv.R
 		// TODO: fsync params?
 
 		compress := a.isCompressionUsed(calcFrom, calcTo)
-		writer := a.DataWriter(sn, compress)
+		writer := a.DataWriter(ctx, sn, compress)
 		defer writer.Close()
 		meta, err := a.freezer.Freeze(ctx, calcFrom, calcTo, writer, db)
 		if err != nil {
@@ -135,8 +132,6 @@ func (a *ProtoForkable) BuildFile(ctx context.Context, from, to RootNum, db kv.R
 		}
 		writer.SetMetadata(mbytes)
 
-		p := ps.AddNew(filepath.Base(path), 1)
-		defer ps.Delete(p)
 		if err := writer.Flush(); err != nil {
 			return nil, false, err
 		}
@@ -145,7 +140,6 @@ func (a *ProtoForkable) BuildFile(ctx context.Context, from, to RootNum, db kv.R
 		}
 		writer.Close()
 		sn.Close()
-		ps.Delete(p)
 	}
 
 	valuesDecomp, err := seg.NewDecompressorWithMetadata(path, cfg.HasMetadata)
@@ -166,8 +160,8 @@ func (a *ProtoForkable) BuildFile(ctx context.Context, from, to RootNum, db kv.R
 	return df, true, nil
 }
 
-func (a *ProtoForkable) DataWriter(f *seg.Compressor, compress bool) *seg.PagedWriter {
-	return seg.NewPagedWriter(seg.NewWriter(f, a.cfg.Compression), a.cfg.ValuesOnCompressedPage, compress)
+func (a *ProtoForkable) DataWriter(ctx context.Context, f *seg.Compressor, compress bool) *seg.PagedWriter {
+	return seg.NewPagedWriter(ctx, seg.NewWriter(f, a.cfg.Compression), compress, 1)
 }
 
 func (a *ProtoForkable) DataReader(f *seg.Decompressor, compress bool) *seg.Reader {
@@ -189,7 +183,7 @@ func (a *ProtoForkable) BuildIndexes(ctx context.Context, decomp *seg.Decompress
 		}
 	}()
 	for i, ib := range a.builders {
-		filename := path.Base(a.snaps.schema.AccessorIdxFile(version.V1_0, from, to, uint64(i)))
+		filename, _ := a.snaps.schema.AccessorIdxFile(version.V1_0, from, to, uint16(i))
 		p := ps.AddNew("build_index_"+filename, 1)
 		defer ps.Delete(p)
 		recsplitIdx, err := ib.Build(ctx, decomp, from, to, p)
@@ -210,7 +204,8 @@ func (a *ProtoForkable) BuildIndexes2(ctx context.Context, from, to RootNum, ps 
 	if found && file.decompressor != nil {
 		decomp = file.decompressor
 	} else {
-		decomp, err = seg.NewDecompressorWithMetadata(a.fschema.DataFile(version.V1_0, from, to), a.snapCfg.HasMetadata)
+		file, _ := a.fschema.DataFile(version.V1_0, from, to)
+		decomp, err = seg.NewDecompressorWithMetadata(file, a.snapCfg.HasMetadata)
 		if err != nil {
 			return nil, err
 		}
@@ -280,15 +275,15 @@ func (a *ProtoForkable) BeginFilesRo() *ProtoForkableTx {
 // take dirtyFiles lock before using this
 func (a *ProtoForkable) DebugBeginDirtyFilesRo() *forkableDirtyFilesRoTx {
 	var files []*FilesItem
-	a.snaps.dirtyFiles.Walk(func(items []*FilesItem) bool {
-		files = append(files, items...)
-		for _, item := range items {
-			if !item.frozen {
-				item.refcount.Add(1)
-			}
+	iter := a.snaps.dirtyFiles.Iter()
+	defer iter.Release()
+	for ok := iter.First(); ok; ok = iter.Next() {
+		item := iter.Item()
+		files = append(files, item)
+		if !item.frozen {
+			item.refcount.Add(1)
 		}
-		return true
-	})
+	}
 	return &forkableDirtyFilesRoTx{
 		p:     a,
 		files: files,
@@ -354,7 +349,7 @@ func (a *ProtoForkableTx) StatelessIdxReader(i int) *recsplit.IndexReader {
 
 	r := a.readers[i]
 	if r == nil {
-		r = a.files[i].src.index.GetReaderFromPool()
+		r = a.files[i].src.index.Reader()
 		a.readers[i] = r
 	}
 

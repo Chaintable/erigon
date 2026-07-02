@@ -4,24 +4,25 @@
 package contracts
 
 import (
+	"context"
 	"fmt"
 	"math/big"
 	"reflect"
 	"strings"
+	"time"
 
-	ethereum "github.com/erigontech/erigon"
+	"github.com/cenkalti/backoff/v4"
 	"github.com/erigontech/erigon/common"
+	"github.com/erigontech/erigon/common/event"
 	"github.com/erigontech/erigon/execution/abi"
 	"github.com/erigontech/erigon/execution/abi/bind"
 	"github.com/erigontech/erigon/execution/types"
-	"github.com/erigontech/erigon/p2p/event"
 )
 
 // Reference imports to suppress errors if they are not otherwise used.
 var (
 	_ = big.NewInt
 	_ = strings.NewReader
-	_ = ethereum.NotFound
 	_ = bind.Bind
 	_ = common.Big1
 	_ = types.BloomLookup
@@ -43,11 +44,25 @@ func DeployKeyperSet(auth *bind.TransactOpts, backend bind.ContractBackend) (com
 		return common.Address{}, nil, nil, err
 	}
 
-	address, tx, contract, err := bind.DeployContract(auth, parsed, common.FromHex(KeyperSetBin), backend)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	backOff := backoff.WithContext(backoff.BackOff(backoff.NewConstantBackOff(50*time.Millisecond)), ctx)
+	defer cancel()
+	type binding struct {
+		address  common.Address
+		tx       types.Transaction
+		contract *bind.BoundContract
+	}
+	b, err := backoff.RetryWithData(func() (binding, error) {
+		address, tx, contract, err := bind.DeployContract(auth, parsed, common.FromHex(KeyperSetBin), backend)
+		if err != nil {
+			return binding{}, err
+		}
+		return binding{address, tx, contract}, nil
+	}, backOff)
 	if err != nil {
 		return common.Address{}, nil, nil, err
 	}
-	return address, tx, &KeyperSet{KeyperSetCaller: KeyperSetCaller{contract: contract}, KeyperSetTransactor: KeyperSetTransactor{contract: contract}, KeyperSetFilterer: KeyperSetFilterer{contract: contract}}, nil
+	return b.address, b.tx, &KeyperSet{KeyperSetCaller: KeyperSetCaller{contract: b.contract}, KeyperSetTransactor: KeyperSetTransactor{contract: b.contract}, KeyperSetFilterer: KeyperSetFilterer{contract: b.contract}}, nil
 }
 
 // KeyperSet is an auto generated Go binding around an Ethereum contract.
@@ -721,10 +736,10 @@ type KeyperSetOwnershipTransferredIterator struct {
 	contract *bind.BoundContract // Generic contract to use for unpacking event data
 	event    string              // Event name to use for unpacking event data
 
-	logs chan types.Log        // Log channel receiving the found contract events
-	sub  ethereum.Subscription // Subscription for errors, completion and termination
-	done bool                  // Whether the subscription completed delivering logs
-	fail error                 // Occurred error to stop iteration
+	logs chan types.Log     // Log channel receiving the found contract events
+	sub  event.Subscription // Subscription for errors, completion and termination
+	done bool               // Whether the subscription completed delivering logs
+	fail error              // Occurred error to stop iteration
 }
 
 // Next advances the iterator to the subsequent event, returning whether there

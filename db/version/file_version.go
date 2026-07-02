@@ -3,12 +3,16 @@ package version
 import (
 	"errors"
 	"fmt"
+	"math"
 	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/erigontech/erigon/common/log/v3"
 )
 
 /*
@@ -46,21 +50,24 @@ type Version struct {
 }
 
 var ErrVersionIsNotSupported error = errors.New("this version is not supported")
+var ErrInvalidVersion = errors.New("invalid version")
 
 var (
-	ZeroVersion            = Version{}
-	V1_0          Version  = Version{1, 0}
-	V1_1          Version  = Version{1, 1}
-	V1_2          Version  = Version{1, 2}
-	V2_0          Version  = Version{2, 0}
-	V2_1          Version  = Version{2, 1}
-	V1_0_standart Versions = Versions{V1_0, V1_0}
-	V1_1_standart Versions = Versions{V1_1, V1_0}
-	V1_2_standart Versions = Versions{V1_2, V1_0}
-	V1_1_exact    Versions = Versions{V1_1, V1_1}
-	V2_0_standart Versions = Versions{V2_0, V1_0}
-	V2_0_nosup             = Versions{V2_0, V2_0}
-	V2_1_standart Versions = Versions{V2_1, V1_0}
+	ZeroVersion                  = Version{}
+	StrictSearchVersion          = Version{math.MaxUint64, math.MaxUint64}
+	SearchVersion                = Version{math.MaxUint64 - 1, math.MaxUint64 - 1}
+	V1_0                Version  = Version{1, 0}
+	V1_1                Version  = Version{1, 1}
+	V1_2                Version  = Version{1, 2}
+	V2_0                Version  = Version{2, 0}
+	V2_1                Version  = Version{2, 1}
+	V1_0_standart       Versions = Versions{V1_0, V1_0}
+	V1_1_standart       Versions = Versions{V1_1, V1_0}
+	V1_2_standart       Versions = Versions{V1_2, V1_0}
+	V1_1_exact          Versions = Versions{V1_1, V1_1}
+	V2_0_standart       Versions = Versions{V2_0, V1_0}
+	V2_0_nosup                   = Versions{V2_0, V2_0}
+	V2_1_standart       Versions = Versions{V2_1, V1_0}
 )
 
 func (v Version) Less(rhd Version) bool {
@@ -125,35 +132,34 @@ func (v Version) IsZero() bool {
 	return v.Major == 0 && v.Minor == 0
 }
 
+func (v Version) IsSearch() bool {
+	return v == SearchVersion || v == StrictSearchVersion
+}
+
 func ParseVersion(v string) (Version, error) {
-	if strings.HasPrefix(v, "v") {
-		versionString := strings.Split(v, "-")[0]
-		strVersions := strings.Split(versionString[1:], ".")
-		major, err := strconv.ParseUint(strVersions[0], 10, 8)
+	if len(v) == 0 || v[0] != 'v' {
+		return Version{}, ErrInvalidVersion
+	}
+
+	verStr, _, _ := strings.Cut(v[1:], "-")
+	majorStr, minorStr, hasDot := strings.Cut(verStr, ".")
+	if hasDot && minorStr == "" {
+		return Version{}, ErrInvalidVersion
+	}
+
+	major, err := strconv.ParseUint(majorStr, 10, 8)
+	if err != nil {
+		return Version{}, ErrInvalidVersion
+	}
+	var minor uint64
+	if len(minorStr) > 0 {
+		minor, err = strconv.ParseUint(minorStr, 10, 8)
 		if err != nil {
-			return Version{}, fmt.Errorf("invalid version: %w", err)
+			return Version{}, ErrInvalidVersion
 		}
-		var minor uint64
-		if len(strVersions) > 1 {
-			minor, err = strconv.ParseUint(strVersions[1], 10, 8)
-			if err != nil {
-				return Version{}, fmt.Errorf("invalid version: %w", err)
-			}
-		} else {
-			minor = 0
-		}
-
-		return Version{
-			Major: major,
-			Minor: minor,
-		}, nil
 	}
 
-	if len(v) == 0 {
-		return Version{}, errors.New("invalid version: no prefix")
-	}
-
-	return Version{}, fmt.Errorf("invalid version prefix: %s", v[0:1])
+	return Version{Major: major, Minor: minor}, nil
 }
 
 func (v Version) String() string {
@@ -180,6 +186,29 @@ func (v Versions) String() string {
 
 func (v Versions) Supports(ver Version) bool {
 	return ver.GreaterOrEqual(v.MinSupported) && ver.LessOrEqual(v.Current)
+}
+
+var mustSupportLogOnce sync.Once
+
+// MustSupport panics if ver is outside [MinSupported, Current].
+func (v Versions) MustSupport(ver Version, filename string) {
+	if v.Supports(ver) {
+		return
+	}
+	var msg string
+	if ver.Less(v.MinSupported) {
+		msg = fmt.Sprintf(
+			"Snapshot file is too old for this Erigon build: file=%s, minimum_required=%s. To fix, reset snapshots: `erigon snapshots reset --datadir $DATADIR --chain $CHAIN`",
+			filename, v.MinSupported,
+		)
+	} else {
+		msg = fmt.Sprintf(
+			"Snapshot file is newer than this Erigon build supports: file=%s, highest_supported=<%s. To fix, either upgrade Erigon to a newer release, or align snapshots by command: `erigon snapshots reset --datadir $DATADIR --chain $CHAIN`",
+			filename, v.Current,
+		)
+	}
+	mustSupportLogOnce.Do(func() { log.Error(msg) })
+	panic(msg)
 }
 
 // FindFilesWithVersionsByPattern return an filepath by pattern
@@ -212,6 +241,54 @@ func FindFilesWithVersionsByPattern(pattern string) (string, Version, bool, erro
 	return matches[0], ver, true, nil
 }
 
+// MatchVersionedFile searches for files matching a pattern within a pre-scanned list.
+// This avoids filesystem calls by searching within the provided dirEntries slice.
+// filePattern is the filename pattern (e.g., "*-accounts.0-1.kv")
+// dirEntries is a slice of filenames (not full paths)
+// dir is the directory path to join with matched filenames
+func MatchVersionedFile(filePattern string, dirEntries []string, dir string) (string, Version, bool, error) {
+	var bestMatch string
+	var bestVersion Version
+	found := false
+
+	// Optimization: patterns like "*-accounts.0-1.kv" are common — a single leading wildcard
+	// followed by a literal suffix. Use HasSuffix instead of filepath.Match (which is ~50x slower).
+	if strings.HasPrefix(filePattern, "*") && !strings.ContainsAny(filePattern[1:], "*?[") {
+		suffix := filePattern[1:]
+		for _, name := range dirEntries {
+			if !strings.HasSuffix(name, suffix) {
+				continue
+			}
+			ver, _ := ParseVersion(name)
+			if !found || ver.Greater(bestVersion) {
+				bestVersion = ver
+				bestMatch = name
+				found = true
+			}
+		}
+	} else {
+		for _, name := range dirEntries {
+			matched, err := filepath.Match(filePattern, name)
+			if err != nil {
+				return "", Version{}, false, fmt.Errorf("invalid pattern: %w", err)
+			}
+			if matched {
+				ver, _ := ParseVersion(name)
+				if !found || ver.Greater(bestVersion) {
+					bestVersion = ver
+					bestMatch = name
+					found = true
+				}
+			}
+		}
+	}
+
+	if !found {
+		return "", Version{}, false, nil
+	}
+	return filepath.Join(dir, bestMatch), bestVersion, true, nil
+}
+
 func CheckIsThereFileWithSupportedVersion(pattern string, minSup Version) error {
 	_, fileVer, ok, err := FindFilesWithVersionsByPattern(pattern)
 	if err != nil {
@@ -224,6 +301,15 @@ func CheckIsThereFileWithSupportedVersion(pattern string, minSup Version) error 
 		return fmt.Errorf("file version %s is less than supported version %s", fileVer.String(), minSup.String())
 	}
 	return nil
+}
+
+func MakeMaskedWithExtReplace(path string, newExt string) string {
+	fName, err := ReplaceVersionWithMask(path)
+	if err != nil {
+		return ""
+	}
+
+	return strings.ReplaceAll(fName, filepath.Ext(path), newExt)
 }
 
 func ReplaceVersionWithMask(path string) (string, error) {
@@ -250,13 +336,4 @@ func (v *Version) UnmarshalYAML(node *yaml.Node) error {
 	}
 	*v = ver
 	return nil
-}
-
-func VersionTooLowPanic(filename string, version Versions) {
-	panic(fmt.Sprintf(
-		"FileVersion is too low, try to run snapshot reset: `erigon --datadir $DATADIR --chain $CHAIN snapshots reset`. file=%s, min_supported=%s, current=%s",
-		filename,
-		version.MinSupported,
-		version.Current,
-	))
 }

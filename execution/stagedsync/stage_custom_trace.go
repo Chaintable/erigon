@@ -116,7 +116,7 @@ func SpawnCustomTrace(cfg CustomTraceCfg, ctx context.Context, logger log.Logger
 	}
 
 	log.Info("[stage_custom_trace] start params", "produce", cfg.Produce)
-	txNumsReader := cfg.ExecArgs.BlockReader.TxnumReader(ctx)
+	txNumsReader := cfg.ExecArgs.BlockReader.TxnumReader()
 
 	//agg := cfg.db.(dbstate.HasAgg).Agg().(*dbstate.Aggregator)
 	//stepSize := agg.StepSize()
@@ -136,7 +136,7 @@ func SpawnCustomTrace(cfg CustomTraceCfg, ctx context.Context, logger log.Logger
 
 		fromTxNum := progressOfDomains(tx, cfg.Produce)
 		var ok bool
-		startBlock, ok, err = txNumsReader.FindBlockNum(tx, fromTxNum)
+		startBlock, ok, err = txNumsReader.FindBlockNum(ctx, tx, fromTxNum)
 		if err != nil {
 			return fmt.Errorf("getting last executed block: %w", err)
 		}
@@ -193,12 +193,12 @@ Loop:
 		"rcache", tx.Debug().DomainProgress(kv.RCacheDomain))
 
 	if cfg.Produce.ReceiptDomain {
-		if err := integrity.ValidateDomainProgress(cfg.db, kv.ReceiptDomain, txNumsReader); err != nil {
+		if err := integrity.ValidateDomainProgress(ctx, cfg.db, kv.ReceiptDomain, txNumsReader); err != nil {
 			return err
 		}
 	}
 	if cfg.Produce.RCacheDomain {
-		if err := integrity.ValidateDomainProgress(cfg.db, kv.RCacheDomain, txNumsReader); err != nil {
+		if err := integrity.ValidateDomainProgress(ctx, cfg.db, kv.RCacheDomain, txNumsReader); err != nil {
 			return err
 		}
 	}
@@ -212,9 +212,6 @@ Loop:
 // also, it appends/puts to db blockResults and not "txResult".
 func customTraceBatchProduce(ctx context.Context, produce Produce, cfg *exec.ExecArgs, db kv.TemporalRwDB, fromBlock, toBlock uint64, logPrefix string, logger log.Logger) error {
 	if err := db.UpdateTemporal(ctx, func(tx kv.TemporalRwTx) error {
-		if err := tx.GreedyPruneHistory(ctx, kv.CommitmentDomain); err != nil {
-			return err
-		}
 		if _, err := tx.PruneSmallBatches(ctx, 10*time.Hour); err != nil {
 			return err
 		}
@@ -230,7 +227,7 @@ func customTraceBatchProduce(ctx context.Context, produce Produce, cfg *exec.Exe
 		}
 		defer tx.Rollback()
 
-		doms, err := execctx.NewSharedDomains(tx, logger)
+		doms, err := execctx.NewSharedDomains(ctx, tx, logger)
 		if err != nil {
 			return err
 		}
@@ -246,12 +243,15 @@ func customTraceBatchProduce(ctx context.Context, produce Produce, cfg *exec.Exe
 
 		//asserts
 		if produce.ReceiptDomain {
-			if err = AssertReceipts(ctx, cfg, tx, fromBlock, toBlock); err != nil {
+			if err = AssertReceipts(ctx, cfg, db, fromBlock, toBlock); err != nil {
 				return err
 			}
 		}
 
-		lastTxNum = doms.TxNum()
+		lastTxNum, _, err = doms.SeekCommitment(ctx, tx)
+		if err != nil {
+			return err
+		}
 		if err := tx.Commit(); err != nil {
 			return err
 		}
@@ -269,13 +269,10 @@ func customTraceBatchProduce(ctx context.Context, produce Produce, cfg *exec.Exe
 	}); err != nil {
 		return err
 	}
-	if err := agg.BuildFiles2(ctx, fromStep, toStep); err != nil {
+	if err := agg.BuildFiles2(ctx, fromStep, toStep, true); err != nil {
 		return err
 	}
 	if err := db.Update(ctx, func(tx kv.RwTx) error {
-		if err := tx.(kv.TemporalRwTx).GreedyPruneHistory(ctx, kv.CommitmentDomain); err != nil {
-			return err
-		}
 		if _, err := tx.(kv.TemporalRwTx).PruneSmallBatches(ctx, 10*time.Hour); err != nil {
 			return err
 		}
@@ -287,14 +284,14 @@ func customTraceBatchProduce(ctx context.Context, produce Produce, cfg *exec.Exe
 	return nil
 }
 
-func AssertReceipts(ctx context.Context, cfg *exec.ExecArgs, tx kv.TemporalTx, fromBlock, toBlock uint64) (err error) {
+func AssertReceipts(ctx context.Context, cfg *exec.ExecArgs, db kv.TemporalRoDB, fromBlock, toBlock uint64) (err error) {
 	if !dbg.AssertEnabled {
 		return
 	}
 	if cfg.ChainConfig.Bor != nil { //TODO: enable me
 		return nil
 	}
-	return integrity.ReceiptsNoDupsRange(ctx, fromBlock, toBlock, tx, cfg.BlockReader, true)
+	return integrity.ReceiptsNoDupsRange(ctx, fromBlock, toBlock, db, cfg.BlockReader, true)
 }
 
 func customTraceBatch(ctx context.Context, produce Produce, cfg *exec.ExecArgs, tx kv.TemporalRwTx, doms *execctx.SharedDomains, fromBlock, toBlock uint64, logPrefix string, logger log.Logger) error {
@@ -304,8 +301,8 @@ func customTraceBatch(ctx context.Context, produce Produce, cfg *exec.ExecArgs, 
 
 	var cumulativeBlobGasUsedInBlock uint64
 
-	txNumsReader := cfg.BlockReader.TxnumReader(ctx)
-	fromTxNum, _ := txNumsReader.Min(tx, fromBlock)
+	txNumsReader := cfg.BlockReader.TxnumReader()
+	fromTxNum, _ := txNumsReader.Min(ctx, tx, fromBlock)
 	prevTxNumLog := fromTxNum
 
 	var m runtime.MemStats
@@ -320,7 +317,6 @@ func customTraceBatch(ctx context.Context, produce Produce, cfg *exec.ExecArgs, 
 				cumulativeBlobGasUsedInBlock += txTask.Tx().GetBlobGas()
 			}
 
-			doms.SetTxNum(txTask.TxNum)
 			putter := doms.AsPutDel(tx)
 
 			if produce.ReceiptDomain {
@@ -395,14 +391,16 @@ func customTraceBatch(ctx context.Context, produce Produce, cfg *exec.ExecArgs, 
 			}
 			if produce.TraceFrom {
 				for addr := range result.TraceFroms {
-					if err := doms.IndexAdd(kv.TracesFromIdx, addr[:], txTask.TxNum); err != nil {
+					addrValue := addr.Value()
+					if err := doms.IndexAdd(kv.TracesFromIdx, addrValue[:], txTask.TxNum); err != nil {
 						return err
 					}
 				}
 			}
 			if produce.TraceTo {
 				for addr := range result.TraceTos {
-					if err := doms.IndexAdd(kv.TracesToIdx, addr[:], txTask.TxNum); err != nil {
+					addrValue := addr.Value()
+					if err := doms.IndexAdd(kv.TracesToIdx, addrValue[:], txTask.TxNum); err != nil {
 						return err
 					}
 				}

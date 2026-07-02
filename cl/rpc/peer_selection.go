@@ -28,6 +28,13 @@ var (
 
 var (
 	peersCandidateRefreshInterval = time.Second * 15
+	allCustodyIndices             = func() map[uint64]bool {
+		indices := make(map[uint64]bool)
+		for i := uint64(0); i < 128; i++ {
+			indices[i] = true
+		}
+		return indices
+	}()
 )
 
 type columnDataPeers struct {
@@ -97,7 +104,9 @@ func (c *columnDataPeers) refreshPeers(ctx context.Context) {
 
 			// request metadata
 			metadata := &cltypes.Metadata{}
-			if err := c.simpleReuqest(ctx, pid, communication.MetadataProtocolV3, metadata, []byte{}); err != nil {
+			// Prefer v3 but accept v2 for peers that haven't upgraded yet.
+			metadataTopic := communication.MetadataProtocolV3 + "," + communication.MetadataProtocolV2
+			if err := c.simpleReuqest(ctx, pid, metadataTopic, metadata, []byte{}); err != nil {
 				log.Debug("[peerSelector] failed to request peer metadata", "peer", pid, "err", err)
 				continue
 			}
@@ -105,12 +114,10 @@ func (c *columnDataPeers) refreshPeers(ctx context.Context) {
 				log.Debug("[peerSelector] empty cgc", "peer", pid)
 				continue
 			}
-			custodyIndices := map[cltypes.CustodyIndex]bool{}
+			var custodyIndices map[cltypes.CustodyIndex]bool
 			if peer.EnodeId == "" {
-				// fill all custody indices
-				for i := cltypes.CustodyIndex(0); i < c.beaconConfig.NumberOfCustodyGroups; i++ {
-					custodyIndices[i] = true
-				}
+				// if no enode id, use all custody indices
+				custodyIndices = allCustodyIndices
 			} else {
 				// get custody indices
 				enodeId := enode.HexID(peer.EnodeId)
@@ -124,17 +131,18 @@ func (c *columnDataPeers) refreshPeers(ctx context.Context) {
 			data := &peerData{pid: pid, mask: custodyIndices}
 			c.peerMetaCache.Add(peerKey, data)
 			newPeers = append(newPeers, *data)
-			log.Debug("[peerSelector] added peer", "peer", pid, "custodies", len(custodyIndices))
+			log.Trace("[peerSelector] added peer", "peer", pid, "custodies", len(custodyIndices))
 		}
 		c.peersMutex.Lock()
 		c.peersQueue = newPeers
 		c.peersIndex = 0
 		c.peersMutex.Unlock()
-		custodies := []uint64{}
-		for _, peer := range newPeers {
-			custodies = append(custodies, uint64(len(peer.mask)))
-		}
-		log.Debug("[peerSelector] updated peers", "totalPeers", len(peers.Peers), "peerCount", len(newPeers), "custodies", custodies, "elapsedTime", time.Since(begin))
+		//custodies := []uint64{}
+		//for _, peer := range newPeers {
+		//	custodies = append(custodies, uint64(len(peer.mask)))
+		//}
+		//log.Debug("[peerSelector] updated peers", "totalPeers", len(peers.Peers), "peerCount", len(newPeers), "custodies", custodies, "elapsedTime", time.Since(begin))
+		log.Debug("[peerSelector] updated peers", "totalPeers", len(peers.Peers), "peerCount", len(newPeers), "elapsedTime", time.Since(begin))
 	}
 
 	// begin

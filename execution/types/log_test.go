@@ -240,9 +240,9 @@ func TestFilterLogsTopics(t *testing.T) {
 		if !reflect.DeepEqual(ares, v.want) {
 			t.Errorf("Fail %s, got %v want %v", name, ares, v.want)
 		}
-		old_res := testFLExtractAddress(v.input.FilterOld(map[common.Address]struct{}{}, v.filter))
-		if !reflect.DeepEqual(old_res, v.want) {
-			t.Errorf("Fail Old %s, got %v want %v", name, old_res, v.want)
+		oldRes := testFLExtractAddress(v.input.Filter(map[common.Address]struct{}{}, v.filter, 0))
+		if !reflect.DeepEqual(oldRes, v.want) {
+			t.Errorf("Fail Old %s, got %v want %v", name, oldRes, v.want)
 		}
 	}
 }
@@ -252,4 +252,55 @@ func testFLExtractAddress(xs Logs) (o []common.Address) {
 		o = append(o, v.Address)
 	}
 	return
+}
+
+// TestFilterWithTopicMapEquivalence verifies that FilterWithTopicMap(addrMap, BuildTopicMap(topics), maxLogs)
+// produces identical results to Filter(addrMap, topics, maxLogs) for all topic shapes,
+// including wildcard positions (empty slices → nil map entry) and maxLogs limits.
+func TestFilterWithTopicMapEquivalence(t *testing.T) {
+	t.Parallel()
+
+	var (
+		A common.Hash = [32]byte{1}
+		B common.Hash = [32]byte{2}
+		C common.Hash = [32]byte{3}
+		D common.Hash = [32]byte{4}
+
+		a1 common.Address = [20]byte{1}
+		a2 common.Address = [20]byte{2}
+		a3 common.Address = [20]byte{3}
+		a4 common.Address = [20]byte{4}
+		a5 common.Address = [20]byte{5}
+	)
+
+	logs := Logs{
+		{Address: a1, Topics: []common.Hash{A, B, C}},
+		{Address: a2, Topics: []common.Hash{A, C, D}},
+		{Address: a3, Topics: []common.Hash{B, B}},
+		{Address: a4, Topics: []common.Hash{A, B}},
+		{Address: a5, Topics: []common.Hash{C}},
+	}
+	addrMap := map[common.Address]struct{}{}
+
+	cases := []struct {
+		name    string
+		topics  [][]common.Hash
+		maxLogs uint64
+	}{
+		{"no topics", [][]common.Hash{}, 0},
+		{"all wildcards", [][]common.Hash{{}, {}, {}}, 0},
+		{"exact match slot 0", [][]common.Hash{{A}}, 0},
+		{"wildcard slot 0, exact slot 1", [][]common.Hash{{}, {B}}, 0},
+		{"alternatives in slot 0", [][]common.Hash{{A, B}}, 0},
+		{"wildcard in middle", [][]common.Hash{{A}, {}, {C}}, 0},
+		{"maxLogs limit", [][]common.Hash{{A}}, 1},
+	}
+
+	for _, tc := range cases {
+		want := logs.Filter(addrMap, tc.topics, tc.maxLogs)
+		got := logs.FilterWithTopicMap(addrMap, BuildTopicMap(tc.topics), tc.maxLogs)
+		if !reflect.DeepEqual(want, got) {
+			t.Errorf("case %q: Filter=%v FilterWithTopicMap=%v", tc.name, testFLExtractAddress(want), testFLExtractAddress(got))
+		}
+	}
 }

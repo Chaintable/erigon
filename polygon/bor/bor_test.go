@@ -20,9 +20,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"math/big"
 	"testing"
 
+	"github.com/holiman/uint256"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/mock/gomock"
 
@@ -31,11 +31,12 @@ import (
 	"github.com/erigontech/erigon/common/log/v3"
 	"github.com/erigontech/erigon/db/kv/prune"
 	"github.com/erigontech/erigon/execution/chain"
+	"github.com/erigontech/erigon/execution/execmodule/execmoduletester"
 	"github.com/erigontech/erigon/execution/protocol/rules"
 	"github.com/erigontech/erigon/execution/rlp"
 	"github.com/erigontech/erigon/execution/tests/blockgen"
-	"github.com/erigontech/erigon/execution/tests/mock"
 	"github.com/erigontech/erigon/execution/types"
+	"github.com/erigontech/erigon/execution/types/accounts"
 	"github.com/erigontech/erigon/node/gointerfaces/sentryproto"
 	"github.com/erigontech/erigon/p2p/protocols/eth"
 	"github.com/erigontech/erigon/polygon/bor"
@@ -145,7 +146,7 @@ func (r headerReader) GetHeaderByHash(common.Hash) *types.Header {
 	return nil
 }
 
-func (r headerReader) GetTd(common.Hash, uint64) *big.Int {
+func (r headerReader) GetTd(common.Hash, uint64) *uint256.Int {
 	return nil
 }
 
@@ -165,7 +166,7 @@ func (c *spanner) CommitSpan(heimdallSpan heimdall.Span, syscall rules.SystemCal
 }
 
 type validator struct {
-	*mock.MockSentry
+	*execmoduletester.ExecModuleTester
 	heimdall *testHeimdall
 	blocks   map[uint64]*types.Block
 }
@@ -234,13 +235,13 @@ func newValidator(t *testing.T, testHeimdall *testHeimdall, blocks map[uint64]*t
 	bridgeReader.EXPECT().EventsWithinTime(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, nil).AnyTimes()
 	validatorKey, err := crypto.GenerateKey()
 	require.NoError(t, err)
-	validatorAddress := crypto.PubkeyToAddress(validatorKey.PublicKey)
+	validatorAddress := accounts.InternAddress(crypto.PubkeyToAddress(validatorKey.PublicKey))
 	bor := bor.New(
 		testHeimdall.chainConfig,
 		nil, /* blockReader */
 		&spanner{
 			ChainSpanner:     bor.NewChainSpanner(borabi.ValidatorSetContractABI(), testHeimdall.chainConfig, false, logger),
-			validatorAddress: validatorAddress,
+			validatorAddress: validatorAddress.Value(),
 		},
 		stateReceiver,
 		logger,
@@ -257,7 +258,7 @@ func newValidator(t *testing.T, testHeimdall *testHeimdall, blocks map[uint64]*t
 		testHeimdall.validatorSet = heimdall.NewValidatorSet([]*heimdall.Validator{
 			{
 				ID:               1,
-				Address:          validatorAddress,
+				Address:          validatorAddress.Value(),
 				VotingPower:      1000,
 				ProposerPriority: 1,
 			},
@@ -266,7 +267,7 @@ func newValidator(t *testing.T, testHeimdall *testHeimdall, blocks map[uint64]*t
 		testHeimdall.validatorSet.UpdateWithChangeSet([]*heimdall.Validator{
 			{
 				ID:               uint64(len(testHeimdall.validatorSet.Validators) + 1),
-				Address:          validatorAddress,
+				Address:          validatorAddress.Value(),
 				VotingPower:      1000,
 				ProposerPriority: 1,
 			},
@@ -285,12 +286,18 @@ func newValidator(t *testing.T, testHeimdall *testHeimdall, blocks map[uint64]*t
 		}).
 		AnyTimes()
 
-	bor.Authorize(validatorAddress, func(_ common.Address, mimeType string, message []byte) ([]byte, error) {
+	bor.Authorize(validatorAddress, func(_ accounts.Address, mimeType string, message []byte) ([]byte, error) {
 		return crypto.Sign(crypto.Keccak256(message), validatorKey)
 	})
 
 	return validator{
-		mock.MockWithEverything(t, &types.Genesis{Config: testHeimdall.chainConfig}, validatorKey, prune.DefaultMode, bor, 1024, false, false),
+		execmoduletester.New(
+			t,
+			execmoduletester.WithGenesisSpec(&types.Genesis{Config: testHeimdall.chainConfig}),
+			execmoduletester.WithKey(validatorKey),
+			execmoduletester.WithPruneMode(prune.DefaultMode),
+			execmoduletester.WithEngine(bor),
+		),
 		testHeimdall,
 		blocks,
 	}
@@ -398,6 +405,9 @@ func testVerify(t *testing.T, noValidators int, chainLength int) {
 }
 
 func TestSendBlock(t *testing.T) {
+	if testing.Short() {
+		t.Skip("slow test")
+	}
 	heimdall := newTestHeimdall(polychain.BorDevnet.Config)
 	blocks := map[uint64]*types.Block{}
 
@@ -424,7 +434,7 @@ func TestSendBlock(t *testing.T) {
 
 	b, err := rlp.EncodeToBytes(&eth.NewBlockPacket{
 		Block: sealedBlocks[0],
-		TD:    big.NewInt(1), // This is ignored anyway
+		TD:    *uint256.NewInt(1), // This is ignored anyway
 	})
 
 	if err != nil {

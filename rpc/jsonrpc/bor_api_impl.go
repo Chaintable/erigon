@@ -23,6 +23,7 @@ import (
 	"github.com/erigontech/erigon/common"
 	"github.com/erigontech/erigon/db/rawdb"
 	"github.com/erigontech/erigon/execution/types"
+	"github.com/erigontech/erigon/execution/types/accounts"
 	"github.com/erigontech/erigon/polygon/heimdall"
 	"github.com/erigontech/erigon/rpc"
 	"github.com/erigontech/erigon/rpc/rpchelper"
@@ -61,7 +62,7 @@ func (api *BorImpl) GetSnapshot(number *rpc.BlockNumber) (*Snapshot, error) {
 	if number == nil || *number == rpc.LatestBlockNumber {
 		header = rawdb.ReadCurrentHeader(tx)
 	} else {
-		header, _ = getHeaderByNumber(ctx, *number, api, tx)
+		header, _ = api.headerByNumber(ctx, *number, tx)
 	}
 	// Ensure we have an actually valid block
 	if header == nil {
@@ -81,18 +82,18 @@ func (api *BorImpl) GetSnapshot(number *rpc.BlockNumber) (*Snapshot, error) {
 }
 
 // GetAuthor retrieves the author a block.
-func (api *BorImpl) GetAuthor(blockNrOrHash *rpc.BlockNumberOrHash) (*common.Address, error) {
+func (api *BorImpl) GetAuthor(blockNrOrHash *rpc.BlockNumberOrHash) (accounts.Address, error) {
 	// init rules engine
 	borEngine, err := api.bor()
 
 	if err != nil {
-		return nil, err
+		return accounts.NilAddress, err
 	}
 
 	ctx := context.Background()
 	tx, err := api.db.BeginTemporalRo(ctx)
 	if err != nil {
-		return nil, err
+		return accounts.NilAddress, err
 	}
 	defer tx.Rollback()
 
@@ -103,7 +104,7 @@ func (api *BorImpl) GetAuthor(blockNrOrHash *rpc.BlockNumberOrHash) (*common.Add
 	if blockNrOrHash == nil {
 		latestBlockNum, err2 := rpchelper.GetLatestBlockNumber(tx)
 		if err2 != nil {
-			return nil, err2
+			return accounts.NilAddress, err2
 		}
 		header, err = api._blockReader.HeaderByNumber(ctx, tx, latestBlockNum)
 	} else {
@@ -118,12 +119,12 @@ func (api *BorImpl) GetAuthor(blockNrOrHash *rpc.BlockNumberOrHash) (*common.Add
 
 	// Ensure we have an actually valid block and return its snapshot
 	if header == nil || err != nil {
-		return nil, errUnknownBlock
+		return accounts.NilAddress, errUnknownBlock
 	}
 
 	author, err := borEngine.Author(header)
 
-	return &author, err
+	return author, err
 }
 
 // GetSnapshotAtHash retrieves the state snapshot at a given block.
@@ -137,7 +138,7 @@ func (api *BorImpl) GetSnapshotAtHash(hash common.Hash) (*Snapshot, error) {
 	defer tx.Rollback()
 
 	// Retreive the header
-	header, err := getHeaderByHash(ctx, api, tx, hash)
+	header, err := api.headerByHash(ctx, hash, tx)
 	if err != nil {
 		return nil, err
 	}
@@ -175,7 +176,7 @@ func (api *BorImpl) GetSigners(number *rpc.BlockNumber) ([]common.Address, error
 	if number == nil || *number == rpc.LatestBlockNumber {
 		header = rawdb.ReadCurrentHeader(tx)
 	} else {
-		header, _ = getHeaderByNumber(ctx, *number, api, tx)
+		header, _ = api.headerByNumber(ctx, *number, tx)
 	}
 	// Ensure we have an actually valid block
 	if header == nil {
@@ -200,7 +201,7 @@ func (api *BorImpl) GetSignersAtHash(hash common.Hash) ([]common.Address, error)
 	defer tx.Rollback()
 
 	// Retrieve the header
-	header, _ := getHeaderByHash(ctx, api, tx, hash)
+	header, _ := api.headerByHash(ctx, hash, tx)
 
 	// Ensure we have an actually valid block
 	if header == nil {
@@ -319,11 +320,11 @@ func (api *BorImpl) GetSnapshotProposer(blockNrOrHash *rpc.BlockNumberOrHash) (c
 			if blockNr == rpc.LatestBlockNumber {
 				header = rawdb.ReadCurrentHeader(tx)
 			} else {
-				header, err = getHeaderByNumber(ctx, blockNr, api, tx)
+				header, err = api.headerByNumber(ctx, blockNr, tx)
 			}
 		} else {
 			if blockHash, ok := blockNrOrHash.Hash(); ok {
-				header, err = getHeaderByHash(ctx, api, tx, blockHash)
+				header, err = api.headerByHash(ctx, blockHash, tx)
 			}
 		}
 	}
@@ -357,11 +358,11 @@ func (api *BorImpl) GetSnapshotProposerSequence(blockNrOrHash *rpc.BlockNumberOr
 			if blockNr == rpc.LatestBlockNumber {
 				header = rawdb.ReadCurrentHeader(tx)
 			} else {
-				header, err = getHeaderByNumber(ctx, blockNr, api, tx)
+				header, err = api.headerByNumber(ctx, blockNr, tx)
 			}
 		} else {
 			if blockHash, ok := blockNrOrHash.Hash(); ok {
-				header, err = getHeaderByHash(ctx, api, tx, blockHash)
+				header, err = api.headerByHash(ctx, blockHash, tx)
 			}
 		}
 	}
@@ -378,7 +379,7 @@ func (api *BorImpl) GetSnapshotProposerSequence(blockNrOrHash *rpc.BlockNumberOr
 
 	var difficulties = make(map[common.Address]uint64)
 
-	proposer := validatorSet.GetProposer().Address
+	proposer := accounts.InternAddress(validatorSet.GetProposer().Address)
 	proposerIndex, _ := validatorSet.GetByAddress(proposer)
 
 	signers := validatorSet.Signers()

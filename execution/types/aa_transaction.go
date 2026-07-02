@@ -3,7 +3,6 @@ package types
 import (
 	"bytes"
 	"errors"
-	"fmt"
 	"io"
 	"math/big"
 
@@ -12,9 +11,10 @@ import (
 	"github.com/erigontech/erigon/common"
 	"github.com/erigontech/erigon/execution/abi"
 	"github.com/erigontech/erigon/execution/chain"
-	"github.com/erigontech/erigon/execution/protocol/fixedgas"
+	"github.com/erigontech/erigon/execution/protocol/mdgas"
 	"github.com/erigontech/erigon/execution/protocol/params"
 	"github.com/erigontech/erigon/execution/rlp"
+	"github.com/erigontech/erigon/execution/types/accounts"
 	"github.com/erigontech/erigon/node/gointerfaces/typesproto"
 )
 
@@ -27,8 +27,8 @@ const (
 
 const AA_GAS_PENALTY_PCT = 10
 
-var AA_ENTRY_POINT = common.HexToAddress("0x0000000000000000000000000000000000007560")
-var AA_SENDER_CREATOR = common.HexToAddress("0x00000000000000000000000000000000ffff7560")
+var AA_ENTRY_POINT = accounts.InternAddress(common.HexToAddress("0x0000000000000000000000000000000000007560"))
+var AA_SENDER_CREATOR = accounts.InternAddress(common.HexToAddress("0x00000000000000000000000000000000ffff7560"))
 
 type AccountAbstractionTransaction struct {
 	TransactionMisc
@@ -39,7 +39,7 @@ type AccountAbstractionTransaction struct {
 	GasLimit   uint64
 	AccessList AccessList
 
-	SenderAddress               *common.Address
+	SenderAddress               accounts.Address
 	SenderValidationData        []byte
 	ExecutionData               []byte
 	Paymaster                   *common.Address
@@ -72,19 +72,19 @@ func (tx *AccountAbstractionTransaction) Protected() bool {
 	return true
 }
 
-func (tx *AccountAbstractionTransaction) Sender(signer Signer) (common.Address, error) {
-	return *tx.SenderAddress, nil
+func (tx *AccountAbstractionTransaction) Sender(signer Signer) (accounts.Address, error) {
+	return tx.SenderAddress, nil
 }
 
-func (tx *AccountAbstractionTransaction) cachedSender() (common.Address, bool) {
-	return *tx.SenderAddress, true
+func (tx *AccountAbstractionTransaction) cachedSender() (accounts.Address, bool) {
+	return tx.SenderAddress, true
 }
 
-func (tx *AccountAbstractionTransaction) GetSender() (common.Address, bool) {
-	return *tx.SenderAddress, true
+func (tx *AccountAbstractionTransaction) GetSender() (accounts.Address, bool) {
+	return tx.SenderAddress, true
 }
 
-func (tx *AccountAbstractionTransaction) SetSender(address common.Address) {
+func (tx *AccountAbstractionTransaction) SetSender(address accounts.Address) {
 }
 
 func (tx *AccountAbstractionTransaction) IsContractDeploy() bool {
@@ -106,25 +106,8 @@ func (tx *AccountAbstractionTransaction) GetPrice() *uint256.Int {
 	return tx.Tip
 }
 
-func (tx *AccountAbstractionTransaction) GetTip() *uint256.Int {
-	return tx.Tip
-}
-
-func (tx *AccountAbstractionTransaction) GetEffectiveGasTip(baseFee *uint256.Int) *uint256.Int {
-	if baseFee == nil {
-		return tx.GetTip()
-	}
-	gasFeeCap := tx.GetFeeCap()
-	// return 0 because effectiveFee cant be < 0
-	if gasFeeCap.Lt(baseFee) {
-		return uint256.NewInt(0)
-	}
-	effectiveFee := new(uint256.Int).Sub(gasFeeCap, baseFee)
-	if tx.GetTip().Lt(effectiveFee) {
-		return tx.GetTip()
-	} else {
-		return effectiveFee
-	}
+func (tx *AccountAbstractionTransaction) GetEffectiveGasTip(baseFee *uint256.Int) uint256.Int {
+	return CalcEffectiveGasTip(baseFee, tx.GetTipCap, tx.GetFeeCap)
 }
 
 func (tx *AccountAbstractionTransaction) GetFeeCap() *uint256.Int {
@@ -136,7 +119,7 @@ func (tx *AccountAbstractionTransaction) GetGasLimit() uint64 {
 }
 
 func (tx *AccountAbstractionTransaction) GetTipCap() *uint256.Int {
-	return uint256.NewInt(0)
+	return tx.Tip
 }
 
 func (tx *AccountAbstractionTransaction) GetBlobHashes() []common.Hash {
@@ -163,9 +146,9 @@ func (tx *AccountAbstractionTransaction) Type() byte {
 	return AccountAbstractionTxType
 }
 
-func (tx *AccountAbstractionTransaction) AsMessage(s Signer, baseFee *big.Int, rules *chain.Rules) (*Message, error) {
+func (tx *AccountAbstractionTransaction) AsMessage(s Signer, baseFee *uint256.Int, rules *chain.Rules) (*Message, error) {
 	return &Message{
-		to:         nil,
+		to:         accounts.NilAddress,
 		gasPrice:   *tx.FeeCap,
 		blobHashes: []common.Hash{},
 	}, nil
@@ -179,7 +162,7 @@ func (tx *AccountAbstractionTransaction) Hash() common.Hash {
 	if hash := tx.hash.Load(); hash != nil {
 		return *hash
 	}
-	hash := prefixedRlpHash(AccountAbstractionTxType, []interface{}{
+	hash := prefixedRlpHash(AccountAbstractionTxType, []any{
 		tx.ChainID,
 		tx.NonceKey, tx.Nonce,
 		tx.SenderAddress, tx.SenderValidationData,
@@ -198,8 +181,8 @@ func (tx *AccountAbstractionTransaction) Hash() common.Hash {
 	return hash
 }
 
-func (tx *AccountAbstractionTransaction) SigningHash(chainID *big.Int) common.Hash {
-	hash := prefixedRlpHash(AccountAbstractionTxType, []interface{}{
+func (tx *AccountAbstractionTransaction) SigningHash(chainID *uint256.Int) common.Hash {
+	hash := prefixedRlpHash(AccountAbstractionTxType, []any{
 		chainID,
 		tx.NonceKey, tx.Nonce,
 		tx.SenderAddress, tx.SenderValidationData,
@@ -221,17 +204,12 @@ func (tx *AccountAbstractionTransaction) RawSignatureValues() (*uint256.Int, *ui
 }
 
 func (tx *AccountAbstractionTransaction) payloadSize() (payloadSize, accessListLen, authorizationsLen int) {
-	payloadSize++
-	payloadSize += rlp.Uint256LenExcludingHead(tx.ChainID)
+	payloadSize += rlp.Uint256Len(*tx.ChainID)
+	payloadSize += rlp.Uint256Len(*tx.NonceKey)
+	payloadSize += rlp.U64Len(tx.Nonce)
 
 	payloadSize++
-	payloadSize += rlp.Uint256LenExcludingHead(tx.NonceKey)
-
-	payloadSize++
-	payloadSize += rlp.IntLenExcludingHead(tx.Nonce)
-
-	payloadSize++
-	if tx.SenderAddress != nil {
+	if !tx.SenderAddress.IsNil() {
 		payloadSize += 20
 	}
 
@@ -250,29 +228,14 @@ func (tx *AccountAbstractionTransaction) payloadSize() (payloadSize, accessListL
 	}
 
 	payloadSize += rlp.StringLen(tx.PaymasterData)
-
 	payloadSize += rlp.StringLen(tx.ExecutionData)
-
-	payloadSize++
-	payloadSize += rlp.Uint256LenExcludingHead(tx.BuilderFee)
-
-	payloadSize++
-	payloadSize += rlp.Uint256LenExcludingHead(tx.Tip)
-
-	payloadSize++
-	payloadSize += rlp.Uint256LenExcludingHead(tx.FeeCap)
-
-	payloadSize++
-	payloadSize += rlp.IntLenExcludingHead(tx.ValidationGasLimit)
-
-	payloadSize++
-	payloadSize += rlp.IntLenExcludingHead(tx.PaymasterValidationGasLimit)
-
-	payloadSize++
-	payloadSize += rlp.IntLenExcludingHead(tx.PostOpGasLimit)
-
-	payloadSize++
-	payloadSize += rlp.IntLenExcludingHead(tx.GasLimit)
+	payloadSize += rlp.Uint256Len(*tx.BuilderFee)
+	payloadSize += rlp.Uint256Len(*tx.Tip)
+	payloadSize += rlp.Uint256Len(*tx.FeeCap)
+	payloadSize += rlp.U64Len(tx.ValidationGasLimit)
+	payloadSize += rlp.U64Len(tx.PaymasterValidationGasLimit)
+	payloadSize += rlp.U64Len(tx.PostOpGasLimit)
+	payloadSize += rlp.U64Len(tx.GasLimit)
 
 	accessListLen = accessListSize(tx.AccessList)
 	payloadSize += rlp.ListPrefixLen(accessListLen) + accessListLen
@@ -292,10 +255,10 @@ func (tx *AccountAbstractionTransaction) EncodingSize() int {
 func (tx *AccountAbstractionTransaction) EncodeRLP(w io.Writer) error {
 	payloadSize, accessListLen, authorizationsLen := tx.payloadSize()
 	envelopSize := 1 + rlp.ListPrefixLen(payloadSize) + payloadSize
-	b := newEncodingBuf()
-	defer pooledBuf.Put(b)
+	b := rlp.NewEncodingBuf()
+	defer b.Release()
 	// encode envelope size
-	if err := rlp.EncodeStringSizePrefix(envelopSize, w, b[:]); err != nil {
+	if err := rlp.EncodeStringPrefix(envelopSize, w, b[:]); err != nil {
 		return err
 	}
 	// encode TxType
@@ -313,23 +276,29 @@ func (tx *AccountAbstractionTransaction) EncodeRLP(w io.Writer) error {
 
 func (tx *AccountAbstractionTransaction) encodePayload(w io.Writer, b []byte, payloadSize, accessListLen, authorizationsLen int) error {
 	// prefix
-	if err := rlp.EncodeStructSizePrefix(payloadSize, w, b); err != nil {
+	if err := rlp.EncodeListPrefix(payloadSize, w, b); err != nil {
 		return err
 	}
 
-	if err := rlp.EncodeUint256(tx.ChainID, w, b); err != nil {
+	if err := rlp.EncodeUint256(*tx.ChainID, w, b); err != nil {
 		return err
 	}
 
-	if err := rlp.EncodeUint256(tx.NonceKey, w, b); err != nil {
+	if err := rlp.EncodeUint256(*tx.NonceKey, w, b); err != nil {
 		return err
 	}
 
-	if err := rlp.EncodeInt(tx.Nonce, w, b); err != nil {
+	if err := rlp.EncodeU64(tx.Nonce, w, b); err != nil {
 		return err
 	}
 
-	if err := rlp.EncodeOptionalAddress(tx.SenderAddress, w, b); err != nil {
+	var senderAddress *common.Address
+	if !tx.SenderAddress.IsNil() {
+		senderValue := tx.SenderAddress.Value()
+		senderAddress = &senderValue
+
+	}
+	if err := EncodeOptionalAddress(senderAddress, w, b); err != nil {
 		return err
 	}
 
@@ -337,7 +306,7 @@ func (tx *AccountAbstractionTransaction) encodePayload(w io.Writer, b []byte, pa
 		return err
 	}
 
-	if err := rlp.EncodeOptionalAddress(tx.Deployer, w, b); err != nil {
+	if err := EncodeOptionalAddress(tx.Deployer, w, b); err != nil {
 		return err
 	}
 
@@ -345,7 +314,7 @@ func (tx *AccountAbstractionTransaction) encodePayload(w io.Writer, b []byte, pa
 		return err
 	}
 
-	if err := rlp.EncodeOptionalAddress(tx.Paymaster, w, b); err != nil {
+	if err := EncodeOptionalAddress(tx.Paymaster, w, b); err != nil {
 		return err
 	}
 
@@ -357,36 +326,36 @@ func (tx *AccountAbstractionTransaction) encodePayload(w io.Writer, b []byte, pa
 		return err
 	}
 
-	if err := rlp.EncodeUint256(tx.BuilderFee, w, b); err != nil {
+	if err := rlp.EncodeUint256(*tx.BuilderFee, w, b); err != nil {
 		return err
 	}
 
-	if err := rlp.EncodeUint256(tx.Tip, w, b); err != nil {
+	if err := rlp.EncodeUint256(*tx.Tip, w, b); err != nil {
 		return err
 	}
 
-	if err := rlp.EncodeUint256(tx.FeeCap, w, b); err != nil {
+	if err := rlp.EncodeUint256(*tx.FeeCap, w, b); err != nil {
 		return err
 	}
 
-	if err := rlp.EncodeInt(tx.ValidationGasLimit, w, b); err != nil {
+	if err := rlp.EncodeU64(tx.ValidationGasLimit, w, b); err != nil {
 		return err
 	}
 
-	if err := rlp.EncodeInt(tx.PaymasterValidationGasLimit, w, b); err != nil {
+	if err := rlp.EncodeU64(tx.PaymasterValidationGasLimit, w, b); err != nil {
 		return err
 	}
 
-	if err := rlp.EncodeInt(tx.PostOpGasLimit, w, b); err != nil {
+	if err := rlp.EncodeU64(tx.PostOpGasLimit, w, b); err != nil {
 		return err
 	}
 
-	if err := rlp.EncodeInt(tx.GasLimit, w, b); err != nil {
+	if err := rlp.EncodeU64(tx.GasLimit, w, b); err != nil {
 		return err
 	}
 
 	// prefix
-	if err := rlp.EncodeStructSizePrefix(accessListLen, w, b); err != nil {
+	if err := rlp.EncodeListPrefix(accessListLen, w, b); err != nil {
 		return err
 	}
 	// encode AccessList
@@ -395,7 +364,7 @@ func (tx *AccountAbstractionTransaction) encodePayload(w io.Writer, b []byte, pa
 	}
 
 	// prefix
-	if err := rlp.EncodeStructSizePrefix(authorizationsLen, w, b); err != nil {
+	if err := rlp.EncodeListPrefix(authorizationsLen, w, b); err != nil {
 		return err
 	}
 	// encode Authorizations
@@ -411,59 +380,40 @@ func (tx *AccountAbstractionTransaction) DecodeRLP(s *rlp.Stream) error {
 	if err != nil {
 		return err
 	}
-	var b []byte
 
-	if b, err = s.Uint256Bytes(); err != nil {
-		return err
-	}
-	tx.ChainID = new(uint256.Int).SetBytes(b)
-
-	if b, err = s.Uint256Bytes(); err != nil {
-		return err
-	}
-	tx.NonceKey = new(uint256.Int).SetBytes(b)
-
-	if tx.Nonce, err = s.Uint(); err != nil {
+	tx.ChainID = new(uint256.Int)
+	if err = s.ReadUint256(tx.ChainID); err != nil {
 		return err
 	}
 
-	if b, err = s.Bytes(); err != nil {
+	tx.NonceKey = new(uint256.Int)
+	if err = s.ReadUint256(tx.NonceKey); err != nil {
 		return err
 	}
-	if len(b) != 20 {
-		return fmt.Errorf("wrong size for SenderAddress: %d", len(b))
-	}
-	tx.SenderAddress = &common.Address{}
-	copy((*tx.SenderAddress)[:], b)
 
+	if tx.Nonce, err = s.Uint64(); err != nil {
+		return err
+	}
+
+	var senderAddress common.Address
+	if err = s.ReadBytes(senderAddress[:]); err != nil {
+		return err
+	}
+	tx.SenderAddress = accounts.InternAddress(senderAddress)
 	if tx.SenderValidationData, err = s.Bytes(); err != nil {
 		return err
 	}
 
-	if b, err = s.Bytes(); err != nil {
+	if err = DecodeOptionalAddress(&tx.Deployer, s); err != nil {
 		return err
-	}
-
-	if len(b) == 20 {
-		tx.Deployer = &common.Address{}
-		copy((*tx.Deployer)[:], b)
-	} else if len(b) != 0 {
-		return fmt.Errorf("wrong size for Deployer: %d", len(b))
 	}
 
 	if tx.DeployerData, err = s.Bytes(); err != nil {
 		return err
 	}
 
-	if b, err = s.Bytes(); err != nil {
+	if err = DecodeOptionalAddress(&tx.Paymaster, s); err != nil {
 		return err
-	}
-
-	if len(b) == 20 {
-		tx.Paymaster = &common.Address{}
-		copy((*tx.Paymaster)[:], b)
-	} else if len(b) != 0 {
-		return fmt.Errorf("wrong size for Paymaster: %d", len(b))
 	}
 
 	if tx.PaymasterData, err = s.Bytes(); err != nil {
@@ -474,34 +424,34 @@ func (tx *AccountAbstractionTransaction) DecodeRLP(s *rlp.Stream) error {
 		return err
 	}
 
-	if b, err = s.Uint256Bytes(); err != nil {
-		return err
-	}
-	tx.BuilderFee = new(uint256.Int).SetBytes(b)
-
-	if b, err = s.Uint256Bytes(); err != nil {
-		return err
-	}
-	tx.Tip = new(uint256.Int).SetBytes(b)
-
-	if b, err = s.Uint256Bytes(); err != nil {
-		return err
-	}
-	tx.FeeCap = new(uint256.Int).SetBytes(b)
-
-	if tx.ValidationGasLimit, err = s.Uint(); err != nil {
+	tx.BuilderFee = new(uint256.Int)
+	if err = s.ReadUint256(tx.BuilderFee); err != nil {
 		return err
 	}
 
-	if tx.PaymasterValidationGasLimit, err = s.Uint(); err != nil {
+	tx.Tip = new(uint256.Int)
+	if err = s.ReadUint256(tx.Tip); err != nil {
 		return err
 	}
 
-	if tx.PostOpGasLimit, err = s.Uint(); err != nil {
+	tx.FeeCap = new(uint256.Int)
+	if err = s.ReadUint256(tx.FeeCap); err != nil {
 		return err
 	}
 
-	if tx.GasLimit, err = s.Uint(); err != nil {
+	if tx.ValidationGasLimit, err = s.Uint64(); err != nil {
+		return err
+	}
+
+	if tx.PaymasterValidationGasLimit, err = s.Uint64(); err != nil {
+		return err
+	}
+
+	if tx.PostOpGasLimit, err = s.Uint64(); err != nil {
+		return err
+	}
+
+	if tx.GasLimit, err = s.Uint64(); err != nil {
 		return err
 	}
 
@@ -522,8 +472,8 @@ func (tx *AccountAbstractionTransaction) DecodeRLP(s *rlp.Stream) error {
 
 func (tx *AccountAbstractionTransaction) MarshalBinary(w io.Writer) error {
 	payloadSize, accessListLen, authorizationsLen := tx.payloadSize()
-	b := newEncodingBuf()
-	defer pooledBuf.Put(b)
+	b := rlp.NewEncodingBuf()
+	defer b.Release()
 	// encode TxType
 	b[0] = AccountAbstractionTxType
 	if _, err := w.Write(b[:1]); err != nil {
@@ -542,20 +492,39 @@ func (tx *AccountAbstractionTransaction) PreTransactionGasCost(rules *chain.Rule
 	data = append(data, tx.DeployerData...)
 	data = append(data, tx.ExecutionData...)
 	data = append(data, tx.PaymasterData...)
-	gas, _, overflow := fixedgas.IntrinsicGas(data, uint64(len(tx.AccessList)), uint64(tx.AccessList.StorageKeys()), false, rules.IsHomestead, rules.IsIstanbul, hasEIP3860, rules.IsPrague, true, uint64(len(tx.Authorizations)))
+	intrinsicGasResult, overflow := mdgas.IntrinsicGas(mdgas.IntrinsicGasCalcArgs{
+		Data:              data,
+		AuthorizationsLen: uint64(len(tx.Authorizations)),
+		AccessListLen:     uint64(len(tx.AccessList)),
+		StorageKeysLen:    uint64(tx.AccessList.StorageKeys()),
+		IsEIP2:            rules.IsHomestead,
+		IsEIP2028:         rules.IsIstanbul,
+		IsEIP3860:         hasEIP3860,
+		IsEIP7623:         rules.IsPrague,
+		IsEIP7976:         rules.IsAmsterdam,
+		IsEIP7981:         rules.IsAmsterdam,
+		IsEIP8037:         rules.IsAmsterdam,
+		IsAATxn:           true,
+	})
 
 	if overflow {
 		return 0, errors.New("overflow")
 	}
 
-	return gas, nil
+	return intrinsicGasResult.RegularGas, nil
 }
 
 func (tx *AccountAbstractionTransaction) DeployerFrame(rules *chain.Rules, hasEIP3860 bool) *Message {
 	intrinsicGas, _ := tx.PreTransactionGasCost(rules, hasEIP3860)
 	deployerGasLimit := tx.ValidationGasLimit - intrinsicGas
+	var to accounts.Address
+	if tx.Deployer == nil {
+		to = accounts.NilAddress
+	} else {
+		to = accounts.InternAddress(*tx.Deployer)
+	}
 	return &Message{
-		to:       tx.Deployer,
+		to:       to,
 		from:     AA_SENDER_CREATOR,
 		gasLimit: deployerGasLimit,
 		data:     tx.DeployerData,
@@ -576,16 +545,21 @@ func (tx *AccountAbstractionTransaction) PaymasterPostOp(paymasterContext []byte
 	if err != nil {
 		return nil, errors.New("unable to encode postPaymasterTransaction")
 	}
-
+	var to accounts.Address
+	if tx.Paymaster == nil {
+		to = accounts.NilAddress
+	} else {
+		to = accounts.InternAddress(*tx.Paymaster)
+	}
 	return &Message{
-		to:       tx.Paymaster,
+		to:       to,
 		from:     AA_SENDER_CREATOR,
 		gasLimit: tx.PostOpGasLimit,
 		data:     postOpData,
 	}, nil
 }
 
-func (tx *AccountAbstractionTransaction) PaymasterFrame(chainID *big.Int) (*Message, error) {
+func (tx *AccountAbstractionTransaction) PaymasterFrame(chainID *uint256.Int) (*Message, error) {
 	zeroAddress := common.Address{}
 	if tx.Paymaster == nil || bytes.Equal(zeroAddress[:], tx.Paymaster[:]) {
 		return nil, nil
@@ -601,15 +575,21 @@ func (tx *AccountAbstractionTransaction) PaymasterFrame(chainID *big.Int) (*Mess
 	if err != nil {
 		return nil, err
 	}
+	var to accounts.Address
+	if tx.Paymaster == nil {
+		to = accounts.NilAddress
+	} else {
+		to = accounts.InternAddress(*tx.Paymaster)
+	}
 	return &Message{
-		to:       tx.Paymaster,
+		to:       to,
 		from:     AA_ENTRY_POINT,
 		gasLimit: tx.PaymasterValidationGasLimit,
 		data:     validatePaymasterData,
 	}, nil
 }
 
-func (tx *AccountAbstractionTransaction) ValidationFrame(chainID *big.Int, deploymentGasUsed uint64, rules *chain.Rules, hasEIP3860 bool) (*Message, error) {
+func (tx *AccountAbstractionTransaction) ValidationFrame(chainID *uint256.Int, deploymentGasUsed uint64, rules *chain.Rules, hasEIP3860 bool) (*Message, error) {
 	signingHash := tx.SigningHash(chainID)
 	txAbiEncoding, err := tx.AbiEncode()
 	if err != nil {
@@ -623,7 +603,6 @@ func (tx *AccountAbstractionTransaction) ValidationFrame(chainID *big.Int, deplo
 
 	intrinsicGas, _ := tx.PreTransactionGasCost(rules, hasEIP3860)
 	accountGasLimit := tx.ValidationGasLimit - intrinsicGas - deploymentGasUsed
-
 	return &Message{
 		to:       tx.SenderAddress,
 		from:     AA_ENTRY_POINT,
@@ -632,9 +611,9 @@ func (tx *AccountAbstractionTransaction) ValidationFrame(chainID *big.Int, deplo
 	}, nil
 }
 
-func (tx *AccountAbstractionTransaction) GasPayer() *common.Address {
+func (tx *AccountAbstractionTransaction) GasPayer() accounts.Address {
 	if tx.Paymaster != nil && tx.Paymaster.Cmp(common.Address{}) != 0 {
-		return tx.Paymaster
+		return accounts.InternAddress(*tx.Paymaster)
 	}
 
 	return tx.SenderAddress
@@ -674,7 +653,7 @@ func (tx *AccountAbstractionTransaction) AbiEncode() ([]byte, error) {
 	}
 
 	record := &ABIAccountAbstractTxn{
-		Sender:                      *tx.SenderAddress,
+		Sender:                      tx.SenderAddress.Value(),
 		NonceKey:                    tx.NonceKey.ToBig(),
 		Nonce:                       big.NewInt(int64(tx.Nonce)),
 		ValidationGasLimit:          big.NewInt(int64(tx.ValidationGasLimit)),
@@ -740,7 +719,7 @@ func FromProto(tx *typesproto.AccountAbstractionTransaction) *AccountAbstraction
 		Tip:                         uint256.NewInt(0).SetBytes(tx.Tip),
 		FeeCap:                      uint256.NewInt(0).SetBytes(tx.FeeCap),
 		GasLimit:                    tx.Gas,
-		SenderAddress:               &senderAddress,
+		SenderAddress:               accounts.InternAddress(senderAddress),
 		SenderValidationData:        tx.SenderValidationData,
 		ExecutionData:               tx.ExecutionData,
 		Paymaster:                   paymasterAddress,

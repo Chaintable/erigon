@@ -27,6 +27,7 @@ import (
 
 	"github.com/erigontech/erigon/common"
 	"github.com/erigontech/erigon/common/log/v3"
+	"github.com/erigontech/erigon/execution/types/accounts"
 )
 
 // MaxTotalVotingPower - the maximum allowed total voting power.
@@ -91,7 +92,7 @@ func (v *Validator) Cmp(other *Validator) *Validator {
 		return other
 	}
 
-	result := bytes.Compare(v.Address.Bytes(), other.Address.Bytes())
+	result := bytes.Compare(v.Address[:], other.Address[:])
 
 	if result == 0 {
 		panic("Cannot compare identical validators")
@@ -117,20 +118,10 @@ func (v *Validator) String() string {
 		v.ProposerPriority)
 }
 
-// ValidatorListString returns a prettified validator list for logging purposes.
-func ValidatorListString(vals []*Validator) string {
-	chunks := make([]string, len(vals))
-	for i, val := range vals {
-		chunks[i] = fmt.Sprintf("%s:%d", val.Address, val.VotingPower)
-	}
-
-	return strings.Join(chunks, ",")
-}
-
 // HeaderBytes return header bytes
 func (v *Validator) HeaderBytes() []byte {
 	result := make([]byte, 40)
-	copy(result[:20], v.Address.Bytes())
+	copy(result[:20], v.Address[:])
 	copy(result[20:], v.PowerBytes())
 
 	return result
@@ -154,27 +145,6 @@ func (v *Validator) MinimalVal() MinimalVal {
 	}
 }
 
-// ParseValidators returns validator set bytes
-func ParseValidators(validatorsBytes []byte) ([]*Validator, error) {
-	if len(validatorsBytes)%40 != 0 {
-		return nil, errors.New("invalid validators bytes")
-	}
-
-	result := make([]*Validator, len(validatorsBytes)/40)
-
-	for i := 0; i < len(validatorsBytes); i += 40 {
-		address := make([]byte, 20)
-		power := make([]byte, 20)
-
-		copy(address, validatorsBytes[i:i+20])
-		copy(power, validatorsBytes[i+20:i+40])
-
-		result[i/40] = NewValidator(common.BytesToAddress(address), big.NewInt(0).SetBytes(power).Int64())
-	}
-
-	return result, nil
-}
-
 // ---
 
 // MinimalVal is the minimal validator representation
@@ -183,24 +153,6 @@ type MinimalVal struct {
 	ID          uint64         `json:"ID"`
 	VotingPower uint64         `json:"power"` // TODO add 10^-18 here so that we don't overflow easily
 	Signer      common.Address `json:"signer"`
-}
-
-// SortMinimalValByAddress sorts validators
-func SortMinimalValByAddress(a []MinimalVal) []MinimalVal {
-	sort.Slice(a, func(i, j int) bool {
-		return bytes.Compare(a[i].Signer.Bytes(), a[j].Signer.Bytes()) < 0
-	})
-
-	return a
-}
-
-// ValidatorsToMinimalValidators converts array of validators to minimal validators
-func ValidatorsToMinimalValidators(vals []Validator) (minVals []MinimalVal) {
-	for _, val := range vals {
-		minVals = append(minVals, val.MinimalVal())
-	}
-
-	return
 }
 
 // ValidatorSet represent a set of *Validator at a given height.
@@ -220,7 +172,7 @@ type ValidatorSet struct {
 
 	// cached (unexported)
 	totalVotingPower int64
-	validatorsMap    map[common.Address]int // address -> index
+	validatorsMap    map[accounts.Address]int // address -> index
 }
 
 // NewValidatorSet initializes a ValidatorSet by copying over the
@@ -416,10 +368,10 @@ func validatorListCopy(valsList []*Validator) []*Validator {
 // Copy each validator into a new ValidatorSet.
 func (vals *ValidatorSet) Copy() *ValidatorSet {
 	valCopy := validatorListCopy(vals.Validators)
-	validatorsMap := make(map[common.Address]int, len(vals.Validators))
+	validatorsMap := make(map[accounts.Address]int, len(vals.Validators))
 
 	for i, val := range valCopy {
-		validatorsMap[val.Address] = i
+		validatorsMap[accounts.InternAddress(val.Address)] = i
 	}
 
 	return &ValidatorSet{
@@ -432,7 +384,7 @@ func (vals *ValidatorSet) Copy() *ValidatorSet {
 
 // HasAddress returns true if address given is in the validator set, false -
 // otherwise.
-func (vals *ValidatorSet) HasAddress(address common.Address) bool {
+func (vals *ValidatorSet) HasAddress(address accounts.Address) bool {
 	_, ok := vals.validatorsMap[address]
 
 	return ok
@@ -440,7 +392,7 @@ func (vals *ValidatorSet) HasAddress(address common.Address) bool {
 
 // GetByAddress returns an index of the validator with address and validator
 // itself if found. Otherwise, -1 and nil are returned.
-func (vals *ValidatorSet) GetByAddress(address common.Address) (index int, val *Validator) {
+func (vals *ValidatorSet) GetByAddress(address accounts.Address) (index int, val *Validator) {
 	idx, ok := vals.validatorsMap[address]
 	if ok {
 		return idx, vals.Validators[idx].Copy()
@@ -459,7 +411,7 @@ func (vals *ValidatorSet) GetByIndex(index int) (address []byte, val *Validator)
 
 	val = vals.Validators[index]
 
-	return val.Address.Bytes(), val.Copy()
+	return val.Address[:], val.Copy()
 }
 
 // Size returns the length of the validator set.
@@ -513,7 +465,7 @@ func (vals *ValidatorSet) GetProposer() (proposer *Validator) {
 func (vals *ValidatorSet) findProposer() *Validator {
 	var proposer *Validator
 	for _, val := range vals.Validators {
-		if proposer == nil || !bytes.Equal(val.Address.Bytes(), proposer.Address.Bytes()) {
+		if proposer == nil || !bytes.Equal(val.Address[:], proposer.Address[:]) {
 			proposer = proposer.Cmp(val)
 		}
 	}
@@ -568,7 +520,7 @@ func processChanges(origChanges []*Validator) (updates, removals []*Validator, e
 
 	// Scan changes by address and append valid validators to updates or removals lists.
 	for i, valUpdate := range changes {
-		if i > 0 && bytes.Equal(valUpdate.Address.Bytes(), prevAddr.Bytes()) {
+		if i > 0 && bytes.Equal(valUpdate.Address[:], prevAddr[:]) {
 			err = fmt.Errorf("duplicate entry %v in %v", valUpdate, changes)
 			return nil, nil, err
 		}
@@ -611,7 +563,7 @@ func verifyUpdates(updates []*Validator, vals *ValidatorSet) (updatedTotalVoting
 	updatedTotalVotingPower = vals.TotalVotingPower()
 
 	for _, valUpdate := range updates {
-		address := valUpdate.Address
+		address := accounts.InternAddress(valUpdate.Address)
 		_, val := vals.GetByAddress(address)
 
 		if val == nil {
@@ -643,7 +595,7 @@ func verifyUpdates(updates []*Validator, vals *ValidatorSet) (updatedTotalVoting
 // No changes are made to the validator set 'vals'.
 func computeNewPriorities(updates []*Validator, vals *ValidatorSet, updatedTotalVotingPower int64) {
 	for _, valUpdate := range updates {
-		address := valUpdate.Address
+		address := accounts.InternAddress(valUpdate.Address)
 		_, val := vals.GetByAddress(address)
 
 		if val == nil {
@@ -673,13 +625,13 @@ func (vals *ValidatorSet) applyUpdates(updates []*Validator) {
 	i := 0
 
 	for len(existing) > 0 && len(updates) > 0 {
-		if bytes.Compare(existing[0].Address.Bytes(), updates[0].Address.Bytes()) < 0 { // unchanged validator
+		if bytes.Compare(existing[0].Address[:], updates[0].Address[:]) < 0 { // unchanged validator
 			merged[i] = existing[0]
 			existing = existing[1:]
 		} else {
 			// Apply add or update.
 			merged[i] = updates[0]
-			if bytes.Equal(existing[0].Address.Bytes(), updates[0].Address.Bytes()) {
+			if bytes.Equal(existing[0].Address[:], updates[0].Address[:]) {
 				// Validator is present in both, advance existing.
 				existing = existing[1:]
 			}
@@ -708,7 +660,7 @@ func (vals *ValidatorSet) applyUpdates(updates []*Validator) {
 // No changes are made to the validator set 'vals'.
 func verifyRemovals(deletes []*Validator, vals *ValidatorSet) error {
 	for _, valUpdate := range deletes {
-		address := valUpdate.Address
+		address := accounts.InternAddress(valUpdate.Address)
 		_, val := vals.GetByAddress(address)
 
 		if val == nil {
@@ -733,7 +685,7 @@ func (vals *ValidatorSet) applyRemovals(deletes []*Validator) {
 
 	// Loop over deletes until we removed all of them.
 	for len(deletes) > 0 {
-		if bytes.Equal(existing[0].Address.Bytes(), deletes[0].Address.Bytes()) {
+		if bytes.Equal(existing[0].Address[:], deletes[0].Address[:]) {
 			deletes = deletes[1:]
 		} else { // Leave it in the resulting slice.
 			merged[i] = existing[0]
@@ -812,10 +764,10 @@ func (vals *ValidatorSet) updateValidators(updates []*Validator, deletes []*Vali
 }
 
 func (vals *ValidatorSet) UpdateValidatorMap() {
-	vals.validatorsMap = make(map[common.Address]int, len(vals.Validators))
+	vals.validatorsMap = make(map[accounts.Address]int, len(vals.Validators))
 
 	for i, val := range vals.Validators {
-		vals.validatorsMap[val.Address] = i
+		vals.validatorsMap[accounts.InternAddress(val.Address)] = i
 	}
 }
 
@@ -837,7 +789,7 @@ func (vals *ValidatorSet) UpdateWithChangeSet(changes []*Validator) error {
 }
 
 // Difficulty returns the difficulty for a particular signer at the current snapshot number
-func (vals *ValidatorSet) Difficulty(signer common.Address) (uint64, error) {
+func (vals *ValidatorSet) Difficulty(signer accounts.Address) (uint64, error) {
 	indexDiff, err := vals.GetSignerSuccessionNumber(signer, 0)
 	if err != nil {
 		return 0, fmt.Errorf("ValidatorSet.Difficulty: %w", err)
@@ -848,8 +800,8 @@ func (vals *ValidatorSet) Difficulty(signer common.Address) (uint64, error) {
 
 // SafeDifficulty returns the difficulty for a particular signer at the current snapshot number if available,
 // otherwise it returns 1 for empty signer and 0 if it is not in the validator set.
-func (vals *ValidatorSet) SafeDifficulty(signer common.Address) uint64 {
-	if bytes.Equal(signer.Bytes(), common.Address{}.Bytes()) {
+func (vals *ValidatorSet) SafeDifficulty(signer accounts.Address) uint64 {
+	if signer.IsZero() {
 		return 1
 	}
 
@@ -861,20 +813,21 @@ func (vals *ValidatorSet) SafeDifficulty(signer common.Address) uint64 {
 }
 
 // GetSignerSuccessionNumber returns the relative position of signer in terms of the in-turn proposer
-func (vals *ValidatorSet) GetSignerSuccessionNumber(signer common.Address, number uint64) (int, error) {
+func (vals *ValidatorSet) GetSignerSuccessionNumber(signer accounts.Address, number uint64) (int, error) {
 	proposer := vals.GetProposer()
 	if proposer == nil {
 		return -1, &UnauthorizedProposerError{Number: number, Proposer: []byte{}}
 	}
 
-	proposerIndex, _ := vals.GetByAddress(proposer.Address)
+	proposerIndex, _ := vals.GetByAddress(accounts.InternAddress(proposer.Address))
 	if proposerIndex < 0 {
-		return -1, &UnauthorizedProposerError{Number: number, Proposer: proposer.Address.Bytes()}
+		return -1, &UnauthorizedProposerError{Number: number, Proposer: proposer.Address[:]}
 	}
 
 	signerIndex, _ := vals.GetByAddress(signer)
 	if signerIndex < 0 {
-		return -1, &UnauthorizedSignerError{Number: number, Signer: signer.Bytes()}
+		signerValue := signer.Value()
+		return -1, &UnauthorizedSignerError{Number: number, Signer: signerValue[:]}
 	}
 
 	indexDiff := signerIndex - proposerIndex
@@ -891,27 +844,6 @@ func (vals *ValidatorSet) Signers() []common.Address {
 		sigs = append(sigs, sig.Address)
 	}
 	return sigs
-}
-
-//-----------------
-// ErrTooMuchChange
-
-func IsErrTooMuchChange(err error) bool {
-	switch err.(type) {
-	case tooMuchChangeError:
-		return true
-	default:
-		return false
-	}
-}
-
-type tooMuchChangeError struct {
-	got    int64
-	needed int64
-}
-
-func (e tooMuchChangeError) Error() string {
-	return fmt.Sprintf("Invalid commit -- insufficient old voting power: got %v, needed %v", e.got, e.needed)
 }
 
 //----------------
@@ -954,7 +886,7 @@ func (valz ValidatorsByAddress) Len() int {
 }
 
 func (valz ValidatorsByAddress) Less(i, j int) bool {
-	return bytes.Compare(valz[i].Address.Bytes(), valz[j].Address.Bytes()) == -1
+	return bytes.Compare(valz[i].Address[:], valz[j].Address[:]) == -1
 }
 
 func (valz ValidatorsByAddress) Swap(i, j int) {
@@ -1043,7 +975,7 @@ func GetUpdatedValidatorSet(oldValidatorSet *ValidatorSet, newVals []*Validator,
 
 func validatorContains(a []*Validator, x *Validator) (*Validator, bool) {
 	for _, n := range a {
-		if bytes.Equal(n.Address.Bytes(), x.Address.Bytes()) {
+		if bytes.Equal(n.Address[:], x.Address[:]) {
 			return n, true
 		}
 	}

@@ -28,7 +28,7 @@ import (
 
 // Implementation of paticia tree for efficient search of substrings from a dictionary in a given string
 type node struct {
-	val interface{} // value associated with the key
+	val any // value associated with the key
 	n0  *node
 	n1  *node
 	p0  uint32
@@ -287,7 +287,7 @@ func (s *pathWalker) diverge(divergence uint32) {
 	s.tail = 0
 }
 
-func (n *node) insert(key []byte, value interface{}) {
+func (n *node) insert(key []byte, value any) {
 	s := newPathWalker(n)
 	for _, b := range key {
 		divergence := s.transition(b, false /* readonly */)
@@ -298,7 +298,7 @@ func (n *node) insert(key []byte, value interface{}) {
 	s.insert(value)
 }
 
-func (s *pathWalker) insert(value interface{}) {
+func (s *pathWalker) insert(value any) {
 	if s.tail != 0 {
 		s.diverge(0)
 	}
@@ -316,7 +316,7 @@ func (s *pathWalker) insert(value interface{}) {
 	s.n.val = value
 }
 
-func (n *node) get(key []byte) (interface{}, bool) {
+func (n *node) get(key []byte) (any, bool) {
 	s := newPathWalker(n)
 	for _, b := range key {
 		divergence := s.transition(b, true /* readonly */)
@@ -335,35 +335,42 @@ type PatriciaTree struct {
 	root node
 }
 
-func (pt *PatriciaTree) Insert(key []byte, value interface{}) {
+func (pt *PatriciaTree) Insert(key []byte, value any) {
 	//fmt.Printf("%p Insert [%x]\n", pt, key)
 	pt.root.insert(key, value)
 }
 
-func (pt *PatriciaTree) Get(key []byte) (interface{}, bool) {
+func (pt *PatriciaTree) Get(key []byte) (any, bool) {
 	return pt.root.get(key)
 }
 
 type Match struct {
-	Val   interface{}
+	Val   any
 	Start int
 	End   int
 }
 
 type Matches []Match
 
-func (m Matches) Len() int {
-	return len(m)
+func deduplicateMatches(matches Matches) Matches {
+	if len(matches) < 2 {
+		return matches
+	}
+	slices.SortFunc(matches, func(i, j Match) int { return cmp.Compare(i.Start, j.Start) })
+	lastEnd := matches[0].End
+	j := 1
+	for _, m := range matches[1:] {
+		if m.End > lastEnd {
+			matches[j] = m
+			lastEnd = m.End
+			j++
+		}
+	}
+	return matches[:j]
 }
 
-func (m Matches) Less(i, j int) bool {
-	return m[i].Start < m[j].Start
-}
-
-func (m *Matches) Swap(i, j int) {
-	(*m)[i], (*m)[j] = (*m)[j], (*m)[i]
-}
-
+// MatchFinder is the original implementation kept for validation purposes.
+// It's used in fuzz tests to compare results with MatchFinder2.
 type MatchFinder struct {
 	pt      *PatriciaTree
 	s       pathWalker
@@ -383,6 +390,7 @@ type MatchFinder2 struct {
 	sa         []int32
 	lcp        []int32
 	inv        []int32
+	saisBuf    []int32
 	headLen    int
 	tailLen    int
 	side       int // 0, 1, or 2 (if side is not determined yet)
@@ -576,7 +584,7 @@ func (mf2 *MatchFinder2) FindLongestMatches(data []byte) []Match {
 	} else {
 		mf2.sa = mf2.sa[:n]
 	}
-	if err := sais.Sais(data, mf2.sa); err != nil {
+	if err := sais.Sais(data, mf2.sa, &mf2.saisBuf); err != nil {
 		panic(err)
 	}
 	if cap(mf2.inv) < n {
@@ -695,27 +703,7 @@ func (mf2 *MatchFinder2) FindLongestMatches(data []byte) []Match {
 			//fmt.Printf("Added new Match: [%d-%d] [%x]\n", m.Start, m.End, data[m.Start:m.End])
 		}
 	}
-	//fmt.Printf("before sorting %d matches\n", len(mf2.matches))
-	if len(mf2.matches) < 2 {
-		return mf2.matches
-	}
-	//sort.Sort(&mf2.matches)
-	slices.SortFunc(mf2.matches, func(i, j Match) int { return cmp.Compare(i.Start, j.Start) })
-
-	lastEnd := mf2.matches[0].End
-	j := 1
-	for i, m := range mf2.matches {
-		if i > 0 {
-			if m.End > lastEnd {
-				if i != j {
-					mf2.matches[j] = m
-				}
-				lastEnd = m.End
-				j++
-			}
-		}
-	}
-	return mf2.matches[:j]
+	return deduplicateMatches(mf2.matches)
 }
 
 func (mf2 *MatchFinder2) Current() ([]byte, int) {

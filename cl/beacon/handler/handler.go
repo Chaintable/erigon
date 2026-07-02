@@ -38,6 +38,7 @@ import (
 	"github.com/erigontech/erigon/cl/phase1/core/state/lru"
 	"github.com/erigontech/erigon/cl/phase1/execution_client"
 	"github.com/erigontech/erigon/cl/phase1/forkchoice"
+	"github.com/erigontech/erigon/cl/phase1/network/gossip"
 	"github.com/erigontech/erigon/cl/phase1/network/services"
 	"github.com/erigontech/erigon/cl/pool"
 	"github.com/erigontech/erigon/cl/utils/eth_clock"
@@ -62,6 +63,15 @@ type BlobBundle struct {
 	KzgProofs  []common.Bytes48
 }
 
+// selfBuildPayload holds the execution payload and requests built by the local EL
+// during self-build block production. Cached so broadcastBlock can construct the
+// SignedExecutionPayloadEnvelope when the validator publishes the signed block.
+// [New in Gloas:EIP7732]
+type selfBuildPayload struct {
+	Payload           *cltypes.Eth1Block
+	ExecutionRequests *cltypes.ExecutionRequests
+}
+
 type ApiHandler struct {
 	o   sync.Once
 	mux *chi.Mux
@@ -78,7 +88,7 @@ type ApiHandler struct {
 	sentinel             sentinelproto.SentinelClient
 	blobStoage           blob_storage.BlobStorage
 	columnStorage        blob_storage.DataColumnStorage
-	caplinSnapshots      *freezeblocks.CaplinSnapshots
+	caplinSnapshots      caplinBlobSnapshotReader
 	caplinStateSnapshots *snapshotsync.CaplinStateSnapshots
 
 	peerDas das.PeerDas
@@ -113,7 +123,26 @@ type ApiHandler struct {
 	blsToExecutionChangeService      services.BLSToExecutionChangeService
 	proposerSlashingService          services.ProposerSlashingService
 	builderClient                    builder.BuilderClient
+	gossipManager                    gossip.Gossip
 	enableMemoizedHeadState          bool
+
+	// [New in Gloas:EIP7732]
+	epbsPool                   *pool.EpbsPool
+	executionPayloadBidService services.ExecutionPayloadBidService
+	payloadAttestationService  services.PayloadAttestationService
+	proposerPreferencesService services.ProposerPreferencesService
+	// selfBuildPayloads caches the execution payload + requests built by the local
+	// EL during self-build block production, keyed by the execution block hash.
+	// When the validator publishes the signed block, broadcastBlock retrieves the
+	// cached data, wraps it into a SignedExecutionPayloadEnvelope, and broadcasts
+	// it on the execution_payload gossip topic so the block can reach FULL status.
+	selfBuildPayloads *lru.Cache[common.Hash, *selfBuildPayload]
+	// selfBuildEnvelopes caches the unsigned ExecutionPayloadEnvelope by slot so
+	// the validator client can retrieve it via
+	// GET /eth/v1/validator/execution_payload_envelope/{slot}/{builder_index}.
+	// Populated during block production alongside selfBuildPayloads.
+	// [New in Gloas:EIP7732]
+	selfBuildEnvelopes *lru.Cache[uint64, *cltypes.ExecutionPayloadEnvelope]
 }
 
 func NewApiHandler(
@@ -149,15 +178,32 @@ func NewApiHandler(
 	proposerSlashingService services.ProposerSlashingService,
 	builderClient builder.BuilderClient,
 	caplinStateSnapshots *snapshotsync.CaplinStateSnapshots,
+	gossipManager gossip.Gossip,
 	enableMemoizedHeadState bool,
 	peerDas das.PeerDas,
+	epbsPool *pool.EpbsPool,
+	executionPayloadBidService services.ExecutionPayloadBidService,
+	payloadAttestationService services.PayloadAttestationService,
+	proposerPreferencesService services.ProposerPreferencesService,
 ) *ApiHandler {
 	blobBundles, err := lru.New[common.Bytes48, BlobBundle]("blobs", maxBlobBundleCacheSize)
 	if err != nil {
 		panic(err)
 	}
+	var blobSnapshots caplinBlobSnapshotReader
+	if caplinSnapshots != nil {
+		blobSnapshots = caplinSnapshots
+	}
 
 	slotWaitedForAttestationProduction, err := lru.New[uint64, struct{}]("slotWaitedForAttestationProduction", 1024)
+	if err != nil {
+		panic(err)
+	}
+	selfBuildPayloads, err := lru.New[common.Hash, *selfBuildPayload]("selfBuildPayloads", 4)
+	if err != nil {
+		panic(err)
+	}
+	selfBuildEnvelopes, err := lru.New[uint64, *cltypes.ExecutionPayloadEnvelope]("selfBuildEnvelopes", 4)
 	if err != nil {
 		panic(err)
 	}
@@ -177,7 +223,7 @@ func NewApiHandler(
 		caplinStateSnapshots:               caplinStateSnapshots,
 		peerDas:                            peerDas,
 		slotWaitedForAttestationProduction: slotWaitedForAttestationProduction,
-		randaoMixesPool: sync.Pool{New: func() interface{} {
+		randaoMixesPool: sync.Pool{New: func() any {
 			return solid.NewHashVector(int(beaconChainConfig.EpochsPerHistoricalVector))
 		}},
 		sentinel:                         sentinel,
@@ -186,7 +232,7 @@ func NewApiHandler(
 		emitters:                         emitters,
 		blobStoage:                       blobStoage,
 		columnStorage:                    columnStorage,
-		caplinSnapshots:                  caplinSnapshots,
+		caplinSnapshots:                  blobSnapshots,
 		attestationProducer:              attestationProducer,
 		blobBundles:                      blobBundles,
 		engine:                           engine,
@@ -201,7 +247,14 @@ func NewApiHandler(
 		blsToExecutionChangeService:      blsToExecutionChangeService,
 		proposerSlashingService:          proposerSlashingService,
 		builderClient:                    builderClient,
+		gossipManager:                    gossipManager,
 		enableMemoizedHeadState:          enableMemoizedHeadState,
+		epbsPool:                         epbsPool,
+		executionPayloadBidService:       executionPayloadBidService,
+		payloadAttestationService:        payloadAttestationService,
+		proposerPreferencesService:       proposerPreferencesService,
+		selfBuildPayloads:                selfBuildPayloads,
+		selfBuildEnvelopes:               selfBuildEnvelopes,
 	}
 }
 
@@ -288,6 +341,11 @@ func (a *ApiHandler) init() {
 						r.Get("/attestations", beaconhttp.HandleEndpointFunc(a.GetEthV1BeaconPoolAttestations))
 						r.Post("/attestations", a.PostEthV1BeaconPoolAttestations) // deprecate after electra fork
 						r.Post("/sync_committees", a.PostEthV1BeaconPoolSyncCommittees)
+						// [New in Gloas:EIP7732]
+						r.Get("/payload_attestations", beaconhttp.HandleEndpointFunc(a.GetEthV1BeaconPoolPayloadAttestations))
+						r.Post("/payload_attestations", a.PostEthV1BeaconPoolPayloadAttestations)
+						r.Get("/proposer_preferences", beaconhttp.HandleEndpointFunc(a.GetEthV1BeaconPoolProposerPreferences))
+						r.Post("/proposer_preferences", a.PostEthV1BeaconPoolProposerPreferences)
 					})
 					r.Route("/light_client", func(r chi.Router) {
 						r.Get("/bootstrap/{block_id}", beaconhttp.HandleEndpointFunc(a.GetEthV1BeaconLightClientBootstrap))
@@ -296,6 +354,10 @@ func (a *ApiHandler) init() {
 						r.Get("/updates", a.GetEthV1BeaconLightClientUpdates)
 					})
 					r.Get("/blob_sidecars/{block_id}", beaconhttp.HandleEndpointFunc(a.GetEthV1BeaconBlobSidecars))
+					// [New in Gloas:EIP7732]
+					r.Get("/execution_payload_envelope/{block_id}", beaconhttp.HandleEndpointFunc(a.GetEthV1BeaconExecutionPayloadEnvelope))
+					r.Post("/execution_payload_envelope", a.PostEthV1BeaconExecutionPayloadEnvelope)
+					r.Post("/execution_payload_bid", a.PostEthV1BeaconExecutionPayloadBid)
 					r.Route("/states", func(r chi.Router) {
 						r.Route("/{state_id}", func(r chi.Router) {
 							r.Get("/randao", beaconhttp.HandleEndpointFunc(a.getRandao))
@@ -324,6 +386,8 @@ func (a *ApiHandler) init() {
 						r.Post("/attester/{epoch}", beaconhttp.HandleEndpointFunc(a.getAttesterDuties))
 						r.Get("/proposer/{epoch}", beaconhttp.HandleEndpointFunc(a.getDutiesProposer))
 						r.Post("/sync/{epoch}", beaconhttp.HandleEndpointFunc(a.getSyncDuties))
+						// [New in Gloas:EIP7732]
+						r.Post("/ptc/{epoch}", beaconhttp.HandleEndpointFunc(a.PostEthV1ValidatorDutiesPtc))
 					})
 					r.Get("/blinded_blocks/{slot}", http.NotFound) // deprecated
 					r.Get("/attestation_data", beaconhttp.HandleEndpointFunc(a.GetEthV1ValidatorAttestationData))
@@ -335,6 +399,10 @@ func (a *ApiHandler) init() {
 					r.Post("/contribution_and_proofs", a.PostEthV1ValidatorContributionsAndProofs)
 					r.Post("/prepare_beacon_proposer", a.PostEthV1ValidatorPrepareBeaconProposal)
 					r.Post("/liveness/{epoch}", beaconhttp.HandleEndpointFunc(a.liveness))
+					// [New in Gloas:EIP7732]
+					r.Get("/payload_attestation_data/{slot}", beaconhttp.HandleEndpointFunc(a.GetEthV1ValidatorPayloadAttestationData))
+					r.Get("/execution_payload_bid/{slot}/{builder_index}", beaconhttp.HandleEndpointFunc(a.GetEthV1ValidatorExecutionPayloadBid))
+					r.Get("/execution_payload_envelope/{slot}/{builder_index}", beaconhttp.HandleEndpointFunc(a.GetEthV1ValidatorExecutionPayloadEnvelope))
 					if a.routerCfg.Builder {
 						r.Post("/register_validator", beaconhttp.HandleEndpointFunc(a.PostEthV1BuilderRegisterValidator))
 					}
@@ -371,6 +439,9 @@ func (a *ApiHandler) init() {
 			}
 			if a.routerCfg.Validator {
 				r.Route("/validator", func(r chi.Router) {
+					r.Route("/duties", func(r chi.Router) {
+						r.Get("/proposer/{epoch}", beaconhttp.HandleEndpointFunc(a.getDutiesProposerV2))
+					})
 					r.Get("/blocks/{slot}", beaconhttp.HandleEndpointFunc(a.GetEthV3ValidatorBlock)) // deprecate
 					r.Get("/aggregate_attestation", beaconhttp.HandleEndpointFunc(a.GetEthV2ValidatorAggregateAttestation))
 					r.Post("/aggregate_and_proofs", a.PostEthV1ValidatorAggregatesAndProof) // reuse
@@ -379,6 +450,7 @@ func (a *ApiHandler) init() {
 		})
 		if a.routerCfg.Validator {
 			r.Get("/v3/validator/blocks/{slot}", beaconhttp.HandleEndpointFunc(a.GetEthV3ValidatorBlock))
+			r.Get("/v4/validator/blocks/{slot}", beaconhttp.HandleEndpointFunc(a.GetEthV3ValidatorBlock))
 		}
 	})
 }

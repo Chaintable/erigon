@@ -41,6 +41,7 @@ import (
 	dir2 "github.com/erigontech/erigon/common/dir"
 	"github.com/erigontech/erigon/common/log/v3"
 	"github.com/erigontech/erigon/common/math"
+	"github.com/erigontech/erigon/execution/protocol/misc"
 	"github.com/erigontech/erigon/execution/protocol/rules"
 	"github.com/erigontech/erigon/execution/protocol/rules/ethash/ethashcfg"
 	"github.com/erigontech/erigon/execution/types"
@@ -130,8 +131,8 @@ func memoryMapFile(file *os.File, write bool) (mmap.MMap, []uint32, error) {
 	var view []uint32
 	header := (*reflect.SliceHeader)(unsafe.Pointer(&view))
 	header.Data = (*reflect.SliceHeader)(unsafe.Pointer(&mem)).Data
-	header.Len /= 4
-	header.Cap /= 4
+	header.Len = len(mem) / 4
+	header.Cap = cap(mem) / 4
 
 	return mem, view, nil
 }
@@ -155,13 +156,27 @@ func memoryMapAndGenerate(path string, size uint64, lock bool, generator func(bu
 	if err != nil {
 		return nil, nil, nil, err
 	}
+	cleanup := true
+	var mem mmap.MMap
+	defer func() {
+		if !cleanup {
+			return
+		}
+		if mem != nil {
+			_ = mem.Unmap()
+		}
+		if dump != nil {
+			_ = dump.Close()
+		}
+		_ = dir2.RemoveFile(temp)
+	}()
 	if err = dump.Truncate(int64(len(dumpMagic))*4 + int64(size)); err != nil {
 		return nil, nil, nil, err
 	}
 	// Memory map the file for writing and fill it with the generator
-	mem, buffer, err := memoryMapFile(dump, true)
+	buffer := []uint32(nil)
+	mem, buffer, err = memoryMapFile(dump, true)
 	if err != nil {
-		dump.Close()
 		return nil, nil, nil, err
 	}
 	copy(buffer, dumpMagic)
@@ -169,37 +184,44 @@ func memoryMapAndGenerate(path string, size uint64, lock bool, generator func(bu
 	data := buffer[len(dumpMagic):]
 	generator(data)
 
+	// On error, leave mem/dump non-nil so the deferred cleanup retries
+	// Unmap/Close before RemoveFile — Windows refuses to unlink a file that
+	// is still mapped or open, so a retry can be the difference between a
+	// cleaned temp file and a leak.
 	if err := mem.Unmap(); err != nil {
 		return nil, nil, nil, err
 	}
+	mem = nil
 	if err := dump.Close(); err != nil {
 		return nil, nil, nil, err
 	}
+	dump = nil
 	if err := os.Rename(temp, path); err != nil {
 		return nil, nil, nil, err
 	}
+	cleanup = false
 	return memoryMap(path, lock)
 }
 
 // lru tracks caches or datasets by their last use time, keeping at most N of them.
 type lru struct {
 	what string
-	new  func(epoch uint64) interface{}
+	new  func(epoch uint64) any
 	mu   sync.Mutex
 	// Items are kept in a LRU cache, but there is a special case:
 	// We always keep an item for (highest seen epoch) + 1 as the 'future item'.
 	cache      *simplelru.LRU[uint64, any]
 	future     uint64
-	futureItem interface{}
+	futureItem any
 }
 
 // newlru create a new least-recently-used cache for either the verification caches
 // or the mining datasets.
-func newlru(what string, maxItems int, new func(epoch uint64) interface{}) *lru {
+func newlru(what string, maxItems int, new func(epoch uint64) any) *lru {
 	if maxItems <= 0 {
 		maxItems = 1
 	}
-	cache, _ := simplelru.NewLRU[uint64, any](maxItems, func(key uint64, value interface{}) {
+	cache, _ := simplelru.NewLRU[uint64, any](maxItems, func(key uint64, value any) {
 		log.Trace("Evicted ethash "+what, "epoch", key)
 	})
 	return &lru{what: what, new: new, cache: cache}
@@ -208,7 +230,7 @@ func newlru(what string, maxItems int, new func(epoch uint64) interface{}) *lru 
 // get retrieves or creates an item for the given epoch. The first return value is always
 // non-nil. The second return value is non-nil if lru thinks that an item will be useful in
 // the near future.
-func (lru *lru) get(epoch uint64) (item, future interface{}) {
+func (lru *lru) get(epoch uint64) (item, future any) {
 	lru.mu.Lock()
 	defer lru.mu.Unlock()
 
@@ -244,7 +266,7 @@ type cache struct {
 
 // newCache creates a new ethash verification cache and returns it as a plain Go
 // interface to be usable in an LRU cache.
-func newCache(epoch uint64) interface{} {
+func newCache(epoch uint64) any {
 	return &cache{epoch: epoch}
 }
 
@@ -322,7 +344,7 @@ type dataset struct {
 
 // newDataset creates a new ethash mining dataset and returns it as a plain Go
 // interface to be usable in an LRU cache.
-func newDataset(epoch uint64) interface{} {
+func newDataset(epoch uint64) any {
 	return &dataset{epoch: epoch}
 }
 
@@ -580,7 +602,7 @@ func SeedHash(block uint64) []byte {
 }
 
 func (ethash *Ethash) GetTransferFunc() evmtypes.TransferFunc {
-	return rules.Transfer
+	return misc.Transfer
 }
 
 func (ethash *Ethash) GetPostApplyMessageFunc() evmtypes.PostApplyMessageFunc {

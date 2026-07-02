@@ -23,7 +23,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-
+	"errors"
+	"fmt"
 	"reflect"
 	"slices"
 	"strconv"
@@ -32,6 +33,7 @@ import (
 	"time"
 
 	"github.com/erigontech/erigon/common/log/v3"
+	"github.com/erigontech/erigon/db/kv"
 	"github.com/erigontech/erigon/rpc/jsonstream"
 	"github.com/erigontech/erigon/rpc/rpccfg"
 )
@@ -68,6 +70,7 @@ type handler struct {
 	conn           jsonWriter                     // where responses will be sent
 	logger         log.Logger
 	allowSubscribe bool
+	batchLimit     int
 
 	allowList     AllowList // a list of explicitly allowed methods, if empty -- everything is allowed
 	forbiddenList ForbiddenList
@@ -96,7 +99,7 @@ func HandleError(err error, stream jsonstream.Stream) {
 		if ok {
 			stream.WriteInt(ec.ErrorCode())
 		} else {
-			stream.WriteInt(defaultErrorCode)
+			stream.WriteInt(ErrCodeDefault)
 		}
 		stream.WriteMore()
 		stream.WriteObjectField("message")
@@ -118,9 +121,20 @@ func HandleError(err error, stream jsonstream.Stream) {
 	}
 }
 
-func newHandler(connCtx context.Context, conn jsonWriter, idgen func() ID, reg *serviceRegistry, allowList AllowList, maxBatchConcurrency uint, traceRequests bool, logger log.Logger, rpcSlowLogThreshold time.Duration) *handler {
+func newHandler(
+	connCtx context.Context,
+	conn jsonWriter,
+	idgen func() ID,
+	reg *serviceRegistry,
+	batchLimit int,
+	allowList AllowList,
+	maxBatchConcurrency uint,
+	traceRequests bool,
+	logger log.Logger,
+	rpcSlowLogThreshold time.Duration,
+) *handler {
 	rootCtx, cancelRoot := context.WithCancel(connCtx)
-	forbiddenList := newForbiddenList()
+	forbiddenList := ForbiddenList{}
 
 	h := &handler{
 		reg:            reg,
@@ -131,6 +145,7 @@ func newHandler(connCtx context.Context, conn jsonWriter, idgen func() ID, reg *
 		rootCtx:        rootCtx,
 		cancelRoot:     cancelRoot,
 		allowSubscribe: true,
+		batchLimit:     batchLimit,
 		serverSubs:     make(map[ID]*Subscription),
 		logger:         logger,
 		allowList:      allowList,
@@ -164,21 +179,27 @@ func (h *handler) handleBatch(msgs []*jsonrpcMessage) {
 		})
 		return
 	}
+	// Apply limit on total number of requests.
+	if h.batchLimit != 0 && len(msgs) > h.batchLimit {
+		h.startCallProc(func(cp *callProc) {
+			h.respondWithBatchTooLarge(cp, msgs)
+		})
+		return
+	}
 
 	// Handle non-call messages first:
 	calls := make([]*jsonrpcMessage, 0, len(msgs))
-	for _, msg := range msgs {
-		if handled := h.handleImmediate(msg); !handled {
-			calls = append(calls, msg)
-		}
-	}
+	h.handleResponses(msgs, func(msg *jsonrpcMessage) {
+		calls = append(calls, msg)
+	})
 	if len(calls) == 0 {
 		return
 	}
+
 	// Process calls on a goroutine because they may block indefinitely:
 	h.startCallProc(func(cp *callProc) {
 		// All goroutines will place results right to this array. Because requests order must match reply orders.
-		answersWithNils := make([]any, len(msgs))
+		answersWithNils := make([][]byte, len(msgs))
 		// Bounded parallelism pattern explanation https://blog.golang.org/pipelines#TOC_9.
 		boundedConcurrency := make(chan struct{}, h.maxBatchConcurrency)
 		defer close(boundedConcurrency)
@@ -198,32 +219,59 @@ func (h *handler) handleBatch(msgs []*jsonrpcMessage) {
 				default:
 				}
 
+				// handleCallMsg yields one of three:
+				// non-streaming response: res != nil, encoded here via writeTo.
+				// streamed response: res == nil, already written to the stream.
+				// notification: no response, leaving buf empty (only non-empty buffers reply).
 				buf := bytes.NewBuffer(nil)
 				stream := jsonstream.New(buf)
 				if res := h.handleCallMsg(cp, calls[i], stream); res != nil {
-					answersWithNils[i] = res
+					res.writeTo(stream)
 				}
 				_ = stream.Flush()
-				if buf.Len() > 0 && answersWithNils[i] == nil {
-					answersWithNils[i] = json.RawMessage(buf.Bytes())
+				if buf.Len() > 0 {
+					answersWithNils[i] = buf.Bytes()
 				}
 			}(i)
 		}
 		wg.Wait()
-		answers := make([]any, 0, len(msgs))
-		for _, answer := range answersWithNils {
-			if answer != nil {
-				answers = append(answers, answer)
-			}
-		}
 		h.addSubscriptions(cp.notifiers)
-		if len(answers) > 0 {
-			h.conn.WriteJSON(cp.ctx, answers)
+		out := jsonstream.New(nil)
+		out.WriteArrayStart()
+		wrote := false
+		for _, answer := range answersWithNils {
+			if answer == nil {
+				continue
+			}
+			if wrote {
+				out.WriteMore()
+			}
+			wrote = true
+			_, _ = out.Write(answer)
+		}
+		out.WriteArrayEnd()
+		if wrote {
+			h.conn.WriteJSON(cp.ctx, rawResponse(out.Buffer()))
 		}
 		for _, n := range cp.notifiers {
 			n.activate()
 		}
 	})
+}
+
+func (h *handler) respondWithBatchTooLarge(cp *callProc, batch []*jsonrpcMessage) {
+	reason := fmt.Sprintf("batch limit %d exceeded (can increase by --rpc.batch.limit). Requested batch of size: %d", h.batchLimit, len(batch))
+	resp := errorMessage(&invalidRequestError{reason})
+	// Find the first call and add its "id" field to the error.
+	// This is the best we can do, given that the protocol doesn't have a way
+	// of reporting an error for the entire batch.
+	for _, msg := range batch {
+		if msg.isCall() {
+			resp.ID = msg.ID
+			break
+		}
+	}
+	h.conn.WriteJSON(cp.ctx, []*jsonrpcMessage{resp})
 }
 
 // handleMsg handles a single message.
@@ -240,11 +288,10 @@ func (h *handler) handleMsg(msg *jsonrpcMessage, stream jsonstream.Stream) {
 		answer := h.handleCallMsg(cp, msg, stream)
 		h.addSubscriptions(cp.notifiers)
 		if answer != nil {
-			buffer, _ := json.Marshal(answer)
-			stream.Write(buffer)
+			answer.writeTo(stream)
 		}
 		if needWriteStream {
-			h.conn.WriteJSON(cp.ctx, json.RawMessage(stream.Buffer()))
+			h.conn.WriteJSON(cp.ctx, rawResponse(stream.Buffer()))
 		} else {
 			stream.Write([]byte("\n"))
 		}
@@ -252,6 +299,63 @@ func (h *handler) handleMsg(msg *jsonrpcMessage, stream jsonstream.Stream) {
 			n.activate()
 		}
 	})
+}
+
+// handleResponses processes method call responses.
+func (h *handler) handleResponses(batch []*jsonrpcMessage, handleCall func(*jsonrpcMessage)) {
+	var resolvedOps []*requestOp
+	handleResp := func(msg *jsonrpcMessage) {
+		op := h.respWait[string(msg.ID)]
+		if op == nil {
+			h.logger.Debug("Unsolicited RPC response", "reqid", idForLog(msg.ID))
+			return
+		}
+		resolvedOps = append(resolvedOps, op)
+		delete(h.respWait, string(msg.ID))
+
+		// For subscription responses, start the subscription if the server
+		// indicates success. EthSubscribe gets unblocked in either case through
+		// the op.resp channel.
+		if op.sub != nil {
+			if msg.Error != nil {
+				op.err = msg.Error
+			} else {
+				op.err = json.Unmarshal(msg.Result, &op.sub.subid)
+				if op.err == nil {
+					go op.sub.start()
+					h.clientSubs[op.sub.subid] = op.sub
+				}
+			}
+		}
+
+		if !op.hadResponse {
+			op.hadResponse = true
+			op.resp <- batch
+		}
+	}
+
+	for _, msg := range batch {
+		start := time.Now()
+		switch {
+		case msg.isResponse():
+			handleResp(msg)
+			h.logger.Trace("Handled RPC response", "reqid", idForLog(msg.ID), "duration", time.Since(start))
+
+		case msg.isNotification():
+			if strings.HasSuffix(msg.Method, notificationMethodSuffix) {
+				h.handleSubscriptionResult(msg)
+				continue
+			}
+			handleCall(msg)
+
+		default:
+			handleCall(msg)
+		}
+	}
+
+	for _, op := range resolvedOps {
+		h.removeRequestOp(op)
+	}
 }
 
 // close cancels all requests except for inflightReq and waits for
@@ -374,7 +478,7 @@ func (h *handler) handleResponse(msg *jsonrpcMessage) {
 	delete(h.respWait, string(msg.ID))
 	// For normal responses, just forward the reply to Call/BatchCall.
 	if op.sub == nil {
-		op.resp <- msg
+		op.resp <- []*jsonrpcMessage{msg}
 		return
 	}
 	// For subscription responses, start the subscription if the server
@@ -426,7 +530,7 @@ func (h *handler) handleCallMsg(ctx *callProc, msg *jsonrpcMessage, stream jsons
 			}
 		}
 
-		if resp != nil && resp.Error != nil && resp.Error.Message != "context canceled" {
+		if resp != nil && resp.Error != nil && !errors.Is(ctx.ctx.Err(), context.Canceled) {
 			if resp.Error.Data != nil {
 				h.logger.Warn("[rpc] served", "method", msg.Method, "reqid", idForLog(msg.ID),
 					"err", resp.Error.Message, "errdata", resp.Error.Data)
@@ -484,8 +588,10 @@ func (h *handler) handleCall(cp *callProc, msg *jsonrpcMessage, stream jsonstrea
 		rpcRequestGauge.Inc()
 		if answer != nil && answer.Error != nil {
 			failedReqeustGauge.Inc()
+			callb.timerFailure.ObserveDuration(start)
+		} else {
+			callb.timerSuccess.ObserveDuration(start)
 		}
-		newRPCServingTimerMS(msg.Method, answer == nil || answer.Error == nil).ObserveDuration(start)
 	}
 	return answer
 }
@@ -523,14 +629,68 @@ func (h *handler) handleSubscribe(cp *callProc, msg *jsonrpcMessage, stream json
 	return h.runMethod(ctx, msg, callb, args, stream)
 }
 
+// resultFieldStream lazily writes "result": on first value write.
+// This ensures JSON-RPC 2.0 compliance: if the method errors without
+// writing any data, "result" won't appear in the response.
+type resultFieldStream struct {
+	jsonstream.Stream
+	written bool
+}
+
+func (s *resultFieldStream) ensure() {
+	if !s.written {
+		s.written = true
+		s.Stream.WriteObjectField("result")
+	}
+}
+
+func (s *resultFieldStream) WriteNil()                   { s.ensure(); s.Stream.WriteNil() }
+func (s *resultFieldStream) WriteTrue()                  { s.ensure(); s.Stream.WriteTrue() }
+func (s *resultFieldStream) WriteFalse()                 { s.ensure(); s.Stream.WriteFalse() }
+func (s *resultFieldStream) WriteBool(val bool)          { s.ensure(); s.Stream.WriteBool(val) }
+func (s *resultFieldStream) WriteInt(val int)            { s.ensure(); s.Stream.WriteInt(val) }
+func (s *resultFieldStream) WriteInt8(val int8)          { s.ensure(); s.Stream.WriteInt8(val) }
+func (s *resultFieldStream) WriteInt16(val int16)        { s.ensure(); s.Stream.WriteInt16(val) }
+func (s *resultFieldStream) WriteInt32(val int32)        { s.ensure(); s.Stream.WriteInt32(val) }
+func (s *resultFieldStream) WriteInt64(val int64)        { s.ensure(); s.Stream.WriteInt64(val) }
+func (s *resultFieldStream) WriteUint(val uint)          { s.ensure(); s.Stream.WriteUint(val) }
+func (s *resultFieldStream) WriteUint8(val uint8)        { s.ensure(); s.Stream.WriteUint8(val) }
+func (s *resultFieldStream) WriteUint16(val uint16)      { s.ensure(); s.Stream.WriteUint16(val) }
+func (s *resultFieldStream) WriteUint32(val uint32)      { s.ensure(); s.Stream.WriteUint32(val) }
+func (s *resultFieldStream) WriteUint64(val uint64)      { s.ensure(); s.Stream.WriteUint64(val) }
+func (s *resultFieldStream) WriteFloat32(val float32)    { s.ensure(); s.Stream.WriteFloat32(val) }
+func (s *resultFieldStream) WriteFloat64(val float64)    { s.ensure(); s.Stream.WriteFloat64(val) }
+func (s *resultFieldStream) WriteString(val string)      { s.ensure(); s.Stream.WriteString(val) }
+func (s *resultFieldStream) WriteObjectStart()           { s.ensure(); s.Stream.WriteObjectStart() }
+func (s *resultFieldStream) WriteArrayStart()            { s.ensure(); s.Stream.WriteArrayStart() }
+func (s *resultFieldStream) WriteEmptyArray()            { s.ensure(); s.Stream.WriteEmptyArray() }
+func (s *resultFieldStream) WriteEmptyObject()           { s.ensure(); s.Stream.WriteEmptyObject() }
+func (s *resultFieldStream) Write(p []byte) (int, error) { s.ensure(); return s.Stream.Write(p) }
+func (s *resultFieldStream) WriteRaw(content string)     { s.ensure(); s.Stream.WriteRaw(content) }
+
+// remapDBOverload converts kv.ErrReadTxLimitExceeded into a JSON-RPC -32005 error and sets
+// the HTTP 503 flag in ctx so ServeHTTP can write the correct status before flushing.
+func remapDBOverload(ctx context.Context, err error) error {
+	if errors.Is(err, kv.ErrReadTxLimitExceeded) {
+		SetOverloadedFlag(ctx)
+		return &CustomError{Code: ErrCodeServerOverloaded, Message: ErrMsgServerOverloaded}
+	}
+	return err
+}
+
 // runMethod runs the Go callback for an RPC method.
 func (h *handler) runMethod(ctx context.Context, msg *jsonrpcMessage, callb *callback, args []reflect.Value, stream jsonstream.Stream) *jsonrpcMessage {
 	if !callb.streamable {
 		result, err := callb.call(ctx, msg.Method, args, stream)
 		if err != nil {
-			return msg.errorResponse(err)
+			return msg.errorResponse(remapDBOverload(ctx, err))
 		}
 		return msg.response(result)
+	}
+
+	// Switch gzip middleware to streaming mode before writing any response data.
+	if flush, ok := ctx.Value(httpFlusherContextKey{}).(func()); ok {
+		flush()
 	}
 
 	stream.WriteObjectStart()
@@ -542,15 +702,39 @@ func (h *handler) runMethod(ctx context.Context, msg *jsonrpcMessage, callb *cal
 		stream.Write(msg.ID)
 		stream.WriteMore()
 	}
-	stream.WriteObjectField("result")
-	_, err := callb.call(ctx, msg.Method, args, stream)
+	rs := &resultFieldStream{Stream: stream}
+	_, err := callb.call(ctx, msg.Method, args, rs)
 	if err != nil {
-		_ = stream.ClosePending(1) // the enclosing JSON object is explicitly handled below
-		stream.WriteMore()
+		err = remapDBOverload(ctx, err)
+		if rs.written {
+			_ = stream.ClosePending(1) // the enclosing JSON object is explicitly handled below
+			stream.WriteMore()
+		}
 		HandleError(err, stream)
 	}
 	stream.WriteObjectEnd()
 	return nil
+}
+
+// writeTo writes a success response's already-encoded Result (and id) directly rather than
+// re-encoding it; any other message falls back to json.Marshal. Output equals json.Marshal(msg)
+// except '<', '>', '&' and U+2028/2029 in the id/result are left unescaped (valid JSON, same value).
+func (msg *jsonrpcMessage) writeTo(stream jsonstream.Stream) {
+	if msg.Error != nil || msg.Result == nil || msg.ID == nil || msg.Version == "" || msg.Method != "" || msg.Params != nil {
+		buf, _ := json.Marshal(msg)
+		_, _ = stream.Write(buf)
+		return
+	}
+	stream.WriteObjectStart()
+	stream.WriteObjectField("jsonrpc")
+	stream.WriteString(msg.Version)
+	stream.WriteMore()
+	stream.WriteObjectField("id")
+	_, _ = stream.Write(msg.ID)
+	stream.WriteMore()
+	stream.WriteObjectField("result")
+	_, _ = stream.Write(msg.Result)
+	stream.WriteObjectEnd()
 }
 
 // unsubscribe is the callback function for all *_unsubscribe calls.

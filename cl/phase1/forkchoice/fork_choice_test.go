@@ -106,6 +106,7 @@ func TestForkChoiceBasic(t *testing.T) {
 		public_keys_registry.NewInMemoryPublicKeysRegistry(),
 		localValidators,
 		false, // probabilisticHeadGetter
+		nil,   // db: no KV persistence in tests
 	)
 	require.NoError(t, err)
 	// first steps
@@ -154,9 +155,8 @@ func TestForkChoiceBasic(t *testing.T) {
 
 func TestForkChoiceChainBellatrix(t *testing.T) {
 	if testing.Short() {
-		t.Skip("too slow for testing.Short")
+		t.Skip("slow test")
 	}
-
 	ctx := context.Background()
 	blocks, anchorState, _ := tests.GetBellatrixRandom()
 	cfg := clparams.MainnetBeaconConfig
@@ -196,6 +196,7 @@ func TestForkChoiceChainBellatrix(t *testing.T) {
 		public_keys_registry.NewInMemoryPublicKeysRegistry(),
 		localValidators,
 		false, // probabilisticHeadGetter
+		nil,   // db: no KV persistence in tests
 	)
 	store.OnTick(2000)
 	require.NoError(t, err)
