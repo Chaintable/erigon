@@ -67,7 +67,7 @@ func (f *ProtoForkable) MergeFiles(ctx context.Context, _filesToMerge []visibleF
 
 	from, to := RootNum(filesToMerge[0].startTxNum), RootNum(filesToMerge.EndTxNum())
 
-	segPath := f.snaps.schema.DataFile(version.V1_0, from, to)
+	segPath, _ := f.snaps.schema.DataFile(version.V1_0, from, to)
 
 	var exists bool
 	exists, err = dir.FileExist(segPath)
@@ -86,7 +86,7 @@ func (f *ProtoForkable) MergeFiles(ctx context.Context, _filesToMerge []visibleF
 			return
 		}
 		defer comp.Close()
-		writer := f.DataWriter(comp, f.isCompressionUsed(from, to))
+		writer := f.DataWriter(ctx, comp, f.isCompressionUsed(from, to))
 
 		p := ps.AddNew(path.Base(segPath), 1)
 		defer ps.Delete(p)

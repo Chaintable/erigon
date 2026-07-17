@@ -27,8 +27,8 @@ import (
 	"encoding/hex"
 	"errors"
 	"net"
+	"net/netip"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -166,32 +166,36 @@ type transport interface {
 }
 
 func (c *conn) String() string {
-	s := c.flags.String()
+	var s strings.Builder
+	s.WriteString(c.flags.String())
 	if (c.node.ID() != enode.ID{}) {
-		s += " " + c.node.ID().String()
+		s.WriteString(" ")
+		s.WriteString(c.node.ID().String())
 	}
-	s += " " + c.fd.RemoteAddr().String()
-	return s
+	s.WriteString(" ")
+	s.WriteString(c.fd.RemoteAddr().String())
+	return s.String()
 }
 
 func (f connFlag) String() string {
-	s := ""
+	var s strings.Builder
 	if f&trustedConn != 0 {
-		s += "-trusted"
+		s.WriteString("-trusted")
 	}
 	if f&dynDialedConn != 0 {
-		s += "-dyndial"
+		s.WriteString("-dyndial")
 	}
 	if f&staticDialedConn != 0 {
-		s += "-staticdial"
+		s.WriteString("-staticdial")
 	}
 	if f&inboundConn != 0 {
-		s += "-inbound"
+		s.WriteString("-inbound")
 	}
-	if s != "" {
-		s = s[1:]
+	str := s.String()
+	if str != "" {
+		return str[1:]
 	}
-	return s
+	return str
 }
 
 func (c *conn) is(f connFlag) bool {
@@ -341,11 +345,11 @@ type sharedUDPConn struct {
 	unhandled chan discover.ReadPacket
 }
 
-// ReadFromUDP implements discover.UDPConn
-func (s *sharedUDPConn) ReadFromUDP(b []byte) (n int, addr *net.UDPAddr, err error) {
+// ReadFromUDPAddrPort implements discover.UDPConn
+func (s *sharedUDPConn) ReadFromUDPAddrPort(b []byte) (n int, addr netip.AddrPort, err error) {
 	packet, ok := <-s.unhandled
 	if !ok {
-		return 0, nil, errors.New("connection was closed")
+		return 0, netip.AddrPort{}, errors.New("connection was closed")
 	}
 	l := min(len(packet.Data), len(b))
 	copy(b[:l], packet.Data[:l])
@@ -431,13 +435,13 @@ func (srv *Server) setupLocalNode() error {
 	}
 	sort.Sort(capsByNameAndVersion(srv.ourHandshake.Caps))
 	// Create the local node
-	db, err := enode.OpenDB(srv.quitCtx, srv.Config.NodeDatabase, srv.Config.TmpDir, srv.logger)
+	db, err := enode.OpenDBEx(srv.quitCtx, srv.Config.NodeDatabase, srv.Config.TmpDir, srv.logger)
 	if err != nil {
 		return err
 	}
 	srv.nodedb = db
 
-	srv.localnode = enode.NewLocalNode(db, srv.PrivateKey, srv.logger)
+	srv.localnode = enode.NewLocalNode(db, srv.PrivateKey)
 	srv.localnode.SetFallbackIP(net.IP{127, 0, 0, 1})
 
 	// TODO: check conflicts
@@ -528,7 +532,7 @@ func (srv *Server) setupDiscovery(ctx context.Context) error {
 			Unhandled:   unhandled,
 			Log:         srv.logger,
 		}
-		ntab, err := discover.ListenV4(ctx, strconv.FormatUint(uint64(srv.Config.Protocols[0].Version), 10), conn, srv.localnode, cfg)
+		ntab, err := discover.ListenV4(conn, srv.localnode, cfg)
 		if err != nil {
 			return err
 		}
@@ -541,12 +545,11 @@ func (srv *Server) setupDiscovery(ctx context.Context) error {
 			Bootnodes:   srv.BootstrapNodesV5,
 			Log:         srv.logger,
 		}
-		version := uint64(srv.Config.Protocols[0].Version)
 		var err error
 		if sconn != nil {
-			srv.discv5, err = discover.ListenV5(ctx, strconv.FormatUint(version, 10), sconn, srv.localnode, cfg)
+			srv.discv5, err = discover.ListenV5(sconn, srv.localnode, cfg)
 		} else {
-			srv.discv5, err = discover.ListenV5(ctx, strconv.FormatUint(version, 10), conn, srv.localnode, cfg)
+			srv.discv5, err = discover.ListenV5(conn, srv.localnode, cfg)
 		}
 		if err != nil {
 			// Clean up v4 if v5 setup fails.
@@ -762,9 +765,8 @@ running:
 				inboundCount--
 			}
 		case <-logTimer.C:
-			vals := []interface{}{"protocol", srv.Config.Protocols[0].Version, "peers", len(peers), "trusted", len(trusted), "inbound", inboundCount}
-			vals = append(vals, srv.listErrors()...)
-
+			vals := []any{"protocol", srv.Config.Protocols[0].Version, "peers", len(peers), "trusted", len(trusted), "inbound", inboundCount}
+			//vals = append(vals, srv.listErrors()...)
 			srv.logger.Debug("[p2p] Server", vals...)
 		}
 	}
@@ -861,14 +863,14 @@ func (srv *Server) listenLoop(ctx context.Context) {
 			break
 		}
 
-		remoteIP := netutil.AddrIP(fd.RemoteAddr())
+		remoteIP := netutil.AddrAddr(fd.RemoteAddr())
 		if err := srv.checkInboundConn(fd, remoteIP); err != nil {
 			srv.logger.Trace("Rejected inbound connection", "addr", fd.RemoteAddr(), "err", err)
 			_ = fd.Close()
 			slots.Release(1)
 			continue
 		}
-		if remoteIP != nil {
+		if remoteIP.IsValid() {
 			var addr *net.TCPAddr
 			if tcp, ok := fd.RemoteAddr().(*net.TCPAddr); ok {
 				addr = tcp
@@ -885,18 +887,18 @@ func (srv *Server) listenLoop(ctx context.Context) {
 	}
 }
 
-func (srv *Server) checkInboundConn(fd net.Conn, remoteIP net.IP) error {
-	if remoteIP == nil {
+func (srv *Server) checkInboundConn(fd net.Conn, remoteIP netip.Addr) error {
+	if !remoteIP.IsValid() {
 		return nil
 	}
 	// Reject connections that do not match NetRestrict.
-	if srv.NetRestrict != nil && !srv.NetRestrict.Contains(remoteIP) {
+	if srv.NetRestrict != nil && !srv.NetRestrict.ContainsAddr(remoteIP) {
 		return errors.New("not whitelisted in NetRestrict")
 	}
 	// Reject Internet peers that try too often.
 	now := srv.clock.Now()
 	srv.inboundHistory.expire(now, nil)
-	if !netutil.IsLAN(remoteIP) && srv.inboundHistory.contains(remoteIP.String()) {
+	if !netutil.AddrIsLAN(remoteIP) && srv.inboundHistory.contains(remoteIP.String()) {
 		return errors.New("too many attempts")
 	}
 	srv.inboundHistory.add(remoteIP.String(), now.Add(inboundThrottleTime))
@@ -954,7 +956,7 @@ func (srv *Server) setupConn(c *conn, flags connFlag, dialDest *enode.Node) erro
 	clog := srv.logger.New("id", c.node.ID(), "addr", c.fd.RemoteAddr(), "conn", c.flags)
 	err = srv.checkpoint(c, srv.checkpointPostHandshake)
 	if err != nil {
-		clog.Trace("Rejected peer", "err", err)
+		clog.Trace("[p2p] Rejected peer", "err", err)
 		return err
 	}
 
@@ -962,17 +964,17 @@ func (srv *Server) setupConn(c *conn, flags connFlag, dialDest *enode.Node) erro
 	phs, err := c.doProtoHandshake(srv.ourHandshake)
 	if err != nil {
 		srv.addError(err)
-		clog.Trace("Failed p2p handshake", "err", err)
+		clog.Trace("[p2p] Failed p2p handshake", "err", err)
 		return err
 	}
 	if id := c.node.ID(); !bytes.Equal(crypto.Keccak256(phs.Pubkey), id[:]) {
-		clog.Trace("Wrong devp2p handshake identity", "phsid", hex.EncodeToString(phs.Pubkey))
+		clog.Trace("[p2p] Wrong devp2p handshake identity", "phsid", hex.EncodeToString(phs.Pubkey))
 		return DiscUnexpectedIdentity
 	}
 	c.caps, c.name = phs.Caps, phs.Name
 	err = srv.checkpoint(c, srv.checkpointAddPeer)
 	if err != nil {
-		clog.Trace("Rejected peer", "err", err)
+		clog.Trace("[p2p] Rejected peer", "err", err)
 		return err
 	}
 
@@ -1056,8 +1058,8 @@ type NodeInfo struct {
 		Discovery int `json:"discovery"` // UDP listening port for discovery protocol
 		Listener  int `json:"listener"`  // TCP listening port for RLPx
 	} `json:"ports"`
-	ListenAddr string                 `json:"listenAddr"`
-	Protocols  map[string]interface{} `json:"protocols"`
+	ListenAddr string         `json:"listenAddr"`
+	Protocols  map[string]any `json:"protocols"`
 }
 
 // NodeInfo gathers and returns a collection of metadata known about the host.
@@ -1070,7 +1072,7 @@ func (srv *Server) NodeInfo() *NodeInfo {
 		ID:         node.ID().String(),
 		IP:         node.IP().String(),
 		ListenAddr: srv.ListenAddr,
-		Protocols:  make(map[string]interface{}),
+		Protocols:  make(map[string]any),
 	}
 	info.Ports.Discovery = node.UDP()
 	info.Ports.Listener = node.TCP()
@@ -1079,7 +1081,7 @@ func (srv *Server) NodeInfo() *NodeInfo {
 	// Gather all the running protocol infos (only once per protocol type)
 	for _, proto := range srv.Protocols {
 		if _, ok := info.Protocols[proto.Name]; !ok {
-			nodeInfo := interface{}("unknown")
+			nodeInfo := any("unknown")
 			if query := proto.NodeInfo; query != nil {
 				nodeInfo = proto.NodeInfo()
 			}
@@ -1127,11 +1129,11 @@ func (srv *Server) resetErrors() {
 	srv.errorsMu.Unlock()
 }
 
-func (srv *Server) listErrors() []interface{} {
+func (srv *Server) listErrors() []any {
 	srv.errorsMu.Lock()
 	defer srv.errorsMu.Unlock()
 
-	list := make([]interface{}, 0, len(srv.errors)*2)
+	list := make([]any, 0, len(srv.errors)*2)
 	for err, count := range srv.errors {
 		list = append(list, err, count)
 	}

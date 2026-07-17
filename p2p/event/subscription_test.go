@@ -80,6 +80,9 @@ loop:
 }
 
 func TestResubscribe(t *testing.T) {
+	if testing.Short() {
+		t.Skip("slow test")
+	}
 	t.Parallel()
 
 	var i int
@@ -140,8 +143,9 @@ func TestResubscribeWithErrorHandler(t *testing.T) {
 		sub := NewSubscription(func(unsubscribed <-chan struct{}) error {
 			if i < nfails {
 				return fmt.Errorf("err-%v", i)
+			} else {
+				return nil
 			}
-			return nil
 		})
 		return sub, nil
 	})

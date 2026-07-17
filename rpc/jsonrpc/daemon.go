@@ -30,21 +30,33 @@ import (
 	"github.com/erigontech/erigon/rpc/rpchelper"
 )
 
+func NewEthApiConfig(cfg *httpcfg.HttpCfg) *EthApiConfig {
+	return &EthApiConfig{
+		GasCap:                      cfg.Gascap,
+		FeeCap:                      cfg.Feecap,
+		ReturnDataLimit:             cfg.ReturnDataLimit,
+		AllowUnprotectedTxs:         cfg.AllowUnprotectedTxs,
+		MaxGetProofRewindBlockCount: cfg.MaxGetProofRewindBlockCount,
+		SubscribeLogsChannelSize:    cfg.WebsocketSubscribeLogsChannelSize,
+		RpcTxSyncDefaultTimeout:     cfg.RpcTxSyncDefaultTimeout,
+		RpcTxSyncMaxTimeout:         cfg.RpcTxSyncMaxTimeout,
+	}
+}
+
 // APIList describes the list of available RPC apis
 func APIList(db kv.TemporalRoDB, eth rpchelper.ApiBackend, txPool txpoolproto.TxpoolClient, mining txpoolproto.MiningClient,
 	filters *rpchelper.Filters, stateCache kvcache.Cache,
 	blockReader services.FullBlockReader, cfg *httpcfg.HttpCfg, engine rules.EngineReader,
 	logger log.Logger, bridgeReader bridgeReader, spanProducersReader spanProducersReader,
 ) (list []rpc.API) {
-	base := NewBaseApi(filters, stateCache, blockReader, cfg.WithDatadir, cfg.EvmCallTimeout, engine, cfg.Dirs, bridgeReader, cfg.BlockRangeLimit)
-	ethImpl := NewEthAPI(base, db, eth, txPool, mining, cfg.Gascap, cfg.Feecap, cfg.ReturnDataLimit, cfg.AllowUnprotectedTxs, cfg.MaxGetProofRewindBlockCount, cfg.WebsocketSubscribeLogsChannelSize, logger)
+	base := NewBaseApi(filters, stateCache, blockReader, cfg.WithDatadir, cfg.EvmCallTimeout, engine, cfg.Dirs, bridgeReader, cfg.BlockRangeLimit, cfg.GetLogsMaxResults)
+	ethImpl := NewEthAPI(base, db, eth, txPool, mining, NewEthApiConfig(cfg), logger)
 	erigonImpl := NewErigonAPI(base, db, eth)
 	txpoolImpl := NewTxPoolAPI(base, db, txPool)
 	netImpl := NewNetAPIImpl(eth)
-	debugImpl := NewPrivateDebugAPI(base, db, cfg.Gascap)
+	debugImpl := NewPrivateDebugAPI(base, db, cfg.Gascap, cfg.GethCompatibility)
 	traceImpl := NewTraceAPI(base, db, cfg)
 	web3Impl := NewWeb3APIImpl(eth)
-	dbImpl := NewDBAPIImpl() /* deprecated */
 	adminImpl := NewAdminAPI(eth)
 	parityImpl := NewParityAPIImpl(base, db)
 
@@ -123,6 +135,7 @@ func APIList(db kv.TemporalRoDB, eth rpchelper.ApiBackend, txPool txpoolproto.Tx
 				Version:   "1.0",
 			})
 		case "db": /* Deprecated */
+			dbImpl := NewDBAPIImpl() /* deprecated */
 			list = append(list, rpc.API{
 				Namespace: "db",
 				Public:    true,

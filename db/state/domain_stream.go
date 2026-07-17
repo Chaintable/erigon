@@ -28,6 +28,7 @@ import (
 
 	"github.com/erigontech/erigon/common"
 	"github.com/erigontech/erigon/common/log/v3"
+	"github.com/erigontech/erigon/db/datastruct/btindex"
 	"github.com/erigontech/erigon/db/kv"
 	"github.com/erigontech/erigon/db/kv/order"
 	"github.com/erigontech/erigon/db/kv/stream"
@@ -49,13 +50,12 @@ type CursorItem struct {
 	cDup    kv.CursorDupSort
 	cNonDup kv.Cursor
 
-	iter         btree2.MapIter[string, dataWithStep]
-	idx          *seg.Reader
+	iter         btree2.MapIter[string, []dataWithTxNum]
+	kvReader     *seg.Reader
 	hist         *seg.PagedReader
-	btCursor     *Cursor
+	btCursor     *btindex.Cursor
 	key          []byte
 	val          []byte
-	step         kv.Step
 	startTxNum   uint64
 	endTxNum     uint64
 	latestOffset uint64     // offset of the latest value in the file
@@ -74,7 +74,13 @@ func (ch CursorHeap) Less(i, j int) bool {
 	if cmp == 0 {
 		// when keys match, the items with later blocks are preferred
 		if ch[i].reverse {
+			if ch[i].endTxNum == ch[j].endTxNum {
+				return ch[i].t > ch[j].t // RAM > DB > FILE
+			}
 			return ch[i].endTxNum > ch[j].endTxNum
+		}
+		if ch[i].endTxNum == ch[j].endTxNum {
+			return ch[i].t > ch[j].t // RAM > DB > FILE
 		}
 		return ch[i].endTxNum < ch[j].endTxNum
 	}
@@ -85,11 +91,11 @@ func (ch *CursorHeap) Swap(i, j int) {
 	(*ch)[i], (*ch)[j] = (*ch)[j], (*ch)[i]
 }
 
-func (ch *CursorHeap) Push(x interface{}) {
+func (ch *CursorHeap) Push(x any) {
 	*ch = append(*ch, x.(*CursorItem))
 }
 
-func (ch *CursorHeap) Pop() interface{} {
+func (ch *CursorHeap) Pop() any {
 	old := *ch
 	n := len(old)
 	x := old[n-1]
@@ -105,6 +111,7 @@ type DomainLatestIterFile struct {
 
 	limit       int
 	largeVals   bool
+	filesOnly   bool // when true, iterate only over .kv files, ignoring MDBX
 	from, to    []byte
 	orderAscend order.By
 
@@ -121,7 +128,7 @@ func (hi *DomainLatestIterFile) Close() {
 func (hi *DomainLatestIterFile) Trace(prefix string) *stream.TracedDuo[[]byte, []byte] {
 	return stream.TraceDuo(hi, hi.logger, "[dbg] DomainLatestIterFile.Next "+prefix)
 }
-func (hi *DomainLatestIterFile) init(dc *DomainRoTx) error {
+func (hi *DomainLatestIterFile) init(domainRoTx *DomainRoTx) error {
 	// Implementation:
 	//     File endTxNum  = last txNum of file step
 	//     DB endTxNum    = first txNum of step in db
@@ -130,70 +137,101 @@ func (hi *DomainLatestIterFile) init(dc *DomainRoTx) error {
 	//     File endTxNum  = 15, because `0-2.kv` has steps 0 and 1, last txNum of step 1 is 15
 	//     DB endTxNum    = 16, because db has step 2, and first txNum of step 2 is 16.
 	//     RAM endTxNum   = 17, because current tcurrent txNum is 17
-	hi.largeVals = dc.d.LargeValues
+	hi.largeVals = domainRoTx.d.LargeValues
 	heap.Init(hi.h)
 	var key, value []byte
 
-	err := hi.roTx.Apply(context.Background(), func(tx kv.Tx) error {
-		if dc.d.LargeValues {
-			valsCursor, err := hi.roTx.Cursor(dc.d.ValuesTable) //nolint:gocritic
+	// Initialize DB cursors (skip if filesOnly mode)
+	if !hi.filesOnly {
+		if err := hi.initCursorMDBX(domainRoTx); err != nil {
+			return err
+		}
+	}
+
+	for i, item := range domainRoTx.files {
+		txNum := item.endTxNum - 1 // !important: .kv files have semantic [from, t)
+		if domainRoTx.d.Accessors.Has(statecfg.AccessorBTree) {
+			// Use BTree cursor for domains with BTree accessor
+			btCursor, err := domainRoTx.statelessBtree(i).Seek(domainRoTx.reusableReader(i), hi.from)
 			if err != nil {
 				return err
 			}
-			if key, value, err = valsCursor.Seek(hi.from); err != nil {
+
+			if btCursor == nil {
+				continue
+			}
+
+			key = btCursor.Key()
+			if key != nil && (hi.to == nil || bytes.Compare(key, hi.to) < 0) {
+				val := btCursor.Value()
+				heap.Push(hi.h, &CursorItem{t: FILE_CURSOR, key: key, val: val, btCursor: btCursor, endTxNum: txNum, reverse: true})
+			}
+		} else if domainRoTx.d.Accessors.Has(statecfg.AccessorHashMap) {
+			// For domains without BTree (e.g., commitment with HashMap accessor),
+			// iterate the data file directly using linear scan.
+			// RecSplit indices don't support OrdinalLookup (no enums), so we can't binary search.
+			reader := domainRoTx.reusableReader(i)
+			reader.Reset(0)
+
+			// Linear scan to find first key >= hi.from
+			for reader.HasNext() {
+				key, _ = reader.Next(nil)
+				if hi.from == nil || bytes.Compare(key, hi.from) >= 0 {
+					value, _ = reader.Next(nil)
+					break
+				}
+				reader.Skip() // skip value
+			}
+
+			if key != nil && (hi.to == nil || bytes.Compare(key, hi.to) < 0) {
+				heap.Push(hi.h, &CursorItem{t: FILE_CURSOR, key: common.Copy(key), val: common.Copy(value), kvReader: reader, endTxNum: txNum, reverse: true})
+			}
+		}
+	}
+	return hi.advanceInFiles()
+}
+
+// initCursorMDBX initializes DB cursors for iterating over MDBX values table.
+func (hi *DomainLatestIterFile) initCursorMDBX(domainRoTx *DomainRoTx) error {
+	return hi.roTx.Apply(context.Background(), func(tx kv.Tx) error {
+		if domainRoTx.d.LargeValues {
+			valsCursor, err := hi.roTx.Cursor(domainRoTx.d.ValuesTable) //nolint:gocritic
+			if err != nil {
+				return err
+			}
+			key, value, err := valsCursor.Seek(hi.from)
+			if err != nil {
 				return err
 			}
 			if key != nil && (hi.to == nil || bytes.Compare(key[:len(key)-8], hi.to) < 0) {
 				k := key[:len(key)-8]
 				stepBytes := key[len(key)-8:]
 				step := ^binary.BigEndian.Uint64(stepBytes)
-				endTxNum := step * dc.d.stepSize // DB can store not-finished step, it means - then set first txn in step - it anyway will be ahead of files
+				endTxNum := step * domainRoTx.d.stepSize // DB can store not-finished step, it means - then set first txn in step - it anyway will be ahead of files
 
 				heap.Push(hi.h, &CursorItem{t: DB_CURSOR, key: common.Copy(k), val: common.Copy(value), cNonDup: valsCursor, endTxNum: endTxNum, reverse: true})
 			}
 		} else {
-			valsCursor, err := hi.roTx.CursorDupSort(dc.d.ValuesTable) //nolint:gocritic
+			valsCursor, err := hi.roTx.CursorDupSort(domainRoTx.d.ValuesTable) //nolint:gocritic
 			if err != nil {
 				return err
 			}
 
-			if key, value, err = valsCursor.Seek(hi.from); err != nil {
+			key, value, err := valsCursor.Seek(hi.from)
+			if err != nil {
 				return err
 			}
 			if key != nil && (hi.to == nil || bytes.Compare(key, hi.to) < 0) {
 				stepBytes := value[:8]
 				value = value[8:]
 				step := ^binary.BigEndian.Uint64(stepBytes)
-				endTxNum := step * dc.d.stepSize // DB can store not-finished step, it means - then set first txn in step - it anyway will be ahead of files
+				endTxNum := step * domainRoTx.d.stepSize // DB can store not-finished step, it means - then set first txn in step - it anyway will be ahead of files
 
 				heap.Push(hi.h, &CursorItem{t: DB_CURSOR, key: common.Copy(key), val: common.Copy(value), cDup: valsCursor, endTxNum: endTxNum, reverse: true})
 			}
 		}
 		return nil
 	})
-
-	if err != nil {
-		return err
-	}
-
-	for i, item := range dc.files {
-		// todo release btcursor when iter over/make it truly stateless
-		btCursor, err := dc.statelessBtree(i).Seek(dc.reusableReader(i), hi.from)
-		if err != nil {
-			return err
-		}
-		if btCursor == nil {
-			continue
-		}
-
-		key := btCursor.Key()
-		if key != nil && (hi.to == nil || bytes.Compare(key, hi.to) < 0) {
-			val := btCursor.Value()
-			txNum := item.endTxNum - 1 // !important: .kv files have semantic [from, t)
-			heap.Push(hi.h, &CursorItem{t: FILE_CURSOR, key: key, val: val, btCursor: btCursor, endTxNum: txNum, reverse: true})
-		}
-	}
-	return hi.advanceInFiles()
 }
 
 func (hi *DomainLatestIterFile) advanceInFiles() error {
@@ -206,14 +244,27 @@ func (hi *DomainLatestIterFile) advanceInFiles() error {
 			ci1 := heap.Pop(hi.h).(*CursorItem)
 			switch ci1.t {
 			case FILE_CURSOR:
-				if ci1.btCursor.Next() {
-					ci1.key = ci1.btCursor.Key()
-					ci1.val = ci1.btCursor.Value()
-					if ci1.key != nil && (hi.to == nil || bytes.Compare(ci1.key, hi.to) < 0) {
-						heap.Push(hi.h, ci1)
+				if ci1.btCursor != nil {
+					// BTree cursor iteration
+					if ci1.btCursor.Next() {
+						ci1.key = ci1.btCursor.Key()
+						ci1.val = ci1.btCursor.Value()
+						if ci1.key != nil && (hi.to == nil || bytes.Compare(ci1.key, hi.to) < 0) {
+							heap.Push(hi.h, ci1)
+						}
+					} else {
+						ci1.btCursor.Close()
 					}
-				} else {
-					ci1.btCursor.Close()
+				} else { // Direct .kv file iteration
+					if ci1.kvReader.HasNext() {
+						k, _ := ci1.kvReader.Next(nil)
+						v, _ := ci1.kvReader.Next(nil)
+						ci1.key = common.Copy(k)
+						ci1.val = common.Copy(v)
+						if ci1.key != nil && (hi.to == nil || bytes.Compare(ci1.key, hi.to) < 0) {
+							heap.Push(hi.h, ci1)
+						}
+					}
 				}
 			case DB_CURSOR:
 				if hi.largeVals {
@@ -313,7 +364,7 @@ func (hi *DomainLatestIterFile) Next() ([]byte, []byte, error) {
 // debugIteratePrefix iterates over key-value pairs of the storage domain that start with given prefix
 //
 // k and v lifetime is bounded by the lifetime of the iterator
-func (dt *DomainRoTx) debugIteratePrefixLatest(prefix []byte, ramIter btree2.MapIter[string, dataWithStep], it func(k []byte, v []byte, step kv.Step) (cont bool, err error), roTx kv.Tx) error {
+func (dt *DomainRoTx) debugIteratePrefixLatest(prefix []byte, ramIter btree2.MapIter[string, []dataWithTxNum], it func(k []byte, v []byte) (cont bool, err error), roTx kv.Tx) error {
 	// Implementation:
 	//     File endTxNum  = last txNum of file step
 	//     DB endTxNum    = first txNum of step in db
@@ -326,15 +377,25 @@ func (dt *DomainRoTx) debugIteratePrefixLatest(prefix []byte, ramIter btree2.Map
 	var cp CursorHeap
 	cpPtr := &cp
 	heap.Init(cpPtr)
+	defer func() {
+		for cp.Len() > 0 {
+			ci := heap.Pop(cpPtr).(*CursorItem)
+			if ci.btCursor != nil {
+				ci.btCursor.Close()
+			}
+		}
+	}()
 	var k, v []byte
 	var err error
+	filesEndTxNum := dt.files.EndTxNum()
 
 	if ramIter.Seek(string(prefix)) {
 		k := toBytesZeroCopy(ramIter.Key())
-		v = ramIter.Value().data
+
+		v = ramIter.Value()[len(ramIter.Value())-1].data
 
 		if len(k) > 0 && bytes.HasPrefix(k, prefix) {
-			heap.Push(cpPtr, &CursorItem{t: RAM_CURSOR, key: common.Copy(k), val: common.Copy(v), step: 0, iter: ramIter, endTxNum: math.MaxUint64, reverse: true})
+			heap.Push(cpPtr, &CursorItem{t: RAM_CURSOR, key: common.Copy(k), val: common.Copy(v), iter: ramIter, endTxNum: math.MaxUint64, reverse: true})
 		}
 	}
 
@@ -346,15 +407,17 @@ func (dt *DomainRoTx) debugIteratePrefixLatest(prefix []byte, ramIter btree2.Map
 	if k, v, err = valsCursor.Seek(prefix); err != nil {
 		return err
 	}
-	if len(k) > 0 && bytes.HasPrefix(k, prefix) {
+	// Skip DB entries whose step falls within the file range — files are authoritative there.
+	for len(k) > 0 && bytes.HasPrefix(k, prefix) {
 		step := kv.Step(^binary.BigEndian.Uint64(v[:8]))
-		val := v[8:]
-		//endTxNum := step * stepSize // DB can store not-finished step, it means - then set first txn in step - it anyway will be ahead of files
-		//if haveRamUpdates && endTxNum >= txNum {
-		//	return fmt.Errorf("probably you didn't set SharedDomains.SetTxNum(). ram must be ahead of db: %d, %d", txNum, endTxNum)
-		//}
-
-		heap.Push(cpPtr, &CursorItem{t: DB_CURSOR, key: common.Copy(k), val: common.Copy(val), step: step, cDup: valsCursor, endTxNum: math.MaxUint64, reverse: true})
+		if step.ToTxNum(dt.stepSize) >= filesEndTxNum {
+			val := v[8:]
+			heap.Push(cpPtr, &CursorItem{t: DB_CURSOR, key: common.Copy(k), val: common.Copy(val), cDup: valsCursor, endTxNum: step.ToTxNum(dt.stepSize), reverse: true})
+			break
+		}
+		if k, v, err = valsCursor.NextNoDup(); err != nil {
+			return err
+		}
 	}
 
 	for i, item := range dt.files {
@@ -370,14 +433,13 @@ func (dt *DomainRoTx) debugIteratePrefixLatest(prefix []byte, ramIter btree2.Map
 		if key != nil && bytes.HasPrefix(key, prefix) {
 			val := cursor.Value()
 			txNum := item.endTxNum - 1 // !important: .kv files have semantic [from, t)
-			heap.Push(cpPtr, &CursorItem{t: FILE_CURSOR, key: key, val: val, step: 0, btCursor: cursor, endTxNum: txNum, reverse: true})
+			heap.Push(cpPtr, &CursorItem{t: FILE_CURSOR, key: key, val: val, btCursor: cursor, endTxNum: txNum, reverse: true})
 		}
 	}
 
 	for cp.Len() > 0 {
 		lastKey := common.Copy(cp[0].key)
 		lastVal := common.Copy(cp[0].val)
-		lastStep := cp[0].step
 		// Advance all the items that have this key (including the top)
 		for cp.Len() > 0 && bytes.Equal(cp[0].key, lastKey) {
 			ci1 := heap.Pop(cpPtr).(*CursorItem)
@@ -387,7 +449,7 @@ func (dt *DomainRoTx) debugIteratePrefixLatest(prefix []byte, ramIter btree2.Map
 					k = toBytesZeroCopy(ci1.iter.Key())
 					if k != nil && bytes.HasPrefix(k, prefix) {
 						ci1.key = common.Copy(k)
-						ci1.val = common.Copy(ci1.iter.Value().data)
+						ci1.val = common.Copy(ci1.iter.Value()[len(ci1.iter.Value())-1].data)
 						heap.Push(cpPtr, ci1)
 					}
 				}
@@ -399,46 +461,54 @@ func (dt *DomainRoTx) debugIteratePrefixLatest(prefix []byte, ramIter btree2.Map
 						if ci1.key != nil && bytes.HasPrefix(ci1.key, prefix) {
 							ci1.val = ci1.btCursor.Value()
 							heap.Push(cpPtr, ci1)
+						} else {
+							ci1.btCursor.Close()
 						}
 					} else {
 						ci1.btCursor.Close()
 					}
 				}
 				if indexList.Has(statecfg.AccessorHashMap) {
-					ci1.idx.Reset(ci1.latestOffset)
-					if !ci1.idx.HasNext() {
+					ci1.kvReader.Reset(ci1.latestOffset)
+					if !ci1.kvReader.HasNext() {
 						break
 					}
-					key, _ := ci1.idx.Next(nil)
+					key, _ := ci1.kvReader.Next(nil)
 					if key != nil && bytes.HasPrefix(key, prefix) {
 						ci1.key = key
-						ci1.val, ci1.latestOffset = ci1.idx.Next(nil)
+						ci1.val, ci1.latestOffset = ci1.kvReader.Next(nil)
 						heap.Push(cpPtr, ci1)
 					} else {
-						ci1.idx = nil
+						ci1.kvReader = nil
 					}
 				}
 			case DB_CURSOR:
-				k, v, err := ci1.cDup.NextNoDup()
-				if err != nil {
-					return err
-				}
-
-				if len(k) > 0 && bytes.HasPrefix(k, prefix) {
-					ci1.key = common.Copy(k)
+				var pushed bool
+				for {
+					k, v, err := ci1.cDup.NextNoDup()
+					if err != nil {
+						return err
+					}
+					if len(k) == 0 || !bytes.HasPrefix(k, prefix) {
+						break
+					}
 					step := kv.Step(^binary.BigEndian.Uint64(v[:8]))
-					endTxNum := step.ToTxNum(dt.stepSize) // DB can store not-finished step, it means - then set first txn in step - it anyway will be ahead of files
-					ci1.endTxNum = endTxNum
-					ci1.val = common.Copy(v[8:])
-					ci1.step = step
-					heap.Push(cpPtr, ci1)
-				} else {
+					if step.ToTxNum(dt.stepSize) >= filesEndTxNum {
+						ci1.key = common.Copy(k)
+						ci1.endTxNum = step.ToTxNum(dt.stepSize)
+						ci1.val = common.Copy(v[8:])
+						heap.Push(cpPtr, ci1)
+						pushed = true
+						break
+					}
+				}
+				if !pushed {
 					ci1.cDup.Close()
 				}
 			}
 		}
 		if len(lastVal) > 0 {
-			cont, err := it(lastKey, lastVal, lastStep)
+			cont, err := it(lastKey, lastVal)
 			if err != nil {
 				return err
 			}

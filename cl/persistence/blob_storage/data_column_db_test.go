@@ -3,6 +3,7 @@ package blob_storage
 import (
 	"bytes"
 	"context"
+	"slices"
 	"testing"
 
 	"github.com/erigontech/erigon/cl/beacon/beaconevents"
@@ -32,7 +33,7 @@ func init() {
 }
 
 func setupTestDataColumnStorage(t *testing.T) (DataColumnStorage, afero.Fs, *clparams.BeaconChainConfig, eth_clock.EthereumClock) {
-	fs := afero.NewMemMapFs()
+	fs := afero.NewBasePathFs(afero.NewOsFs(), t.TempDir())
 
 	ctrl := gomock.NewController(t)
 	mockClock := eth_clock.NewMockEthereumClock(ctrl)
@@ -317,13 +318,7 @@ func TestGetSavedColumnIndex(t *testing.T) {
 	// Should contain the written indices
 	assert.Len(t, savedIndices, len(indices))
 	for _, expectedIdx := range indices {
-		found := false
-		for _, savedIdx := range savedIndices {
-			if uint64(expectedIdx) == savedIdx {
-				found = true
-				break
-			}
-		}
+		found := slices.Contains(savedIndices, uint64(expectedIdx))
 		assert.True(t, found, "Expected index %d not found", expectedIdx)
 	}
 }

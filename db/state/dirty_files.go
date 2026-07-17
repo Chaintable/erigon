@@ -19,6 +19,7 @@ package state
 import (
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -33,6 +34,7 @@ import (
 
 	"github.com/erigontech/erigon/common/dir"
 	"github.com/erigontech/erigon/common/log/v3"
+	"github.com/erigontech/erigon/db/datastruct/btindex"
 	"github.com/erigontech/erigon/db/datastruct/existence"
 	"github.com/erigontech/erigon/db/recsplit"
 	"github.com/erigontech/erigon/db/seg"
@@ -53,7 +55,7 @@ import (
 type FilesItem struct {
 	decompressor         *seg.Decompressor
 	index                *recsplit.Index
-	bindex               *BtIndex
+	bindex               *btindex.BtIndex
 	existence            *existence.Filter
 	startTxNum, endTxNum uint64 //[startTxNum, endTxNum)
 
@@ -93,7 +95,7 @@ func (i *FilesItem) Segment() *seg.Decompressor { return i.decompressor }
 
 func (i *FilesItem) AccessorIndex() *recsplit.Index { return i.index }
 
-func (i *FilesItem) BtIndex() *BtIndex { return i.bindex }
+func (i *FilesItem) BtIndex() *btindex.BtIndex { return i.bindex }
 
 func (i *FilesItem) ExistenceFilter() *existence.Filter { return i.existence }
 func (i *FilesItem) MadvNormal() {
@@ -163,22 +165,14 @@ func (i *FilesItem) closeFiles() {
 	if i == nil {
 		return
 	}
-	if i.decompressor != nil {
-		i.decompressor.Close()
-		i.decompressor = nil
-	}
-	if i.index != nil {
-		i.index.Close()
-		i.index = nil
-	}
-	if i.bindex != nil {
-		i.bindex.Close()
-		i.bindex = nil
-	}
-	if i.existence != nil {
-		i.existence.Close()
-		i.existence = nil
-	}
+	i.decompressor.Close()
+	i.decompressor = nil
+	i.index.Close()
+	i.index = nil
+	i.bindex.Close()
+	i.bindex = nil
+	i.existence.Close()
+	i.existence = nil
 }
 
 func (i *FilesItem) FilePaths(basePath string) (relativePaths []string) {
@@ -208,19 +202,9 @@ func (i *FilesItem) closeFilesAndRemove() {
 	if i == nil {
 		return
 	}
-	if i.decompressor != nil {
-		i.decompressor.Close()
-		// paranoic-mode on: don't delete frozen files
-		if !i.frozen {
-			if err := dir.RemoveFile(i.decompressor.FilePath()); err != nil {
-				log.Trace("remove after close", "err", err, "file", i.decompressor.FileName())
-			}
-			if err := dir.RemoveFile(i.decompressor.FilePath() + ".torrent"); err != nil {
-				log.Trace("remove after close", "err", err, "file", i.decompressor.FileName()+".torrent")
-			}
-		}
-		i.decompressor = nil
-	}
+	// Delete accessors before the data file. If the process is killed between
+	// deleting the data file and accessors, the accessor files become
+	// permanently orphaned.
 	if i.index != nil {
 		i.index.Close()
 		// paranoic-mode on: don't delete frozen files
@@ -253,6 +237,19 @@ func (i *FilesItem) closeFilesAndRemove() {
 			log.Trace("remove after close", "err", err, "file", i.existence.FilePath)
 		}
 		i.existence = nil
+	}
+	if i.decompressor != nil {
+		i.decompressor.Close()
+		// paranoic-mode on: don't delete frozen files
+		if !i.frozen {
+			if err := dir.RemoveFile(i.decompressor.FilePath()); err != nil {
+				log.Trace("remove after close", "err", err, "file", i.decompressor.FileName())
+			}
+			if err := dir.RemoveFile(i.decompressor.FilePath() + ".torrent"); err != nil {
+				log.Trace("remove after close", "err", err, "file", i.decompressor.FileName()+".torrent")
+			}
+		}
+		i.decompressor = nil
 	}
 }
 
@@ -320,17 +317,17 @@ func deleteMergeFile(dirtyFiles *btree2.BTreeG[*FilesItem], outs []*FilesItem, f
 	}
 }
 
-func (d *Domain) openDirtyFiles() (err error) {
+func (d *Domain) openDirtyFiles(dirEntries []string) (err error) {
 	invalidFileItems := make([]*FilesItem, 0)
 	invalidFileItemsLock := sync.Mutex{}
 	d.dirtyFiles.Walk(func(items []*FilesItem) bool {
 		for _, item := range items {
 			fromStep, toStep := item.StepRange(d.stepSize)
 			if item.decompressor == nil {
-				fPathMask := d.kvFilePathMask(fromStep, toStep)
-				fPath, fileVer, ok, err := version.FindFilesWithVersionsByPattern(fPathMask)
+				fNameMask := d.kvFileNameMask(fromStep, toStep)
+				fPath, fileVer, ok, err := version.MatchVersionedFile(fNameMask, dirEntries, d.dirs.SnapDomain)
 				if err != nil {
-					_, fName := filepath.Split(fPath)
+					fName := filepath.Base(fPath)
 					d.logger.Debug("[agg] Domain.openDirtyFiles: FileExist err", "f", fName, "err", err)
 					invalidFileItemsLock.Lock()
 					invalidFileItems = append(invalidFileItems, item)
@@ -338,7 +335,7 @@ func (d *Domain) openDirtyFiles() (err error) {
 					continue
 				}
 				if !ok {
-					_, fName := filepath.Split(fPath)
+					fName := fNameMask
 					d.logger.Debug("[agg] Domain.openDirtyFiles: file does not exists", "f", fName)
 					invalidFileItemsLock.Lock()
 					invalidFileItems = append(invalidFileItems, item)
@@ -346,13 +343,10 @@ func (d *Domain) openDirtyFiles() (err error) {
 					continue
 				}
 
-				if fileVer.Less(d.FileVersion.DataKV.MinSupported) {
-					_, fName := filepath.Split(fPath)
-					versionTooLowPanic(fName, d.FileVersion.DataKV)
-				}
+				fName := filepath.Base(fPath)
+				d.FileVersion.DataKV.MustSupport(fileVer, fName)
 
 				if item.decompressor, err = seg.NewDecompressor(fPath); err != nil {
-					_, fName := filepath.Split(fPath)
 					if errors.Is(err, &seg.ErrCompressedFileCorrupted{}) {
 						d.logger.Debug("[agg] Domain.openDirtyFiles", "err", err, "f", fName)
 					} else {
@@ -367,57 +361,48 @@ func (d *Domain) openDirtyFiles() (err error) {
 			}
 
 			if item.index == nil && d.Accessors.Has(statecfg.AccessorHashMap) {
-				fPathMask := d.kviAccessorFilePathMask(fromStep, toStep)
-				fPath, fileVer, ok, err := version.FindFilesWithVersionsByPattern(fPathMask)
+				fNameMask := d.kviAccessorFileNameMask(fromStep, toStep)
+				fPath, fileVer, ok, err := version.MatchVersionedFile(fNameMask, dirEntries, d.dirs.SnapDomain)
 				if err != nil {
-					_, fName := filepath.Split(fPath)
+					fName := filepath.Base(fPath)
 					d.logger.Warn("[agg] Domain.openDirtyFiles", "err", err, "f", fName)
 				}
 				if ok {
-					if fileVer.Less(d.FileVersion.AccessorKVI.MinSupported) {
-						_, fName := filepath.Split(fPath)
-						versionTooLowPanic(fName, d.FileVersion.AccessorKVI)
-					}
+					fName := filepath.Base(fPath)
+					d.FileVersion.AccessorKVI.MustSupport(fileVer, fName)
 					if item.index, err = recsplit.OpenIndex(fPath); err != nil {
-						_, fName := filepath.Split(fPath)
 						d.logger.Warn("[agg] Domain.openDirtyFiles", "err", err, "f", fName)
 						// don't interrupt on error. other files may be good
 					}
 				}
 			}
 			if item.bindex == nil && d.Accessors.Has(statecfg.AccessorBTree) {
-				fPathMask := d.kvBtAccessorFilePathMask(fromStep, toStep)
-				fPath, fileVer, ok, err := version.FindFilesWithVersionsByPattern(fPathMask)
+				fNameMask := d.kvBtAccessorFileNameMask(fromStep, toStep)
+				fPath, fileVer, ok, err := version.MatchVersionedFile(fNameMask, dirEntries, d.dirs.SnapDomain)
 				if err != nil {
-					_, fName := filepath.Split(fPath)
+					fName := filepath.Base(fPath)
 					d.logger.Warn("[agg] Domain.openDirtyFiles", "err", err, "f", fName)
 				}
 				if ok {
-					if fileVer.Less(d.FileVersion.AccessorBT.MinSupported) {
-						_, fName := filepath.Split(fPath)
-						versionTooLowPanic(fName, d.FileVersion.AccessorBT)
-					}
-					if item.bindex, err = OpenBtreeIndexWithDecompressor(fPath, DefaultBtreeM, d.dataReader(item.decompressor)); err != nil {
-						_, fName := filepath.Split(fPath)
+					fName := filepath.Base(fPath)
+					d.FileVersion.AccessorBT.MustSupport(fileVer, fName)
+					if item.bindex, err = btindex.OpenBtreeIndexWithDecompressor(fPath, btindex.DefaultBtreeM, d.dataReader(item.decompressor)); err != nil {
 						d.logger.Warn("[agg] Domain.openDirtyFiles", "err", err, "f", fName)
 						// don't interrupt on error. other files may be good
 					}
 				}
 			}
 			if item.existence == nil && d.Accessors.Has(statecfg.AccessorExistence) {
-				fPathMask := d.kvExistenceIdxFilePathMask(fromStep, toStep)
-				fPath, fileVer, ok, err := version.FindFilesWithVersionsByPattern(fPathMask)
+				fNameMask := d.kvExistenceIdxFileNameMask(fromStep, toStep)
+				fPath, fileVer, ok, err := version.MatchVersionedFile(fNameMask, dirEntries, d.dirs.SnapDomain)
 				if err != nil {
-					_, fName := filepath.Split(fPath)
+					fName := filepath.Base(fPath)
 					d.logger.Warn("[agg] Domain.openDirtyFiles", "err", err, "f", fName)
 				}
 				if ok {
-					if fileVer.Less(d.FileVersion.AccessorKVEI.MinSupported) {
-						_, fName := filepath.Split(fPath)
-						versionTooLowPanic(fName, d.FileVersion.AccessorKVEI)
-					}
+					fName := filepath.Base(fPath)
+					d.FileVersion.AccessorKVEI.MustSupport(fileVer, fName)
 					if item.existence, err = existence.OpenFilter(fPath, false); err != nil {
-						_, fName := filepath.Split(fPath)
 						d.logger.Warn("[agg] Domain.openDirtyFiles", "err", err, "f", fName)
 						// don't interrupt on error. other files may be good
 					}
@@ -435,17 +420,17 @@ func (d *Domain) openDirtyFiles() (err error) {
 	return nil
 }
 
-func (h *History) openDirtyFiles() error {
+func (h *History) openDirtyFiles(dataEntries, accessorEntries []string) error {
 	invalidFilesMu := sync.Mutex{}
 	invalidFileItems := make([]*FilesItem, 0)
 	h.dirtyFiles.Walk(func(items []*FilesItem) bool {
 		for _, item := range items {
 			fromStep, toStep := item.StepRange(h.stepSize)
 			if item.decompressor == nil {
-				fPathMask := h.vFilePathMask(fromStep, toStep)
-				fPath, fileVer, ok, err := version.FindFilesWithVersionsByPattern(fPathMask)
+				fNameMask := h.vFileNameMask(fromStep, toStep)
+				fPath, fileVer, ok, err := version.MatchVersionedFile(fNameMask, dataEntries, h.dirs.SnapHistory)
 				if err != nil {
-					_, fName := filepath.Split(fPath)
+					fName := filepath.Base(fPath)
 					h.logger.Debug("[agg] History.openDirtyFiles: FileExist", "f", fName, "err", err)
 					invalidFilesMu.Lock()
 					invalidFileItems = append(invalidFileItems, item)
@@ -453,20 +438,17 @@ func (h *History) openDirtyFiles() error {
 					continue
 				}
 				if !ok {
-					_, fName := filepath.Split(fPath)
+					fName := fNameMask
 					h.logger.Debug("[agg] History.openDirtyFiles: file does not exists", "f", fName)
 					invalidFilesMu.Lock()
 					invalidFileItems = append(invalidFileItems, item)
 					invalidFilesMu.Unlock()
 					continue
 				}
-				if fileVer.Less(h.FileVersion.DataV.MinSupported) {
-					_, fName := filepath.Split(fPath)
-					versionTooLowPanic(fName, h.FileVersion.DataV)
-				}
+				fName := filepath.Base(fPath)
+				h.FileVersion.DataV.MustSupport(fileVer, fName)
 
 				if item.decompressor, err = seg.NewDecompressor(fPath); err != nil {
-					_, fName := filepath.Split(fPath)
 					if errors.Is(err, &seg.ErrCompressedFileCorrupted{}) {
 						h.logger.Debug("[agg] History.openDirtyFiles", "err", err, "f", fName)
 						// TODO we do not restore those files so we could just remove them along with indices. Same for domains/indices.
@@ -494,19 +476,16 @@ func (h *History) openDirtyFiles() error {
 			}
 
 			if item.index == nil {
-				fPathMask := h.vAccessorFilePathMask(fromStep, toStep)
-				fPath, fileVer, ok, err := version.FindFilesWithVersionsByPattern(fPathMask)
+				fNameMask := h.vAccessorFileNameMask(fromStep, toStep)
+				fPath, fileVer, ok, err := version.MatchVersionedFile(fNameMask, accessorEntries, h.dirs.SnapAccessors)
 				if err != nil {
-					_, fName := filepath.Split(fPath)
+					fName := filepath.Base(fPath)
 					h.logger.Warn("[agg] History.openDirtyFiles", "err", err, "f", fName)
 				}
 				if ok {
-					if fileVer.Less(h.FileVersion.AccessorVI.MinSupported) {
-						_, fName := filepath.Split(fPath)
-						versionTooLowPanic(fName, h.FileVersion.AccessorVI)
-					}
+					fName := filepath.Base(fPath)
+					h.FileVersion.AccessorVI.MustSupport(fileVer, fName)
 					if item.index, err = recsplit.OpenIndex(fPath); err != nil {
-						_, fName := filepath.Split(fPath)
 						h.logger.Warn("[agg] History.openDirtyFiles", "err", err, "f", fName)
 						// don't interrupt on error. other files may be good
 					}
@@ -523,18 +502,18 @@ func (h *History) openDirtyFiles() error {
 	return nil
 }
 
-func (ii *InvertedIndex) openDirtyFiles() error {
+func (ii *InvertedIndex) openDirtyFiles(dataEntries, accessorEntries []string) error {
 	var invalidFileItems []*FilesItem
 	invalidFileItemsLock := sync.Mutex{}
 	ii.dirtyFiles.Walk(func(items []*FilesItem) bool {
 		for _, item := range items {
 			fromStep, toStep := item.StepRange(ii.stepSize)
 			if item.decompressor == nil {
-				fPathPattern := ii.efFilePathMask(fromStep, toStep)
-				fPath, fileVer, ok, err := version.FindFilesWithVersionsByPattern(fPathPattern)
+				fNameMask := ii.efFileNameMask(fromStep, toStep)
+				fPath, fileVer, ok, err := version.MatchVersionedFile(fNameMask, dataEntries, ii.dirs.SnapIdx)
 				if err != nil {
-					_, fName := filepath.Split(fPath)
-					ii.logger.Debug("[agg] InvertedIndex.openDirtyFiles: FindFilesWithVersionsByPattern error", "f", fName, "err", err)
+					fName := filepath.Base(fPath)
+					ii.logger.Debug("[agg] InvertedIndex.openDirtyFiles: MatchVersionedFile error", "f", fName, "err", err)
 					invalidFileItemsLock.Lock()
 					invalidFileItems = append(invalidFileItems, item)
 					invalidFileItemsLock.Unlock()
@@ -542,7 +521,7 @@ func (ii *InvertedIndex) openDirtyFiles() error {
 				}
 
 				if !ok {
-					_, fName := filepath.Split(fPath)
+					fName := fNameMask
 					ii.logger.Debug("[agg] InvertedIndex.openDirtyFiles: file does not exists", "f", fName)
 					invalidFileItemsLock.Lock()
 					invalidFileItems = append(invalidFileItems, item)
@@ -550,13 +529,10 @@ func (ii *InvertedIndex) openDirtyFiles() error {
 					continue
 				}
 
-				if fileVer.Less(ii.FileVersion.DataEF.MinSupported) {
-					_, fName := filepath.Split(fPath)
-					versionTooLowPanic(fName, ii.FileVersion.DataEF)
-				}
+				fName := filepath.Base(fPath)
+				ii.FileVersion.DataEF.MustSupport(fileVer, fName)
 
 				if item.decompressor, err = seg.NewDecompressor(fPath); err != nil {
-					_, fName := filepath.Split(fPath)
 					if errors.Is(err, &seg.ErrCompressedFileCorrupted{}) {
 						ii.logger.Debug("[agg] InvertedIndex.openDirtyFiles", "err", err, "f", fName)
 					} else {
@@ -571,20 +547,17 @@ func (ii *InvertedIndex) openDirtyFiles() error {
 			}
 
 			if item.index == nil {
-				fPathPattern := ii.efAccessorFilePathMask(fromStep, toStep)
-				fPath, fileVer, ok, err := version.FindFilesWithVersionsByPattern(fPathPattern)
+				fNameMask := ii.efAccessorFileNameMask(fromStep, toStep)
+				fPath, fileVer, ok, err := version.MatchVersionedFile(fNameMask, accessorEntries, ii.dirs.SnapAccessors)
 				if err != nil {
-					_, fName := filepath.Split(fPath)
+					fName := filepath.Base(fPath)
 					ii.logger.Warn("[agg] InvertedIndex.openDirtyFiles", "err", err, "f", fName)
 					// don't interrupt on error. other files may be good
 				}
 				if ok {
-					if fileVer.Less(ii.FileVersion.AccessorEFI.MinSupported) {
-						_, fName := filepath.Split(fPath)
-						versionTooLowPanic(fName, ii.FileVersion.AccessorEFI)
-					}
+					fName := filepath.Base(fPath)
+					ii.FileVersion.AccessorEFI.MustSupport(fileVer, fName)
 					if item.index, err = recsplit.OpenIndex(fPath); err != nil {
-						_, fName := filepath.Split(fPath)
 						ii.logger.Warn("[agg] InvertedIndex.openDirtyFiles", "err", err, "f", fName)
 						// don't interrupt on error. other files may be good
 					}
@@ -671,6 +644,18 @@ func calcVisibleFiles(files *btree2.BTreeG[*FilesItem], l statecfg.Accessors, ch
 	if newVisibleFiles == nil {
 		newVisibleFiles = []visibleFile{}
 	}
+
+	// Check for gaps in visible files and warn if found
+	for i := 1; i < len(newVisibleFiles); i++ {
+		prev := newVisibleFiles[i-1]
+		curr := newVisibleFiles[i]
+		if prev.endTxNum != curr.startTxNum {
+			log.Warn("[agg] gap in visible files", "prev", prev.src.decompressor.FileName(),
+				"prevEnd", prev.endTxNum, "curr", curr.src.decompressor.FileName(), "currStart", curr.startTxNum,
+				"gap", curr.startTxNum-prev.endTxNum)
+		}
+	}
+
 	return newVisibleFiles
 }
 
@@ -758,6 +743,25 @@ func (files visibleFiles) VisibleFiles() []VisibleFile {
 		res = append(res, file)
 	}
 	return res
+}
+
+// dirListing holds a directory path and its pre-read entry names.
+type dirListing struct {
+	dir   string
+	names []string
+}
+
+// readDirNames reads a directory once and returns a dirListing for reuse.
+func readDirNames(dir string) dirListing {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		panic(err)
+	}
+	names := make([]string, len(entries))
+	for i, e := range entries {
+		names[i] = e.Name()
+	}
+	return dirListing{dir: dir, names: names}
 }
 
 // fileItemsWithMissedAccessors returns list of files with missed accessors

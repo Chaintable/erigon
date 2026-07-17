@@ -235,8 +235,7 @@ func NewTestDB(tb testing.TB, label kv.Label) kv.TemporalRwDB {
 	tb.Helper()
 	db := memdb.NewTestDB(tb, label)
 	dirs := datadir.New(tb.TempDir())
-	stepSize := uint64(1000)
-	agg := state.NewTest(dirs).StepSize(stepSize).MustOpen(context.Background(), db)
+	agg := state.NewTest(dirs).DisableHistory().MustOpen(context.Background(), db)
 	tb.Cleanup(agg.Close)
 	tdb, _ := New(db, agg)
 	return tdb
@@ -372,10 +371,10 @@ func (tx *RwTx) LockDBInRam() error {
 func (tx *RwTx) Debug() kv.TemporalDebugTx { return tx }
 func (tx *Tx) Debug() kv.TemporalDebugTx   { return tx }
 
-func (tx *RwTx) NewMemBatch(ioMetrics interface{}) kv.TemporalMemBatch {
+func (tx *RwTx) NewMemBatch(ioMetrics any) kv.TemporalMemBatch {
 	return state.NewTemporalMemBatch(tx, ioMetrics)
 }
-func (tx *Tx) NewMemBatch(ioMetrics interface{}) kv.TemporalMemBatch {
+func (tx *Tx) NewMemBatch(ioMetrics any) kv.TemporalMemBatch {
 	return state.NewTemporalMemBatch(tx, ioMetrics)
 }
 
@@ -590,12 +589,29 @@ func (tx *RwTx) HistoryRange(name kv.Domain, fromTs, toTs int, asc order.By, lim
 	return tx.historyRange(name, tx.RwTx, fromTs, toTs, asc, limit)
 }
 
+func (tx *tx) historyKeyTxNumRange(name kv.Domain, dbTx kv.Tx, fromTs, toTs int, asc order.By, limit int) (stream.KU64, error) {
+	it, err := tx.aggtx.HistoryKeyTxNumRange(name, fromTs, toTs, asc, limit, dbTx)
+	if err != nil {
+		return nil, err
+	}
+	tx.resourcesToClose = append(tx.resourcesToClose, it)
+	return it, nil
+}
+
+func (tx *Tx) HistoryKeyTxNumRange(name kv.Domain, fromTs, toTs int, asc order.By, limit int) (stream.KU64, error) {
+	return tx.historyKeyTxNumRange(name, tx.Tx, fromTs, toTs, asc, limit)
+}
+
+func (tx *RwTx) HistoryKeyTxNumRange(name kv.Domain, fromTs, toTs int, asc order.By, limit int) (stream.KU64, error) {
+	return tx.historyKeyTxNumRange(name, tx.RwTx, fromTs, toTs, asc, limit)
+}
+
 // Write methods
 
-func (tx *tx) DomainPut(domain kv.Domain, k, v []byte, txNum uint64, prevVal []byte, prevStep kv.Step) error {
+func (tx *tx) DomainPut(domain kv.Domain, k, v []byte, txNum uint64, prevVal []byte) error {
 	panic("implement me pls. or use SharedDomains")
 }
-func (tx *tx) DomainDel(domain kv.Domain, k []byte, txNum uint64, prevVal []byte, prevStep kv.Step) error {
+func (tx *tx) DomainDel(domain kv.Domain, k []byte, txNum uint64, prevVal []byte) error {
 	panic("implement me pls. or use SharedDomains")
 }
 func (tx *tx) DomainDelPrefix(domain kv.Domain, prefix []byte, txNum uint64) error {
@@ -624,12 +640,20 @@ func (tx *RwTx) GetLatestFromDB(domain kv.Domain, k []byte) (v []byte, step kv.S
 	return tx.getLatestFromDB(domain, tx.RwTx, k)
 }
 
+func (tx *RwTx) TraceKey(domain kv.Domain, k []byte, fromTxNum, toTxNum uint64) (stream.U64V, error) {
+	return tx.aggtx.DebugTraceKey(tx.ctx, domain, k, fromTxNum, toTxNum, tx.RwTx)
+}
+
 func (tx *tx) getLatestFromDB(domain kv.Domain, dbTx kv.Tx, k []byte) (v []byte, step kv.Step, found bool, err error) {
 	return tx.aggtx.DebugGetLatestFromDB(domain, k, dbTx)
 }
 
 func (tx *tx) GetLatestFromFiles(domain kv.Domain, k []byte, maxTxNum uint64) (v []byte, found bool, fileStartTxNum uint64, fileEndTxNum uint64, err error) {
 	return tx.aggtx.DebugGetLatestFromFiles(domain, k, maxTxNum)
+}
+
+func (tx *Tx) TraceKey(domain kv.Domain, k []byte, fromTxNum, toTxNum uint64) (stream.U64V, error) {
+	return tx.aggtx.DebugTraceKey(tx.ctx, domain, k, fromTxNum, toTxNum, tx.Tx)
 }
 
 func (db *DB) DomainTables(domain ...kv.Domain) []string {
@@ -714,9 +738,6 @@ func (tx *RwTx) PruneSmallBatches(ctx context.Context, timeout time.Duration) (h
 		return
 	}
 	return haveMore || hasMore, nil
-}
-func (tx *RwTx) GreedyPruneHistory(ctx context.Context, domain kv.Domain) error {
-	return tx.aggtx.GreedyPruneHistory(ctx, domain, tx.RwTx)
 }
 func (tx *RwTx) Unwind(ctx context.Context, txNumUnwindTo uint64, changeset *[kv.DomainLen][]kv.DomainEntryDiff) error {
 	return tx.aggtx.Unwind(ctx, tx.RwTx, txNumUnwindTo, changeset)

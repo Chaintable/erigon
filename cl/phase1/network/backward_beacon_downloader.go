@@ -17,12 +17,11 @@
 package network
 
 import (
+	"context"
 	"math"
 	"sync"
 	"sync/atomic"
 	"time"
-
-	"golang.org/x/net/context"
 
 	"github.com/erigontech/erigon/cl/cltypes"
 	"github.com/erigontech/erigon/cl/persistence/base_encoding"
@@ -38,6 +37,11 @@ import (
 // Whether the reverse downloader arrived at expected height or condition.
 type OnNewBlock func(blk *cltypes.SignedBeaconBlock) (finished bool, err error)
 
+// BlockChecker is an interface for checking if a block exists
+type BlockChecker interface {
+	HasBlock(blockNumber uint64) bool
+}
+
 type BackwardBeaconDownloader struct {
 	ctx            context.Context
 	slotToDownload atomic.Uint64
@@ -50,6 +54,7 @@ type BackwardBeaconDownloader struct {
 	db             kv.RwDB
 	sn             *freezeblocks.CaplinSnapshots
 	neverSkip      bool
+	blockChecker   BlockChecker
 
 	mu sync.Mutex
 }
@@ -90,6 +95,13 @@ func (b *BackwardBeaconDownloader) SetNeverSkip(neverSkip bool) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.neverSkip = neverSkip
+}
+
+// SetBlockChecker sets the block checker for skipping already downloaded blocks
+func (b *BackwardBeaconDownloader) SetBlockChecker(checker BlockChecker) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.blockChecker = checker
 }
 
 // SetShouldStopAtFn sets the stop condition.
@@ -202,7 +214,7 @@ func (b *BackwardBeaconDownloader) processResponses(responses []*cltypes.SignedB
 		}
 
 		if blockRoot != b.expectedRoot {
-			log.Debug("Unexpected root", "got", common.Hash(blockRoot), "expected", b.expectedRoot)
+			log.Trace("Unexpected root", "got", common.Hash(blockRoot), "expected", b.expectedRoot)
 			continue
 		}
 
@@ -311,8 +323,16 @@ func (b *BackwardBeaconDownloader) canSkipSlot(ctx context.Context, tx kv.Tx, el
 	}
 
 	blockNumber, err := beacon_indicies.ReadExecutionBlockNumber(tx, b.expectedRoot)
+	if err != nil {
+		log.Warn("Failed to read execution block number", "err", err)
+	}
 	if err != nil || blockNumber == nil {
 		return false
+	}
+
+	// Check if block is already in the collector
+	if b.blockChecker != nil && b.blockChecker.HasBlock(*blockNumber) {
+		return true
 	}
 
 	if *blockNumber < elFrozenBlocks {

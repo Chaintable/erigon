@@ -28,10 +28,11 @@ import (
 
 	"github.com/erigontech/erigon/common"
 	"github.com/erigontech/erigon/common/log/v3"
+	"github.com/erigontech/erigon/common/math"
 	"github.com/erigontech/erigon/db/kv"
 	"github.com/erigontech/erigon/db/services"
 	"github.com/erigontech/erigon/execution/chain"
-	"github.com/erigontech/erigon/execution/eth1/eth1_chain_reader"
+	"github.com/erigontech/erigon/execution/execmodule/chainreader"
 	"github.com/erigontech/erigon/execution/p2p"
 	"github.com/erigontech/erigon/execution/types"
 	"github.com/erigontech/erigon/node/ethconfig"
@@ -52,7 +53,7 @@ type EngineBlockDownloader struct {
 	status        atomic.Value // current Status of the downloading process, aka: is it doing anything
 	blockReader   services.FullBlockReader
 	db            kv.RoDB
-	chainRW       eth1_chain_reader.ChainReaderWriterEth1
+	chainRW       chainreader.ChainReaderWriterEth1
 	syncCfg       ethconfig.Sync
 	lock          sync.Mutex
 	logger        log.Logger
@@ -77,7 +78,7 @@ func NewEngineBlockDownloader(
 		panic(fmt.Errorf("failed to create badHeaders cache: %w", err))
 	}
 	// the block downloader has fcuTimeout=0 to avoid having to deal with async fcu
-	chainRW := eth1_chain_reader.NewChainReaderEth1(config, executionClient, 0 /* fcuTimeout */)
+	chainRW := chainreader.NewChainReaderEth1(config, executionClient, 0 /* fcuTimeout */)
 	return &EngineBlockDownloader{
 		backgroundCtx: ctx,
 		db:            db,
@@ -127,12 +128,22 @@ func (e *EngineBlockDownloader) download(ctx context.Context, req BackwardDownlo
 	err := e.processReq(ctx, req)
 	if err != nil {
 		args := append(req.LogArgs(), "err", err)
-		e.logger.Warn("[EngineBlockDownloader] could not process backward download request", args...)
+		if errors.Is(err, p2p.ErrChainLengthExceedsLimit) {
+			// Expected: gap is unbridgeable by a chain-length-limited download; the EL relies on FCU or staged sync.
+			e.logger.Info("[EngineBlockDownloader] backward download skipped — gap exceeds limit, awaiting FCU/staged sync", args...)
+		} else {
+			e.logger.Warn("[EngineBlockDownloader] could not process backward download request", args...)
+		}
 		e.status.Store(Idle)
 		return
 	}
 	e.logger.Info("[EngineBlockDownloader] backward download request successfully processed", req.LogArgs()...)
 	e.status.Store(Synced)
+}
+
+// newPayloadGapExceedsLimit reports whether the head-to-parent gap exceeds maxReorgDepth in either direction.
+func newPayloadGapExceedsLimit(currentHeadNum, missingBlockNum, maxReorgDepth uint64) bool {
+	return math.AbsoluteDifference(currentHeadNum, missingBlockNum) > maxReorgDepth
 }
 
 func (e *EngineBlockDownloader) processReq(ctx context.Context, req BackwardDownloadRequest) error {
@@ -166,7 +177,6 @@ func (e *EngineBlockDownloader) processReq(ctx context.Context, req BackwardDown
 }
 
 func (e *EngineBlockDownloader) downloadBlocks(ctx context.Context, req BackwardDownloadRequest) error {
-	e.logger.Info("[EngineBlockDownloader] processing backward download of blocks", req.LogArgs()...)
 	blocksBatchSize := min(500, uint64(e.syncCfg.LoopBlockLimit))
 	opts := []p2p.BbdOption{p2p.WithBlocksBatchSize(blocksBatchSize)}
 	if req.Trigger == NewPayloadTrigger {
@@ -174,11 +184,22 @@ func (e *EngineBlockDownloader) downloadBlocks(ctx context.Context, req Backward
 		currentHeader := e.chainRW.CurrentHeader(ctx)
 		if currentHeader != nil {
 			opts = append(opts, p2p.WithChainLengthCurrentHead(currentHeader.Number.Uint64()))
+			if req.ValidateChainTip != nil &&
+				newPayloadGapExceedsLimit(currentHeader.Number.Uint64(), req.ValidateChainTip.NumberU64()-1, e.syncCfg.MaxReorgDepth) {
+				return fmt.Errorf(
+					"%w: currentHead=%d, parent=%d, limit=%d",
+					p2p.ErrChainLengthExceedsLimit,
+					currentHeader.Number.Uint64(),
+					req.ValidateChainTip.NumberU64()-1,
+					e.syncCfg.MaxReorgDepth,
+				)
+			}
 		}
 	}
 	if req.Trigger == SegmentRecoveryTrigger {
 		opts = append(opts, p2p.WithChainLengthLimit(uint64(e.syncCfg.LoopBlockLimit)))
 	}
+	e.logger.Info("[EngineBlockDownloader] processing backward download of blocks", req.LogArgs()...)
 
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel() // need to cancel the ctx so that we cancel the download request processing if we err out prematurely
@@ -194,7 +215,7 @@ func (e *EngineBlockDownloader) downloadBlocks(ctx context.Context, req Backward
 	var blocks []*types.Block
 	var insertedBlocksWithoutExec int
 	for blocks, err = feed.Next(ctx); err == nil && len(blocks) > 0; blocks, err = feed.Next(ctx) {
-		progressLogArgs := []interface{}{
+		progressLogArgs := []any{
 			"from", blocks[0].NumberU64(),
 			"fromHash", blocks[0].Hash(),
 			"to", blocks[len(blocks)-1].NumberU64(),

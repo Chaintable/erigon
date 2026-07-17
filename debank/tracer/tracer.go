@@ -1,6 +1,7 @@
 package tracer
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"math/big"
@@ -69,46 +70,47 @@ func (bs *BlockStorageDiffMap) ToStateDiff(parrentRoot, root common.Hash) *dtype
 
 }
 
-func (bs *BlockStorageDiffMap) UpdateAccountData(address common.Address, original, account *accounts.Account) error {
-	addrhash := crypto.Keccak256Hash(address.Bytes())
+func (bs *BlockStorageDiffMap) UpdateAccountData(address accounts.Address, original, account *accounts.Account) error {
+	addrhash := crypto.Keccak256Hash(address.Value().Bytes())
 	delete(bs.DeletedAccounts, addrhash)
 	bs.NewAccounts[addrhash] = dtypes.NewAccount{
 		Address:  addrhash,
 		Balance:  account.Balance.Clone(),
 		Nonce:    account.Nonce,
-		CodeHash: account.CodeHash,
+		CodeHash: account.CodeHash.Value(),
 	}
 	return nil
 }
 
-func (bs *BlockStorageDiffMap) UpdateAccountCode(address common.Address, incarnation uint64, codeHash common.Hash, code []byte) error {
-	bs.NewCodes[codeHash] = dtypes.NewCode{
-		CodeHash: codeHash,
+func (bs *BlockStorageDiffMap) UpdateAccountCode(address accounts.Address, incarnation uint64, codeHash accounts.CodeHash, code []byte) error {
+	bs.NewCodes[codeHash.Value()] = dtypes.NewCode{
+		CodeHash: codeHash.Value(),
 		Code:     code,
 	}
 	return nil
 }
 
-func (bs *BlockStorageDiffMap) DeleteAccount(address common.Address, original *accounts.Account) error {
-	addrhash := crypto.Keccak256Hash(address.Bytes())
+func (bs *BlockStorageDiffMap) DeleteAccount(address accounts.Address, original *accounts.Account) error {
+	addrhash := crypto.Keccak256Hash(address.Value().Bytes())
 	delete(bs.NewAccounts, addrhash)
 	bs.DeletedAccounts[addrhash] = struct{}{}
 	return nil
 }
 
-func (bs *BlockStorageDiffMap) WriteAccountStorage(address common.Address, incarnation uint64, key common.Hash, original, value uint256.Int) error {
-	addrhash := crypto.Keccak256Hash(address.Bytes())
+func (bs *BlockStorageDiffMap) WriteAccountStorage(address accounts.Address, incarnation uint64, key accounts.StorageKey, original, value uint256.Int) error {
+	addrhash := crypto.Keccak256Hash(address.Value().Bytes())
 	if _, ok := bs.StorageDiff[addrhash]; !ok {
 		bs.StorageDiff[addrhash] = make(map[common.Hash]*uint256.Int)
 	}
 	storageDiff := bs.StorageDiff[addrhash]
 	valueCopy := value.Clone()
-	storageDiff[crypto.Keccak256Hash(key.Bytes())] = valueCopy
-	bs.StorageChanges[address] = struct{}{}
+	keyValue := key.Value()
+	storageDiff[crypto.Keccak256Hash(keyValue.Bytes())] = valueCopy
+	bs.StorageChanges[address.Value()] = struct{}{}
 	return nil
 }
 
-func (bs *BlockStorageDiffMap) CreateContract(address common.Address) error {
+func (bs *BlockStorageDiffMap) CreateContract(address accounts.Address) error {
 	return nil
 }
 
@@ -154,7 +156,7 @@ func (f callFrame) failed() bool {
 }
 
 func (f *callFrame) processOutput(output []byte, err error, reverted bool) {
-	output = common.CopyBytes(output)
+	output = bytes.Clone(output)
 	// Clear error if tx wasn't reverted. This happened
 	// for pre-homestead contract storage OOG.
 	if err != nil && !reverted {
@@ -283,7 +285,7 @@ func GetCallTracer(BlockFile *dtypes.BlockFile, txID string) (*tracing.Hooks, *c
 }
 
 // OnTxStart is called when transaction execution starts
-func (t *callTracer) OnTxStart(vm *tracing.VMContext, txn types.Transaction, from common.Address) {
+func (t *callTracer) OnTxStart(vm *tracing.VMContext, txn types.Transaction, from accounts.Address) {
 	t.gasLimit = txn.GetGasLimit()
 }
 
@@ -304,14 +306,14 @@ func (t *callTracer) OnTxEnd(receipt *types.Receipt, err error) {
 }
 
 // OnEnter is called when entering a call frame
-func (t *callTracer) OnEnter(depth int, typ byte, from common.Address, to common.Address, precompile bool, input []byte, gas uint64, value uint256.Int, code []byte) {
-	toCopy := to
+func (t *callTracer) OnEnter(depth int, typ byte, from accounts.Address, to accounts.Address, precompile bool, input []byte, gas uint64, value uint256.Int, code []byte) {
+	toCopy := to.Value()
 	tpy := vm.OpCode(typ)
 	call := callFrame{
 		Type:  tpy,
-		From:  from,
+		From:  from.Value(),
 		To:    &toCopy,
-		Input: common.CopyBytes(input),
+		Input: bytes.Clone(input),
 		Gas:   gas,
 		Value: value.ToBig(),
 	}

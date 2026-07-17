@@ -40,7 +40,7 @@ import (
 	"github.com/erigontech/erigon/execution/types"
 )
 
-func ResetState(db kv.TemporalRwDB, ctx context.Context) error {
+func ResetState(db kv.TemporalRwDB, ctx context.Context, dirs datadir.Dirs, br services.FullBlockReader, logger log.Logger) error {
 	// don't reset senders here
 	if err := db.Update(ctx, ResetWitnesses); err != nil {
 		return err
@@ -58,7 +58,53 @@ func ResetState(db kv.TemporalRwDB, ctx context.Context) error {
 	if err := ResetExec(ctx, db); err != nil {
 		return err
 	}
+	if err := ResetCanonicalAndRefillFromSnapshots(ctx, db, dirs, br, logger); err != nil {
+		return err
+	}
 	return nil
+}
+
+// ResetCanonicalAndRefillFromSnapshots wipes kv.HeaderCanonical, resets
+// Headers/BlockHashes/Bodies/Senders/Snapshots stage progress, and refills
+// the snapshot-covered range via FillDBFromSnapshots — the same pattern
+// stage_header --reset and stage_exec --reset use to rebuild canonical
+// markers and stage progress from frozen snapshot files.
+//
+// Motivation: prior to this, ResetState wiped MDBX state-domain tables and
+// the Execution stage progress, but left kv.HeaderCanonical untouched. A
+// stale canonical pointer at a height above the snapshot tip — typically a
+// sidechain hash deposited by a successful older forkchoice update whose
+// later replacement reorgs failed on execution and rolled back — survived
+// the reset and steered the subsequent forward catchup back onto the
+// sidechain, re-introducing phantom state. Clearing the table and letting
+// FillDBFromSnapshots re-anchor canonical markers from the frozen segments
+// hands canonical-hash assignment for the post-tip range entirely to the
+// next forkchoice update from the consensus layer.
+//
+// kv.HeaderTD is intentionally NOT truncated: TD records live under both
+// canonical and sidechain hashes at the same height and are consulted by
+// the consensus layer's block-import path (Caplin BlockCollector) when it
+// verifies parent.TD of a not-yet-canonical block. Wiping them by-number
+// across the post-tip range would break that path with
+// "parent's total difficulty not found" until the headers were re-fetched
+// from peers. The stale TD records are independently keyed by hash and do
+// not affect canonical assignment, and FillDBFromSnapshots rewrites the
+// snapshot-range TDs as it walks the frozen headers.
+func ResetCanonicalAndRefillFromSnapshots(ctx context.Context, db kv.TemporalRwDB, dirs datadir.Dirs, br services.FullBlockReader, logger log.Logger) error {
+	return db.Update(ctx, func(tx kv.RwTx) error {
+		if err := tx.ClearTable(kv.HeaderCanonical); err != nil {
+			return fmt.Errorf("clear canonical hash table: %w", err)
+		}
+		if err := clearStageProgress(tx, stages.Headers, stages.BlockHashes, stages.Bodies, stages.Senders, stages.Snapshots); err != nil {
+			return fmt.Errorf("clear chain-data stage progress: %w", err)
+		}
+		if br.FrozenBlocks() > 0 {
+			if err := FillDBFromSnapshots("reset_state_fill_db_from_snapshots", ctx, tx, dirs, br, logger); err != nil {
+				return fmt.Errorf("refill canonical markers from snapshots: %w", err)
+			}
+		}
+		return nil
+	})
 }
 
 func ResetBlocks(tx kv.RwTx, db kv.RoDB, br services.FullBlockReader, bw *blockio.BlockWriter, dirs datadir.Dirs, logger log.Logger) error {
@@ -118,7 +164,9 @@ func ResetSenders(ctx context.Context, tx kv.RwTx) error {
 }
 
 func ResetExec(ctx context.Context, db kv.TemporalRwDB) (err error) {
-	cleanupList := make([]string, 0)
+	domainTablesCount := len(db.Debug().DomainTables(kv.AccountsDomain, kv.StorageDomain, kv.CodeDomain, kv.CommitmentDomain, kv.ReceiptDomain, kv.RCacheDomain))
+	invertedIdxTablesCount := len(db.Debug().InvertedIdxTables(kv.LogAddrIdx, kv.LogTopicIdx, kv.TracesFromIdx, kv.TracesToIdx))
+	cleanupList := make([]string, 0, len(stateBuckets)+len(stateHistoryBuckets)+domainTablesCount+invertedIdxTablesCount)
 	cleanupList = append(cleanupList, stateBuckets...)
 	cleanupList = append(cleanupList, stateHistoryBuckets...)
 	cleanupList = append(cleanupList, db.Debug().DomainTables(kv.AccountsDomain, kv.StorageDomain, kv.CodeDomain, kv.CommitmentDomain, kv.ReceiptDomain, kv.RCacheDomain)...)
@@ -172,6 +220,7 @@ var stateBuckets = []string{
 }
 var stateHistoryBuckets = []string{
 	kv.TblPruningProgress,
+	kv.TblPruningValsProg,
 	kv.ChangeSets3,
 }
 
@@ -227,7 +276,7 @@ func FillDBFromSnapshots(logPrefix string, ctx context.Context, tx kv.RwTx, dirs
 		case stages.Headers:
 			h2n := etl.NewCollector(logPrefix, dirs.Tmp, etl.NewSortableBuffer(etl.BufferOptimalSize/2), logger)
 			defer h2n.Close()
-			h2n.SortAndFlushInBackground(true)
+			h2n.SortAndFlushInBackground(false)
 			h2n.LogLvl(log.LvlDebug)
 
 			// fill some small tables from snapshots, in future we may store this data in snapshots also, but
@@ -236,7 +285,7 @@ func FillDBFromSnapshots(logPrefix string, ctx context.Context, tx kv.RwTx, dirs
 			blockNumBytes := make([]byte, 8)
 			if err := blockReader.HeadersRange(ctx, func(header *types.Header) error {
 				blockNum, blockHash := header.Number.Uint64(), header.Hash()
-				td.Add(td, header.Difficulty)
+				td.Add(td, header.Difficulty.ToBig())
 				// What can happen if chaindata is deleted is that maybe header.seg progress is lower or higher than
 				// body.seg progress. In this case we need to skip the header, and "normalize" the progress to keep them in sync.
 				if blockNum > blocksAvailable {
