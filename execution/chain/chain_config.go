@@ -29,6 +29,7 @@ import (
 	"github.com/erigontech/erigon/common/generics"
 	"github.com/erigontech/erigon/common/hexutil"
 	"github.com/erigontech/erigon/execution/protocol/params"
+	"github.com/erigontech/erigon/execution/types/accounts"
 )
 
 // Config is the core config which determines the blockchain settings.
@@ -72,11 +73,11 @@ type Config struct {
 	MergeHeight                   *big.Int `json:"mergeBlock,omitempty"`                    // The Merge block number
 
 	// Mainnet fork scheduling switched from block numbers to timestamps after The Merge
-	ShanghaiTime    *big.Int `json:"shanghaiTime,omitempty"`
-	CancunTime      *big.Int `json:"cancunTime,omitempty"`
-	PragueTime      *big.Int `json:"pragueTime,omitempty"`
-	OsakaTime       *big.Int `json:"osakaTime,omitempty"`
-	GlamsterdamTime *big.Int `json:"glamsterdamTime,omitempty"`
+	ShanghaiTime  *big.Int `json:"shanghaiTime,omitempty"`
+	CancunTime    *big.Int `json:"cancunTime,omitempty"`
+	PragueTime    *big.Int `json:"pragueTime,omitempty"`
+	OsakaTime     *big.Int `json:"osakaTime,omitempty"`
+	AmsterdamTime *big.Int `json:"amsterdamTime,omitempty"`
 
 	// Optional EIP-4844 parameters (see also EIP-7691, EIP-7840, EIP-7892)
 	MinBlobGasPrice       *uint64                       `json:"minBlobGasPrice,omitempty"`
@@ -92,7 +93,6 @@ type Config struct {
 	// Balancer fork (Gnosis Chain). See https://hackmd.io/@filoozom/rycoQITlWl
 	BalancerTime            *big.Int                         `json:"balancerTime,omitempty"`
 	BalancerRewriteBytecode map[common.Address]hexutil.Bytes `json:"balancerRewriteBytecode,omitempty"`
-	CensoringSchedule       map[uint64]*CensoringConfig      `json:"censoringSchedule,omitempty"`
 
 	// (Optional) governance contract where EIP-1559 fees will be sent to, which otherwise would be burnt since the London fork.
 	// A key corresponds to the block number, starting from which the fees are sent to the address (map value).
@@ -172,7 +172,8 @@ var (
 		ShanghaiTime:                  big.NewInt(0),
 		CancunTime:                    big.NewInt(0),
 		PragueTime:                    big.NewInt(0),
-		GlamsterdamTime:               big.NewInt(0),
+		OsakaTime:                     big.NewInt(0),
+		AmsterdamTime:                 big.NewInt(0),
 		DepositContract:               common.HexToAddress("0x00000000219ab540356cBB839Cbe05303d7705Fa"),
 		Ethash:                        new(EthashConfig),
 	}
@@ -190,10 +191,10 @@ type BorConfig interface {
 	GetBhilaiBlock() *big.Int
 	IsRio(num uint64) bool
 	GetRioBlock() *big.Int
-	StateReceiverContractAddress() common.Address
+	StateReceiverContractAddress() accounts.Address
 	CalculateSprintNumber(number uint64) uint64
 	CalculateSprintLength(number uint64) uint64
-	CalculateCoinbase(number uint64) common.Address
+	CalculateCoinbase(number uint64) accounts.Address
 }
 
 func timestampToTime(unixSec int64) *time.Time {
@@ -248,8 +249,8 @@ func (c *Config) String() string {
 	if c.BalancerTime != nil {
 		fmt.Fprintf(&b, ", Balancer: %v", timestampToTime(c.BalancerTime.Int64()))
 	}
-	if c.GlamsterdamTime != nil {
-		fmt.Fprintf(&b, ", Glamsterdam: %v", timestampToTime(c.GlamsterdamTime.Int64()))
+	if c.AmsterdamTime != nil {
+		fmt.Fprintf(&b, ", Glamsterdam: %v", timestampToTime(c.AmsterdamTime.Int64()))
 	}
 	fmt.Fprintf(&b, ", Engine: %v}", engine)
 	return b.String()
@@ -365,9 +366,9 @@ func (c *Config) IsCancun(time uint64) bool {
 	return isForked(c.CancunTime, time)
 }
 
-// IsGlamsterdam returns whether time is either equal to the Glamsterdam fork time or greater.
-func (c *Config) IsGlamsterdam(time uint64) bool {
-	return isForked(c.GlamsterdamTime, time)
+// IsAmsterdam returns whether time is either equal to the Amsterdam fork time or greater.
+func (c *Config) IsAmsterdam(time uint64) bool {
+	return isForked(c.AmsterdamTime, time)
 }
 
 // IsPrague returns whether time is either equal to the Prague fork time or greater.
@@ -380,12 +381,12 @@ func (c *Config) IsOsaka(time uint64) bool {
 	return isForked(c.OsakaTime, time)
 }
 
-func (c *Config) GetBurntContract(num uint64) *common.Address {
+func (c *Config) GetBurntContract(num uint64) accounts.Address {
 	if len(c.BurntContract) == 0 {
-		return nil
+		return accounts.NilAddress
 	}
 	addr := ConfigValueLookup(common.ParseMapKeysIntoUint64(c.BurntContract), num)
-	return &addr
+	return accounts.InternAddress(addr)
 }
 
 func (c *Config) GetMinBlobGasPrice() uint64 {
@@ -418,6 +419,10 @@ func (c *Config) GetBlobConfig(time uint64) *params.BlobConfig {
 		val, ok = c.BlobSchedule["osaka"]
 		if ok && c.OsakaTime != nil {
 			c.parsedBlobSchedule[c.OsakaTime.Uint64()] = val
+		}
+		val, ok = c.BlobSchedule["gloas"]
+		if ok && c.AmsterdamTime != nil {
+			c.parsedBlobSchedule[c.AmsterdamTime.Uint64()] = val
 		}
 		val, ok = c.BlobSchedule["bpo1"]
 		if ok && c.Bpo1Time != nil {
@@ -486,14 +491,14 @@ func (c *Config) SecondsPerSlot() uint64 {
 	return 12 // Ethereum
 }
 
-func (c *Config) SystemContracts(time uint64) map[string]common.Address {
-	contracts := map[string]common.Address{}
+func (c *Config) SystemContracts(time uint64) map[string]accounts.Address {
+	contracts := map[string]accounts.Address{}
 	if c.IsCancun(time) {
 		contracts["BEACON_ROOTS_ADDRESS"] = params.BeaconRootsAddress
 	}
 	if c.IsPrague(time) {
 		contracts["CONSOLIDATION_REQUEST_PREDEPLOY_ADDRESS"] = params.ConsolidationRequestAddress
-		contracts["DEPOSIT_CONTRACT_ADDRESS"] = c.DepositContract
+		contracts["DEPOSIT_CONTRACT_ADDRESS"] = accounts.InternAddress(c.DepositContract)
 		contracts["HISTORY_STORAGE_ADDRESS"] = params.HistoryStorageAddress
 		contracts["WITHDRAWAL_REQUEST_PREDEPLOY_ADDRESS"] = params.WithdrawalRequestAddress
 	}
@@ -723,9 +728,8 @@ type Rules struct {
 	IsByzantium, IsConstantinople, IsPetersburg       bool
 	IsIstanbul, IsBerlin, IsLondon, IsShanghai        bool
 	IsCancun, IsNapoli, IsBhilai                      bool
-	IsPrague, IsOsaka, IsGlamsterdam                  bool
+	IsPrague, IsOsaka, IsAmsterdam                    bool
 	IsAura                                            bool
-	Censoring                                         *CensoringConfig
 }
 
 // isForked returns whether a fork scheduled at block s is active at the given head block.

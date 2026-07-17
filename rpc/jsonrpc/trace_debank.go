@@ -24,6 +24,7 @@ import (
 	"github.com/erigontech/erigon/execution/rlp"
 	"github.com/erigontech/erigon/execution/state"
 	"github.com/erigontech/erigon/execution/types"
+	"github.com/erigontech/erigon/execution/types/accounts"
 	"github.com/erigontech/erigon/execution/vm"
 	"github.com/erigontech/erigon/execution/vm/evmtypes"
 	bortypes "github.com/erigontech/erigon/polygon/bor/types"
@@ -89,15 +90,14 @@ func (api *TraceAPIImpl) DebankBlockRaw(ctx context.Context, blockNrOrHash rpc.B
 		return nil, err
 	}
 
-	stateReader, err := CreateHistoryStateReader2(dbtx, api._txNumReader, header.Number.Uint64(), 0, chainConfig.ChainName)
+	stateReader, err := CreateHistoryStateReader2(ctx, dbtx, api._txNumReader, header.Number.Uint64(), 0, chainConfig.ChainName)
 	if err != nil {
 		return nil, err
 	}
 
 	writer := dtracer.NewBlockStorageDiff()
 	ibs := state.New(stateReader)
-	usedGas := new(uint64)
-	usedBlobGas := new(uint64)
+	gasUsed := &protocol.GasUsed{}
 	gp := protocol.NewGasPool(header.GasLimit, chainConfig.GetMaxBlobGasPerBlock(header.Time))
 
 	engine, ok := api.engine().(rules.Engine)
@@ -142,7 +142,7 @@ func (api *TraceAPIImpl) DebankBlockRaw(ctx context.Context, blockNrOrHash rpc.B
 		hooks, tracer := dtracer.GetCallTracer(blockFile, txn.Hash().Hex())
 		vmConfig.Tracer = hooks
 		ibs.SetHooks(hooks)
-		receipt, _, err := protocol.ApplyTransaction(chainConfig, protocol.GetHashFn(header, getHeader), engine, nil, gp, ibs, writer, header, txn, usedGas, usedBlobGas, vmConfig)
+		receipt, err := protocol.ApplyTransaction(chainConfig, protocol.GetHashFn(header, getHeader), engine, accounts.NilAddress, gp, ibs, writer, header, txn, gasUsed, vmConfig)
 		if err != nil {
 			return nil, fmt.Errorf("trace_debankBlock: bn=%d, txnIdx=%d, %w", header.Number.Uint64(), i, err)
 		}
@@ -176,7 +176,7 @@ func (api *TraceAPIImpl) DebankBlockRaw(ctx context.Context, blockNrOrHash rpc.B
 			}
 			txCtx := evmtypes.TxContext{
 				TxHash:   bortypes.ComputeBorTxHash(blockNumber, blockHash),
-				Origin:   common.Address{},
+				Origin:   accounts.ZeroAddress,
 				GasPrice: *uint256.NewInt(0),
 			}
 			hooks := dtracer.NewCallTracer(blockFile, txCtx.TxHash.Hex())
@@ -201,12 +201,13 @@ func (api *TraceAPIImpl) DebankBlockRaw(ctx context.Context, blockNrOrHash rpc.B
 				evm.Reset(txCtx, ibs)
 			}
 
+			borBlockNum := block.Number()
 			receipt := types.Receipt{
 				Type:             0,
 				TxHash:           bortypes.ComputeBorTxHash(block.NumberU64(), block.Hash()),
 				GasUsed:          0,
 				BlockHash:        block.Hash(),
-				BlockNumber:      block.Number(),
+				BlockNumber:      &borBlockNum,
 				TransactionIndex: uint(len(block.Transactions())),
 				Status:           types.ReceiptStatusSuccessful,
 			}
@@ -239,20 +240,20 @@ func (api *TraceAPIImpl) DebankBlockRaw(ctx context.Context, blockNrOrHash rpc.B
 	}
 
 	// 如果 usedGas 不为 nil，值必须等于 headerGasUsed
-	if *usedGas != header.GasUsed {
-		return nil, fmt.Errorf("usedGas mismatch: got %v, want %v", *usedGas, header.GasUsed)
+	if gasUsed.Block != header.GasUsed {
+		return nil, fmt.Errorf("usedGas mismatch: got %v, want %v", gasUsed.Block, header.GasUsed)
 	}
 
 	// usedBlobGas 不为 nil
 	if header.BlobGasUsed == nil {
 		// 将 headerBlobGasUsed 视为 0
-		if *usedBlobGas != 0 {
-			return nil, fmt.Errorf("usedBlobGas is %v, but headerBlobGasUsed is nil (0 expected)", *usedBlobGas)
+		if gasUsed.Blob != 0 {
+			return nil, fmt.Errorf("usedBlobGas is %v, but headerBlobGasUsed is nil (0 expected)", gasUsed.Blob)
 		}
 	} else {
 		// headerBlobGasUsed 不为 nil，二者必须相等
-		if *usedBlobGas != *header.BlobGasUsed {
-			return nil, fmt.Errorf("usedBlobGas mismatch: got %v, want %v", *usedBlobGas, *header.BlobGasUsed)
+		if gasUsed.Blob != *header.BlobGasUsed {
+			return nil, fmt.Errorf("usedBlobGas mismatch: got %v, want %v", gasUsed.Blob, *header.BlobGasUsed)
 		}
 	}
 
@@ -354,23 +355,18 @@ func (api *TraceAPIImpl) DebankBGTraceStatus(ctx context.Context) (*BGTraceStatu
 
 }
 
-func CreateHistoryStateReader2(tx kv.TemporalTx, txNumsReader rawdbv3.TxNumsReader, blockNumber uint64, txnIndex int, chainName string) (state.StateReader, error) {
-	r := state.NewHistoryReaderV3()
-	r.SetTx(tx)
-	//r.SetTrace(true)
-	minTxNum, err := txNumsReader.Min(tx, blockNumber)
+func CreateHistoryStateReader2(ctx context.Context, tx kv.TemporalTx, txNumsReader rawdbv3.TxNumsReader, blockNumber uint64, txnIndex int, chainName string) (state.StateReader, error) {
+	minTxNum, err := txNumsReader.Min(ctx, tx, blockNumber)
 	if err != nil {
 		return nil, err
 	}
 	txNum := uint64(int(minTxNum) + txnIndex)
-	earliestTxNum := r.StateHistoryStartFrom()
-	if txNum < earliestTxNum {
-		// data available only starting from earliestTxNum, throw error to avoid unintended
+	if minHistoryTxNum := state.StateHistoryStartTxNum(tx); txNum < minHistoryTxNum {
+		// data available only starting from minHistoryTxNum, throw error to avoid unintended
 		// consequences of using this StateReader
-		return r, state.PrunedError
+		return nil, state.PrunedError
 	}
-	r.SetTxNum(txNum)
-	return r, nil
+	return state.NewHistoryReaderV3(tx, txNum), nil
 }
 
 func getFrom(txn types.Transaction) common.Address {
@@ -384,10 +380,9 @@ func getFrom(txn types.Transaction) common.Address {
 		chainId = txn.GetChainID().ToBig()
 	}
 
-	var from common.Address
 	signer := types.LatestSignerForChainID(chainId)
-	from, _ = txn.Sender(*signer)
-	return from
+	from, _ := txn.Sender(*signer)
+	return from.Value()
 }
 
 // genesisBlockByChainName returns the genesis block for the given chain name

@@ -48,6 +48,7 @@ func init() {
 	snapcfg.RegisterKnownTypes(networkname.Gnosis, ethereumTypes)
 	snapcfg.RegisterKnownTypes(networkname.Chiado, ethereumTypes)
 	snapcfg.RegisterKnownTypes(networkname.Hoodi, ethereumTypes)
+	snapcfg.RegisterKnownTypes(networkname.Bloatnet, ethereumTypes)
 }
 
 var Enums = struct {
@@ -80,15 +81,15 @@ var Indexes = struct {
 	TxnHash,
 	TxnHash2BlockNum snaptype.Index
 }{
-	HeaderHash:       snaptype.Index{Name: statecfg.HeadersIdx, Version: statecfg.Schema.HeadersBlock.Version.AccessorIdx},
-	BodyHash:         snaptype.Index{Name: statecfg.BodiesIdx, Version: statecfg.Schema.BodiesBlock.Version.AccessorIdx},
-	TxnHash:          snaptype.Index{Name: statecfg.TransactionsIdx, Version: statecfg.Schema.TransactionsBlock.Version.AccessorIdx},
-	TxnHash2BlockNum: snaptype.Index{Name: statecfg.TransactionsToBlockIdx, Version: statecfg.Schema.TxnHash2BlockNumBlock.Version.AccessorIdx, Offset: 1},
+	HeaderHash:       snaptype.Index{Name: statecfg.HeadersIdx, Version: statecfg.Schema.HeadersBlock.FileVersion.AccessorIdx},
+	BodyHash:         snaptype.Index{Name: statecfg.BodiesIdx, Version: statecfg.Schema.BodiesBlock.FileVersion.AccessorIdx},
+	TxnHash:          snaptype.Index{Name: statecfg.TransactionsIdx, Version: statecfg.Schema.TransactionsBlock.FileVersion.AccessorIdx},
+	TxnHash2BlockNum: snaptype.Index{Name: statecfg.TransactionsToBlockIdx, Version: statecfg.Schema.TxnHash2BlockNumBlock.FileVersion.AccessorIdx, Offset: 1},
 }
 
 var (
 	Salt = snaptype.RegisterType(
-		Enums.Domains,
+		Enums.Salt,
 		"salt",
 		snaptype.Versions{
 			Current:      version.ZeroVersion, //2,
@@ -101,7 +102,7 @@ var (
 	Headers = snaptype.RegisterType(
 		Enums.Headers,
 		statecfg.Headers,
-		statecfg.Schema.HeadersBlock.Version.DataSeg,
+		statecfg.Schema.HeadersBlock.FileVersion.DataSeg,
 		nil,
 		[]snaptype.Index{Indexes.HeaderHash},
 		snaptype.IndexBuilderFunc(
@@ -142,7 +143,7 @@ var (
 	Bodies = snaptype.RegisterType(
 		Enums.Bodies,
 		statecfg.Bodies,
-		statecfg.Schema.BodiesBlock.Version.DataSeg,
+		statecfg.Schema.BodiesBlock.FileVersion.DataSeg,
 		nil,
 		[]snaptype.Index{Indexes.BodyHash},
 		snaptype.IndexBuilderFunc(
@@ -176,7 +177,7 @@ var (
 	Transactions = snaptype.RegisterType(
 		Enums.Transactions,
 		statecfg.Transactions,
-		statecfg.Schema.TransactionsBlock.Version.DataSeg,
+		statecfg.Schema.TransactionsBlock.FileVersion.DataSeg,
 		nil,
 		[]snaptype.Index{Indexes.TxnHash, Indexes.TxnHash2BlockNum},
 		snaptype.IndexBuilderFunc(
@@ -198,13 +199,7 @@ var (
 				if !ok {
 					return fmt.Errorf("can't find files with vers by pattern %s for indexing in bodies", bodiesPathPattern)
 				}
-				if bVer.Less(statecfg.Schema.BodiesBlock.Version.DataSeg.MinSupported) {
-					verToPanic := version.Versions{
-						Current:      bVer,
-						MinSupported: statecfg.Schema.BodiesBlock.Version.DataSeg.MinSupported,
-					}
-					version.VersionTooLowPanic(filepath.Base(bodiesPath), verToPanic)
-				}
+				statecfg.Schema.BodiesBlock.FileVersion.DataSeg.MustSupport(bVer, filepath.Base(bodiesPath))
 				bodiesSegment, err := seg.NewDecompressor(bodiesPath)
 				if err != nil {
 					return fmt.Errorf("can't open %s for indexing in bodies: %w", sn.As(Bodies).Path, err)
@@ -227,13 +222,7 @@ var (
 				if !ok {
 					return fmt.Errorf("can't find files with vers by pattern %s for indexing in txs", txPathPattern)
 				}
-				if tVer.Less(statecfg.Schema.TransactionsBlock.Version.DataSeg.MinSupported) {
-					verToPanic := version.Versions{
-						Current:      tVer,
-						MinSupported: statecfg.Schema.TransactionsBlock.Version.DataSeg.MinSupported,
-					}
-					version.VersionTooLowPanic(filepath.Base(txPath), verToPanic)
-				}
+				statecfg.Schema.TransactionsBlock.FileVersion.DataSeg.MustSupport(tVer, filepath.Base(txPath))
 				d, err := seg.NewDecompressor(txPath)
 				if err != nil {
 					return fmt.Errorf("can't open %s for indexing in transactions: %w", sn.Path, err)
@@ -241,12 +230,6 @@ var (
 				defer d.Close()
 				if d.Count() != expectedCount {
 					return fmt.Errorf("TransactionsIdx: at=%d-%d, pre index building, expect: %d, got %d", sn.From, sn.To, expectedCount, d.Count())
-				}
-
-				if p != nil {
-					name := sn.Name()
-					p.Name.Store(&name)
-					p.Total.Store(uint64(d.Count() * 2))
 				}
 
 				txnHashIdx, err := recsplit.NewRecSplit(recsplit.RecSplitArgs{
@@ -290,6 +273,7 @@ var (
 				defer bodiesSegment.MadvSequential().DisableReadAhead()
 
 				for {
+					txnHashIdx.SetProgress(p)
 					g, bodyGetter := d.MakeGetter(), bodiesSegment.MakeGetter()
 					var ti, offset, nextPos uint64
 					blockNum := firstBlockNum
@@ -301,10 +285,6 @@ var (
 					}
 
 					for g.HasNext() {
-						if p != nil {
-							p.Processed.Add(1)
-						}
-
 						word, nextPos = g.Next(word[:0])
 						select {
 						case <-ctx.Done():

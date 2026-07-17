@@ -20,8 +20,6 @@
 package vm
 
 import (
-	"encoding/binary"
-
 	"github.com/holiman/uint256"
 
 	"github.com/erigontech/erigon/common"
@@ -69,16 +67,6 @@ func getData(data []byte, start uint64, size uint64) []byte {
 	return common.RightPadBytes(data[start:end], int(size))
 }
 
-// getDataBig returns a slice from the data based on the start and size and pads
-// up to size with zero's. This function is overflow safe.
-func getDataBig(data []byte, start *uint256.Int, size uint64) []byte {
-	start64, overflow := start.Uint64WithOverflow()
-	if overflow {
-		start64 = ^uint64(0)
-	}
-	return getData(data, start64, size)
-}
-
 // ToWordSize returns the ceiled word size required for memory expansion.
 func ToWordSize(size uint64) uint64 {
 	if size > math.MaxUint64-31 {
@@ -86,21 +74,4 @@ func ToWordSize(size uint64) uint64 {
 	}
 
 	return (size + 31) / 32
-}
-
-func allZero(b []byte) bool {
-	// 8-byte strides
-	n8 := len(b) - len(b)%8
-	for i := 0; i < n8; i += 8 {
-		if 0 != binary.NativeEndian.Uint64(b[i:i+8]) {
-			return false
-		}
-	}
-	// 1-byte strides for the remainder
-	for _, byte := range b[n8:] {
-		if byte != 0 {
-			return false
-		}
-	}
-	return true
 }

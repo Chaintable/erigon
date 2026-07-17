@@ -130,7 +130,7 @@ integration stage_exec
 ## How to re-gen CommitmentDomain
 
 ```sh
-integration commitment_rebuild
+integration commitment rebuild
 ```
 
 ## How to re-generate optional Domain/Index
@@ -140,6 +140,19 @@ integration commitment_rebuild
 erigon snapshots rm-state-snapshots --domain=receipt,rcache,logtopics,logaddrs,tracesfrom,tracesto
 integration stage_custom_trace --domain=receipt,rcache,logtopics,logaddrs,tracesfrom,tracesto --reset
 integration stage_custom_trace --domain=receipt,rcache,logtopics,logaddrs,tracesfrom,tracesto
+```
+
+## How to remove history snapshots only (keep domain data)
+
+```sh
+# Remove all history files (SnapHistory + SnapIdx + SnapAccessors) without touching domain data (.kv files):
+erigon snapshots rm-state --only-history
+
+# Remove a specific step range of history files only:
+erigon snapshots rm-state --only-history --step=0-900
+
+# Dry-run first to see what would be deleted:
+erigon snapshots rm-state --only-history --step=0-900 --dry-run
 ```
 
 ## How to re-gen bor checkpoints
@@ -154,7 +167,7 @@ erigon snapshots integrity --datadir /erigon-data/ --check=BorCheckpoints
 ## See tables size
 
 ```sh
-./build/bin/mdbx_stat -efa  ~/data/chiado33_full/chaindata | awk '
+./build/bin/mdbx_stat -efa  /erigon-data/mainnet_archive/chaindata/ | awk '
     BEGIN { pagesize = 4096 }
     /^  Pagesize:/ { pagesize = $2 }
     /^Status of/ { table = $3 }

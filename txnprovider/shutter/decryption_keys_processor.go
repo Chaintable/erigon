@@ -33,6 +33,7 @@ import (
 	"github.com/erigontech/erigon/common/estimate"
 	"github.com/erigontech/erigon/common/log/v3"
 	"github.com/erigontech/erigon/execution/types"
+	"github.com/erigontech/erigon/execution/types/accounts"
 	shuttercrypto "github.com/erigontech/erigon/txnprovider/shutter/internal/crypto"
 	"github.com/erigontech/erigon/txnprovider/shutter/internal/proto"
 	"github.com/erigontech/erigon/txnprovider/shutter/shuttercfg"
@@ -265,7 +266,7 @@ func (dkp *DecryptionKeysProcessor) decryptTxn(keys map[IdentityPreimage]*proto.
 		return nil, fmt.Errorf("txn gas limit mismatch: txn=%d, encryptedTxnSubmission=%d", txn.GetGasLimit(), subGasLimit)
 	}
 
-	txn.SetSender(sender)
+	txn.SetSender(accounts.InternAddress(sender))
 	return txn, nil
 }
 

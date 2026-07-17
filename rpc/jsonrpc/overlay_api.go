@@ -36,6 +36,7 @@ import (
 	"github.com/erigontech/erigon/execution/protocol"
 	"github.com/erigontech/erigon/execution/state"
 	"github.com/erigontech/erigon/execution/types"
+	"github.com/erigontech/erigon/execution/types/accounts"
 	"github.com/erigontech/erigon/execution/vm"
 	"github.com/erigontech/erigon/execution/vm/evmtypes"
 	"github.com/erigontech/erigon/rpc"
@@ -131,6 +132,10 @@ func (api *OverlayAPIImpl) CallConstructor(ctx context.Context, address common.A
 		return nil, err
 	}
 
+	if block == nil {
+		return nil, fmt.Errorf("block not found: %d", blockNum)
+	}
+
 	// -1 is a default value for transaction index.
 	// If it's -1, we will try to replay every single transaction in that block
 	transactionIndex := -1
@@ -142,7 +147,7 @@ func (api *OverlayAPIImpl) CallConstructor(ctx context.Context, address common.A
 	}
 
 	if transactionIndex == -1 {
-		return nil, errors.New("could not find txn hash")
+		return nil, fmt.Errorf("could not find txn hash")
 	}
 
 	replayTransactions = block.Transactions()[:transactionIndex]
@@ -176,7 +181,7 @@ func (api *OverlayAPIImpl) CallConstructor(ctx context.Context, address common.A
 		return hash, err
 	}
 
-	blockCtx = protocol.NewEVMBlockContext(header, getHash, api.engine(), nil, chainConfig)
+	blockCtx = protocol.NewEVMBlockContext(header, getHash, api.engine(), accounts.NilAddress, chainConfig)
 
 	// Get a new instance of the EVM
 	evm = vm.NewEVM(blockCtx, txCtx, statedb, chainConfig, vm.Config{})
@@ -212,7 +217,7 @@ func (api *OverlayAPIImpl) CallConstructor(ctx context.Context, address common.A
 		return nil, err
 	}
 
-	contractAddr := types.CreateAddress(msg.From(), msg.Nonce())
+	contractAddr := types.CreateAddress(msg.From().Value(), msg.Nonce())
 	if creationTx.GetTo() == nil && contractAddr == address {
 		// CREATE: adapt message with new code so it's replaced instantly
 		msg = types.NewMessage(msg.From(), msg.To(), msg.Nonce(), msg.Value(), api.GasCap, msg.GasPrice(), msg.FeeCap(), msg.TipCap(), *code, msg.AccessList(), msg.CheckNonce(), msg.CheckTransaction(), msg.CheckGas(), msg.IsFree(), msg.MaxFeePerBlobGas())
@@ -220,7 +225,7 @@ func (api *OverlayAPIImpl) CallConstructor(ctx context.Context, address common.A
 		msg.ChangeGas(api.GasCap, api.GasCap)
 	}
 	txCtx = protocol.NewEVMTxContext(msg)
-	ct := OverlayCreateTracer{contractAddress: address, code: *code, gasCap: api.GasCap}
+	ct := OverlayCreateTracer{contractAddress: accounts.InternAddress(address), code: *code, gasCap: api.GasCap}
 	evm = vm.NewEVM(blockCtx, txCtx, evm.IntraBlockState(), chainConfig, vm.Config{Tracer: ct.Tracer().Hooks})
 
 	// Execute the transaction message
@@ -239,7 +244,7 @@ func (api *OverlayAPIImpl) CallConstructor(ctx context.Context, address common.A
 		if err != nil {
 			return nil, err
 		}
-		code, err := evm.IntraBlockState().GetCode(address)
+		code, err := evm.IntraBlockState().GetCode(accounts.InternAddress(address))
 		if err != nil {
 			return nil, err
 		}
@@ -286,6 +291,15 @@ func (api *OverlayAPIImpl) GetLogs(ctx context.Context, crit filters.FilterCrite
 		return nil, err
 	}
 
+	err = api.BaseAPI.checkReceiptsAvailable(ctx, tx, begin)
+	if err != nil {
+		return nil, err
+	}
+
+	if api.blockRangeLimit != 0 && (end-begin) > uint64(api.blockRangeLimit) {
+		return nil, fmt.Errorf("%s: %d", errExceedBlockRange, api.blockRangeLimit)
+	}
+
 	numBlocks := end - begin + 1
 	var (
 		results = make([]*blockReplayResult, numBlocks)
@@ -300,7 +314,7 @@ func (api *OverlayAPIImpl) GetLogs(ctx context.Context, crit filters.FilterCrite
 			defer pend.Done()
 			tx, err := api.db.BeginTemporalRo(ctx)
 			if err != nil {
-				log.Error("Error", "error", err.Error())
+				log.Error("Error", "error", err)
 				return
 			}
 			defer tx.Rollback()
@@ -320,7 +334,7 @@ func (api *OverlayAPIImpl) GetLogs(ctx context.Context, crit filters.FilterCrite
 				statedb := state.New(stateReader)
 
 				if stateOverride != nil {
-					err = stateOverride.Override(statedb)
+					err = stateOverride.Override(statedb, nil, rules)
 					if err != nil {
 						results[task.idx] = &blockReplayResult{BlockNumber: task.BlockNumber, Error: err.Error()}
 						continue
@@ -395,7 +409,12 @@ blockLoop:
 		if res == nil {
 			continue
 		}
-		logs = append(logs, res.Logs...)
+		for _, l := range res.Logs {
+			if api.getLogsMaxResults != 0 && len(logs) >= api.getLogsMaxResults {
+				return nil, fmt.Errorf("%s: %d", errExceedLogResults, api.getLogsMaxResults)
+			}
+			logs = append(logs, l)
+		}
 	}
 	return logs, nil
 }
@@ -453,7 +472,7 @@ func (api *OverlayAPIImpl) replayBlock(ctx context.Context, blockNum uint64, sta
 		return hash, err
 	}
 
-	blockCtx = protocol.NewEVMBlockContext(header, getHash, api.engine(), nil, chainConfig)
+	blockCtx = protocol.NewEVMBlockContext(header, getHash, api.engine(), accounts.NilAddress, chainConfig)
 
 	signer := types.MakeSigner(chainConfig, blockNum, blockCtx.Time)
 	rules := blockCtx.Rules(chainConfig)
@@ -505,7 +524,7 @@ func (api *OverlayAPIImpl) replayBlock(ctx context.Context, blockNum uint64, sta
 		if receipt.Status == types.ReceiptStatusFailed {
 			log.Debug("[replayBlock] skipping transaction because it has status=failed", "transactionHash", txn.Hash())
 
-			contractCreation := msg.To() == nil
+			contractCreation := msg.To().IsNil()
 			if !contractCreation {
 				// bump the nonce of the sender
 				sender := vm.AccountRef(msg.From())

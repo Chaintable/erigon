@@ -21,7 +21,6 @@ package executiontests
 
 import (
 	"context"
-	"encoding/binary"
 	"fmt"
 	"maps"
 	"math"
@@ -35,22 +34,22 @@ import (
 	"github.com/erigontech/erigon/common"
 	"github.com/erigontech/erigon/common/crypto"
 	"github.com/erigontech/erigon/common/hexutil"
-	"github.com/erigontech/erigon/common/length"
 	"github.com/erigontech/erigon/common/log/v3"
 	"github.com/erigontech/erigon/common/u256"
 	"github.com/erigontech/erigon/db/kv"
-	"github.com/erigontech/erigon/db/kv/bitmapdb"
 	"github.com/erigontech/erigon/db/kv/prune"
 	"github.com/erigontech/erigon/db/rawdb"
+	"github.com/erigontech/erigon/execution/cache"
 	libchain "github.com/erigontech/erigon/execution/chain"
 	chainspec "github.com/erigontech/erigon/execution/chain/spec"
+	"github.com/erigontech/erigon/execution/execmodule/execmoduletester"
 	"github.com/erigontech/erigon/execution/protocol/params"
 	"github.com/erigontech/erigon/execution/protocol/rules/ethash"
 	"github.com/erigontech/erigon/execution/rlp"
 	"github.com/erigontech/erigon/execution/state"
 	"github.com/erigontech/erigon/execution/tests/blockgen"
-	"github.com/erigontech/erigon/execution/tests/mock"
 	"github.com/erigontech/erigon/execution/types"
+	"github.com/erigontech/erigon/execution/types/accounts"
 	"github.com/erigontech/erigon/execution/vm"
 	"github.com/erigontech/erigon/node/gointerfaces/sentryproto"
 	"github.com/erigontech/erigon/p2p/protocols/eth"
@@ -63,7 +62,7 @@ var (
 )
 
 // makeBlockChain creates a deterministic chain of blocks rooted at parent.
-func makeBlockChain(parent *types.Block, n int, m *mock.MockSentry, seed int) *blockgen.ChainPack {
+func makeBlockChain(parent *types.Block, n int, m *execmoduletester.ExecModuleTester, seed int) *blockgen.ChainPack {
 	chain, _ := blockgen.GenerateChain(m.ChainConfig, parent, m.Engine, m.DB, n, func(i int, b *blockgen.BlockGen) {
 		b.SetCoinbase(common.Address{0: byte(seed), 19: byte(i)})
 	})
@@ -73,8 +72,8 @@ func makeBlockChain(parent *types.Block, n int, m *mock.MockSentry, seed int) *b
 // newCanonical creates a chain database, and injects a deterministic canonical
 // chain. Depending on the full flag, if creates either a full block chain or a
 // header only chain.
-func newCanonical(t *testing.T, n int) *mock.MockSentry {
-	m := mock.Mock(t)
+func newCanonical(t *testing.T, n int) *execmoduletester.ExecModuleTester {
+	m := execmoduletester.New(t)
 
 	// Create and inject the requested chain
 	if n == 0 {
@@ -90,7 +89,7 @@ func newCanonical(t *testing.T, n int) *mock.MockSentry {
 }
 
 // Test fork of length N starting from block i
-func testFork(t *testing.T, m *mock.MockSentry, i, n int, comparator func(td1, td2 *big.Int)) {
+func testFork(t *testing.T, m *execmoduletester.ExecModuleTester, i, n int, comparator func(td1, td2 *big.Int)) {
 	// Copy old chain up to #i into a new db
 	canonicalMock := newCanonical(t, i)
 	var err error
@@ -176,6 +175,9 @@ func testFork(t *testing.T, m *mock.MockSentry, i, n int, comparator func(td1, t
 }
 
 func TestLastBlock(t *testing.T) {
+	if testing.Short() {
+		t.Skip("slow test")
+	}
 	t.Parallel()
 	m := newCanonical(t, 0)
 	var err error
@@ -281,7 +283,12 @@ func testLongerFork(t *testing.T, full bool) {
 }
 
 // Tests that chains missing links do not get accepted by the processor.
-func TestBrokenBlockChain(t *testing.T) { testBrokenChain(t) }
+func TestBrokenBlockChain(t *testing.T) {
+	if testing.Short() {
+		t.Skip("slow test")
+	}
+	testBrokenChain(t)
+}
 
 func testBrokenChain(t *testing.T) {
 	t.Parallel()
@@ -298,7 +305,12 @@ func testBrokenChain(t *testing.T) {
 }
 
 // Tests that reorganising a long chain after a short one overwrites the canonical numbers and links in the database.
-func TestReorgLongBlocks(t *testing.T) { testReorgLong(t) }
+func TestReorgLongBlocks(t *testing.T) {
+	if testing.Short() {
+		t.Skip("slow test")
+	}
+	testReorgLong(t)
+}
 
 func testReorgLong(t *testing.T) {
 	t.Parallel()
@@ -306,7 +318,12 @@ func testReorgLong(t *testing.T) {
 }
 
 // Tests that reorganising a short chain after a long one overwrites the canonical numbers and links in the database.
-func TestReorgShortBlocks(t *testing.T) { testReorgShort(t) }
+func TestReorgShortBlocks(t *testing.T) {
+	if testing.Short() {
+		t.Skip("slow test")
+	}
+	testReorgShort(t)
+}
 
 func testReorgShort(t *testing.T) {
 	t.Parallel()
@@ -392,7 +409,10 @@ func testReorg(t *testing.T, first, second []int64, td int64) {
 
 	m.ReceiveWg.Wait()
 
-	msg := m.SentMessage(0)
+	msg, err := m.SentMessage(0)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	require.Equal(sentryproto.MessageId_RECEIPTS_66, msg.Id)
 
@@ -412,10 +432,11 @@ func testReorg(t *testing.T, first, second []int64, td int64) {
 	require.Equal(b, msg.GetData())
 
 	// Make sure the chain total difficulty is the correct one
-	want := new(big.Int).Add(m.Genesis.Difficulty(), big.NewInt(td))
+	genDiff := m.Genesis.Difficulty()
+	want := new(uint256.Int).AddUint64(&genDiff, uint64(td))
 	have, err := rawdb.ReadTdByHash(tx, rawdb.ReadCurrentHeader(tx).Hash())
 	require.NoError(err)
-	if have.Cmp(want) != 0 {
+	if want.CmpBig(have) != 0 {
 		t.Errorf("total difficulty mismatch: have %v, want %v", have, want)
 	}
 	// Make sure the canonical chain is the correct one
@@ -453,8 +474,8 @@ func TestChainTxReorgs(t *testing.T) {
 		signer = types.LatestSigner(gspec.Config)
 	)
 
-	m := mock.MockWithGenesis(t, gspec, key1, false)
-	m2 := mock.MockWithGenesis(t, gspec, key1, false)
+	m := execmoduletester.New(t, execmoduletester.WithGenesisSpec(gspec), execmoduletester.WithKey(key1))
+	m2 := execmoduletester.New(t, execmoduletester.WithGenesisSpec(gspec), execmoduletester.WithKey(key1))
 	defer m2.DB.Close()
 
 	// Create two transactions shared between the chains:
@@ -564,7 +585,7 @@ func TestChainTxReorgs(t *testing.T) {
 	}
 }
 
-func readReceipt(db kv.TemporalTx, txHash common.Hash, m *mock.MockSentry) (*types.Receipt, common.Hash, uint64, uint64, error) {
+func readReceipt(db kv.TemporalTx, txHash common.Hash, m *execmoduletester.ExecModuleTester) (*types.Receipt, common.Hash, uint64, uint64, error) {
 	// Retrieve the context of the receipt based on the transaction hash
 	blockNumber, _, err := rawdb.ReadTxLookupEntry(db, txHash)
 	if err != nil {
@@ -601,6 +622,9 @@ func readReceipt(db kv.TemporalTx, txHash common.Hash, m *mock.MockSentry) (*typ
 
 // Tests if the canonical block can be fetched from the database during chain insertion.
 func TestCanonicalBlockRetrieval(t *testing.T) {
+	if testing.Short() {
+		t.Skip("slow test")
+	}
 	t.Parallel()
 	m := newCanonical(t, 0)
 
@@ -642,6 +666,9 @@ func TestCanonicalBlockRetrieval(t *testing.T) {
 }
 
 func TestEIP155Transition(t *testing.T) {
+	if testing.Short() {
+		t.Skip("slow test")
+	}
 	t.Parallel()
 	// Configure and generate a sample block chai
 
@@ -655,7 +682,7 @@ func TestEIP155Transition(t *testing.T) {
 			Alloc:  types.GenesisAlloc{address: {Balance: funds}, deleteAddr: {Balance: new(big.Int)}},
 		}
 	)
-	m := mock.MockWithGenesis(t, gspec, key, false)
+	m := execmoduletester.New(t, execmoduletester.WithGenesisSpec(gspec), execmoduletester.WithKey(key))
 
 	chain, chainErr := blockgen.GenerateChain(m.ChainConfig, m.Genesis, m.Engine, m.DB, 4, func(i int, block *blockgen.BlockGen) {
 		var (
@@ -774,7 +801,7 @@ func doModesTest(t *testing.T, pm prune.Mode) error {
 			Alloc:  types.GenesisAlloc{address: {Balance: funds}, deleteAddr: {Balance: new(big.Int)}},
 		}
 	)
-	m := mock.MockWithGenesisPruneMode(t, gspec, key, 128, pm, false)
+	m := execmoduletester.New(t, execmoduletester.WithGenesisSpec(gspec), execmoduletester.WithKey(key), execmoduletester.WithBlockBufferSize(128), execmoduletester.WithPruneMode(pm))
 
 	head := uint64(4)
 	chain, err := blockgen.GenerateChain(m.ChainConfig, m.Genesis, m.Engine, m.DB, int(head), func(i int, block *blockgen.BlockGen) {
@@ -830,46 +857,28 @@ func doModesTest(t *testing.T, pm prune.Mode) error {
 	require.NoError(err)
 	defer tx.Rollback()
 
-	if m.HistoryV3 {
-		//TODO: e3 not implemented Prune feature yet
-		/*
-			if pm.History.Enabled() {
-				it, err := tx.(kv.TemporalTx).HistoryRange(temporal.AccountsHistory, 0, int(pm.History.PruneTo(head)), order.Asc, -1)
-				require.NoError(err)
-				count, err := iter.CountKV(it)
-				require.NoError(err)
-				require.Zero(count)
-
-				it, err = tx.(kv.TemporalTx).HistoryRange(temporal.AccountsHistory, int(pm.History.PruneTo(head)), -1, order.Asc, -1)
-				require.NoError(err)
-				count, err = iter.CountKV(it)
-				require.NoError(err)
-				require.Equal(3, count)
-			} else {
-				it, err := tx.(kv.TemporalTx).HistoryRange(temporal.AccountsHistory, 0, -1, order.Asc, -1)
-				require.NoError(err)
-				count, err := iter.CountKV(it)
-				require.NoError(err)
-				require.Equal(3, count)
-			}
-		*/
-	} else {
+	//TODO: e3 not implemented Prune feature yet
+	/*
 		if pm.History.Enabled() {
-			afterPrune := uint64(0)
-			err := tx.ForEach(kv.E2AccountsHistory, nil, func(k, _ []byte) error {
-				n := binary.BigEndian.Uint64(k[length.Addr:])
-				require.Greater(n, pm.History.PruneTo(head))
-				afterPrune++
-				return nil
-			})
-			require.Positive(afterPrune)
+			it, err := tx.(kv.TemporalTx).HistoryRange(temporal.AccountsHistory, 0, int(pm.History.PruneTo(head)), order.Asc, -1)
 			require.NoError(err)
+			count, err := iter.CountKV(it)
+			require.NoError(err)
+			require.Zero(count)
+
+			it, err = tx.(kv.TemporalTx).HistoryRange(temporal.AccountsHistory, int(pm.History.PruneTo(head)), -1, order.Asc, -1)
+			require.NoError(err)
+			count, err = iter.CountKV(it)
+			require.NoError(err)
+			require.Equal(3, count)
 		} else {
-			found, err := bitmapdb.Get64(tx, kv.E2AccountsHistory, address[:], 0, 1024)
+			it, err := tx.(kv.TemporalTx).HistoryRange(temporal.AccountsHistory, 0, -1, order.Asc, -1)
 			require.NoError(err)
-			require.Equal(uint64(0), found.Minimum())
+			count, err := iter.CountKV(it)
+			require.NoError(err)
+			require.Equal(3, count)
 		}
-	}
+	*/
 
 	if pm.History.Enabled() {
 		b, err := m.BlockReader.BlockByNumber(m.Ctx, tx, 1)
@@ -954,13 +963,16 @@ func runPermutation(t *testing.T, testFunc func(*testing.T, prune.Mode) error, c
 }
 
 func TestEIP161AccountRemoval(t *testing.T) {
+	if testing.Short() {
+		t.Skip("slow test")
+	}
 	t.Parallel()
 	// Configure and generate a sample block chain
 	var (
 		key, _  = crypto.HexToECDSA("b71c71a67e1177ad4e901695e1b4b9ee17ae16c6668d313eac2f96dbcda3f291")
 		address = crypto.PubkeyToAddress(key.PublicKey)
 		funds   = big.NewInt(1000000000)
-		theAddr = common.Address{1}
+		theAddr = accounts.InternAddress(common.Address{1})
 		gspec   = &types.Genesis{
 			Config: &libchain.Config{
 				ChainID:               big.NewInt(1),
@@ -971,7 +983,7 @@ func TestEIP161AccountRemoval(t *testing.T) {
 			Alloc: types.GenesisAlloc{address: {Balance: funds}},
 		}
 	)
-	m := mock.MockWithGenesis(t, gspec, key, false)
+	m := execmoduletester.New(t, execmoduletester.WithGenesisSpec(gspec), execmoduletester.WithKey(key))
 
 	chain, err := blockgen.GenerateChain(m.ChainConfig, m.Genesis, m.Engine, m.DB, 3, func(i int, block *blockgen.BlockGen) {
 		var (
@@ -981,11 +993,11 @@ func TestEIP161AccountRemoval(t *testing.T) {
 		)
 		switch i {
 		case 0:
-			txn, err = types.SignTx(types.NewTransaction(block.TxNonce(address), theAddr, new(uint256.Int), 21000, new(uint256.Int), nil), *signer, key)
+			txn, err = types.SignTx(types.NewTransaction(block.TxNonce(address), theAddr.Value(), new(uint256.Int), 21000, new(uint256.Int), nil), *signer, key)
 		case 1:
-			txn, err = types.SignTx(types.NewTransaction(block.TxNonce(address), theAddr, new(uint256.Int), 21000, new(uint256.Int), nil), *signer, key)
+			txn, err = types.SignTx(types.NewTransaction(block.TxNonce(address), theAddr.Value(), new(uint256.Int), 21000, new(uint256.Int), nil), *signer, key)
 		case 2:
-			txn, err = types.SignTx(types.NewTransaction(block.TxNonce(address), theAddr, new(uint256.Int), 21000, new(uint256.Int), nil), *signer, key)
+			txn, err = types.SignTx(types.NewTransaction(block.TxNonce(address), theAddr.Value(), new(uint256.Int), 21000, new(uint256.Int), nil), *signer, key)
 		}
 		if err != nil {
 			t.Fatal(err)
@@ -1051,6 +1063,9 @@ func TestEIP161AccountRemoval(t *testing.T) {
 }
 
 func TestDoubleAccountRemoval(t *testing.T) {
+	if testing.Short() {
+		t.Skip("slow test")
+	}
 	t.Parallel()
 	var (
 		signer      = types.LatestSignerForChainID(nil)
@@ -1065,7 +1080,7 @@ func TestDoubleAccountRemoval(t *testing.T) {
 			Alloc:  types.GenesisAlloc{bankAddress: {Balance: bankFunds}},
 		}
 	)
-	m := mock.MockWithGenesis(t, gspec, bankKey, false)
+	m := execmoduletester.New(t, execmoduletester.WithGenesisSpec(gspec), execmoduletester.WithKey(bankKey))
 
 	var theAddr common.Address
 
@@ -1107,25 +1122,25 @@ func TestDoubleAccountRemoval(t *testing.T) {
 
 	st := state.New(m.NewStateReader(tx))
 	require.NoError(t, err)
-	exist, err := st.Exist(theAddr)
+	exist, err := st.Exist(accounts.InternAddress(theAddr))
 	require.NoError(t, err)
 	assert.False(t, exist, "Contract should've been removed")
 
 	st = state.New(m.NewHistoryStateReader(1, tx))
 	require.NoError(t, err)
-	exist, err = st.Exist(theAddr)
+	exist, err = st.Exist(accounts.InternAddress(theAddr))
 	require.NoError(t, err)
 	assert.False(t, exist, "Contract should not exist at block #0")
 
 	st = state.New(m.NewHistoryStateReader(2, tx))
 	require.NoError(t, err)
-	exist, err = st.Exist(theAddr)
+	exist, err = st.Exist(accounts.InternAddress(theAddr))
 	require.NoError(t, err)
 	assert.True(t, exist, "Contract should exist at block #1")
 
 	st = state.New(m.NewHistoryStateReader(3, tx))
 	require.NoError(t, err)
-	exist, err = st.Exist(theAddr)
+	exist, err = st.Exist(accounts.InternAddress(theAddr))
 	require.NoError(t, err)
 	assert.True(t, exist, "Contract should exist at block #2")
 }
@@ -1142,7 +1157,7 @@ func TestBlockchainHeaderchainReorgConsistency(t *testing.T) {
 
 	t.Parallel()
 	// Generate a canonical chain to act as the main dataset
-	m, m2 := mock.Mock(t), mock.Mock(t)
+	m, m2 := execmoduletester.New(t), execmoduletester.New(t)
 
 	chain, err := blockgen.GenerateChain(m.ChainConfig, m.Genesis, m.Engine, m.DB, 64, func(i int, b *blockgen.BlockGen) { b.SetCoinbase(common.Address{1}) })
 	if err != nil {
@@ -1209,7 +1224,7 @@ func TestLargeReorgTrieGC(t *testing.T) {
 	t.Parallel()
 	// Generate the original common chain segment and the two competing forks
 
-	m, m2 := mock.Mock(t), mock.Mock(t)
+	m, m2 := execmoduletester.New(t), execmoduletester.New(t)
 
 	shared, err := blockgen.GenerateChain(m.ChainConfig, m.Genesis, m.Engine, m.DB, 64, func(i int, b *blockgen.BlockGen) {
 		b.SetCoinbase(common.Address{1})
@@ -1272,7 +1287,7 @@ func TestLowDiffLongChain(t *testing.T) {
 
 	t.Parallel()
 	// Generate a canonical chain to act as the main dataset
-	m := mock.Mock(t)
+	m := execmoduletester.New(t)
 
 	// We must use a pretty long chain to ensure that the fork doesn't overtake us
 	// until after at least 128 blocks post tip
@@ -1297,7 +1312,7 @@ func TestLowDiffLongChain(t *testing.T) {
 	}
 
 	// Import the canonical chain
-	m2 := mock.Mock(t)
+	m2 := execmoduletester.New(t)
 
 	if err := m2.InsertChain(chain); err != nil {
 		t.Fatalf("failed to insert into chain: %v", err)
@@ -1342,6 +1357,9 @@ func TestLowDiffLongChain(t *testing.T) {
 // each transaction, so this works ok. The rework accumulated writes in memory
 // first, but the journal wiped the entire state object on create-revert.
 func TestDeleteCreateRevert(t *testing.T) {
+	if testing.Short() {
+		t.Skip("slow test")
+	}
 	t.Parallel()
 	var (
 		aa = common.HexToAddress("0x000000000000000000000000000000000000aaaa")
@@ -1381,17 +1399,17 @@ func TestDeleteCreateRevert(t *testing.T) {
 			},
 		}
 	)
-	m := mock.MockWithGenesis(t, gspec, key, false)
+	m := execmoduletester.New(t, execmoduletester.WithGenesisSpec(gspec), execmoduletester.WithKey(key))
 
 	chain, err := blockgen.GenerateChain(m.ChainConfig, m.Genesis, m.Engine, m.DB, 1, func(i int, b *blockgen.BlockGen) {
 		b.SetCoinbase(common.Address{1})
 		// One transaction to AAAA
 		tx, _ := types.SignTx(types.NewTransaction(0, aa,
-			u256.Num0, 50000, u256.Num1, nil), *types.LatestSignerForChainID(nil), key)
+			&u256.Num0, 50000, &u256.Num1, nil), *types.LatestSignerForChainID(nil), key)
 		b.AddTx(tx)
 		// One transaction to BBBB
 		tx, _ = types.SignTx(types.NewTransaction(1, bb,
-			u256.Num0, 100000, u256.Num1, nil), *types.LatestSignerForChainID(nil), key)
+			&u256.Num0, 100000, &u256.Num1, nil), *types.LatestSignerForChainID(nil), key)
 		b.AddTx(tx)
 	})
 	if err != nil {
@@ -1411,6 +1429,9 @@ func TestDeleteCreateRevert(t *testing.T) {
 // Expected outcome is that _all_ slots are cleared from A, due to the selfdestruct,
 // and then the new slots exist
 func TestDeleteRecreateSlots(t *testing.T) {
+	if testing.Short() {
+		t.Skip("slow test")
+	}
 	t.Parallel()
 	var (
 		// Generate a canonical chain to act as the main dataset
@@ -1465,8 +1486,8 @@ func TestDeleteRecreateSlots(t *testing.T) {
 		byte(vm.CREATE2),
 	}...)
 
-	initHash := crypto.Keccak256Hash(initCode)
-	aa := types.CreateAddress2(bb, [32]byte{}, initHash[:])
+	initHash := accounts.InternCodeHash(crypto.HashData(initCode))
+	aa := accounts.InternAddress(types.CreateAddress2(bb, [32]byte{}, initHash))
 	t.Logf("Destination address: %x\n", aa)
 
 	gspec := &types.Genesis{
@@ -1474,7 +1495,7 @@ func TestDeleteRecreateSlots(t *testing.T) {
 		Alloc: types.GenesisAlloc{
 			address: {Balance: funds},
 			// The address 0xAAAAA selfdestructs if called
-			aa: {
+			aa.Value(): {
 				// Code needs to just selfdestruct
 				Code:    aaCode,
 				Nonce:   1,
@@ -1488,16 +1509,16 @@ func TestDeleteRecreateSlots(t *testing.T) {
 			},
 		},
 	}
-	m := mock.MockWithGenesis(t, gspec, key, false)
+	m := execmoduletester.New(t, execmoduletester.WithGenesisSpec(gspec), execmoduletester.WithKey(key))
 	chain, err := blockgen.GenerateChain(m.ChainConfig, m.Genesis, m.Engine, m.DB, 1, func(i int, b *blockgen.BlockGen) {
 		b.SetCoinbase(common.Address{1})
 		// One transaction to AA, to kill it
-		tx, _ := types.SignTx(types.NewTransaction(0, aa,
-			u256.Num0, 50000, u256.Num1, nil), *types.LatestSignerForChainID(nil), key)
+		tx, _ := types.SignTx(types.NewTransaction(0, aa.Value(),
+			&u256.Num0, 50000, &u256.Num1, nil), *types.LatestSignerForChainID(nil), key)
 		b.AddTx(tx)
 		// One transaction to BB, to recreate AA
 		tx, _ = types.SignTx(types.NewTransaction(1, bb,
-			u256.Num0, 100000, u256.Num1, nil), *types.LatestSignerForChainID(nil), key)
+			&u256.Num0, 100000, &u256.Num1, nil), *types.LatestSignerForChainID(nil), key)
 		b.AddTx(tx)
 	})
 	if err != nil {
@@ -1514,25 +1535,28 @@ func TestDeleteRecreateSlots(t *testing.T) {
 	statedb := state.New(m.NewHistoryStateReader(2, tx))
 
 	// If all is correct, then slot 1 and 2 are zero
-	key1 := common.HexToHash("01")
-	var got uint256.Int
-	statedb.GetState(aa, key1, &got)
+	key1 := accounts.InternKey(common.HexToHash("01"))
+	got, err := statedb.GetState(aa, key1)
+	require.NoError(t, err)
 	if !got.IsZero() {
 		t.Errorf("got %d exp %d", got.Uint64(), 0)
 	}
-	key2 := common.HexToHash("02")
-	statedb.GetState(aa, key2, &got)
+	key2 := accounts.InternKey(common.HexToHash("02"))
+	got, err = statedb.GetState(aa, key2)
+	require.NoError(t, err)
 	if !got.IsZero() {
 		t.Errorf("got %d exp %d", got.Uint64(), 0)
 	}
 	// Also, 3 and 4 should be set
-	key3 := common.HexToHash("03")
-	statedb.GetState(aa, key3, &got)
+	key3 := accounts.InternKey(common.HexToHash("03"))
+	got, err = statedb.GetState(aa, key3)
+	require.NoError(t, err)
 	if got.Uint64() != 3 {
 		t.Errorf("got %d exp %d", got.Uint64(), 3)
 	}
-	key4 := common.HexToHash("04")
-	statedb.GetState(aa, key4, &got)
+	key4 := accounts.InternKey(common.HexToHash("04"))
+	got, err = statedb.GetState(aa, key4)
+	require.NoError(t, err)
 	if got.Uint64() != 4 {
 		t.Errorf("got %d exp %d", got.Uint64(), 4)
 	}
@@ -1540,6 +1564,9 @@ func TestDeleteRecreateSlots(t *testing.T) {
 }
 
 func TestCVE2020_26265(t *testing.T) {
+	if testing.Short() {
+		t.Skip("slow test")
+	}
 	t.Parallel()
 	var (
 		// Generate a canonical chain to act as the main dataset
@@ -1548,7 +1575,7 @@ func TestCVE2020_26265(t *testing.T) {
 		address = crypto.PubkeyToAddress(key.PublicKey)
 		funds   = big.NewInt(1000000000)
 
-		aa        = common.HexToAddress("0x000000000000000000000000000000000000aaaa")
+		aa        = accounts.InternAddress(common.HexToAddress("0x000000000000000000000000000000000000aaaa"))
 		aaStorage = make(map[common.Hash]common.Hash) // Initial storage in AA
 		aaCode    = []byte{
 			byte(vm.CALLVALUE),
@@ -1591,7 +1618,7 @@ func TestCVE2020_26265(t *testing.T) {
 		Alloc: types.GenesisAlloc{
 			address: {Balance: funds},
 			// The address 0xAAAAA selfdestructs if called
-			aa: {
+			aa.Value(): {
 				// Code needs to just selfdestruct
 				Code:    aaCode,
 				Nonce:   1,
@@ -1607,17 +1634,17 @@ func TestCVE2020_26265(t *testing.T) {
 			},
 		},
 	}
-	m := mock.MockWithGenesis(t, gspec, key, false)
+	m := execmoduletester.New(t, execmoduletester.WithGenesisSpec(gspec), execmoduletester.WithKey(key))
 
 	chain, err := blockgen.GenerateChain(m.ChainConfig, m.Genesis, m.Engine, m.DB, 1, func(i int, b *blockgen.BlockGen) {
 		b.SetCoinbase(common.Address{1})
 		// One transaction to AA, to kill it
 		tx, _ := types.SignTx(types.NewTransaction(0, caller,
-			u256.Num0, 100000, u256.Num1, nil), *types.LatestSignerForChainID(nil), key)
+			&u256.Num0, 100000, &u256.Num1, nil), *types.LatestSignerForChainID(nil), key)
 		b.AddTx(tx)
 		// One transaction to AA, to recreate it (but without storage
-		tx, _ = types.SignTx(types.NewTransaction(1, aa,
-			new(uint256.Int).SetUint64(5), 100000, u256.Num1, nil), *types.LatestSignerForChainID(nil), key)
+		tx, _ = types.SignTx(types.NewTransaction(1, aa.Value(),
+			new(uint256.Int).SetUint64(5), 100000, &u256.Num1, nil), *types.LatestSignerForChainID(nil), key)
 		b.AddTx(tx)
 	})
 	if err != nil {
@@ -1648,6 +1675,9 @@ func TestCVE2020_26265(t *testing.T) {
 // regular value-transfer
 // Expected outcome is that _all_ slots are cleared from A
 func TestDeleteRecreateAccount(t *testing.T) {
+	if testing.Short() {
+		t.Skip("slow test")
+	}
 	t.Parallel()
 	var (
 		// Generate a canonical chain to act as the main dataset
@@ -1656,7 +1686,7 @@ func TestDeleteRecreateAccount(t *testing.T) {
 		address = crypto.PubkeyToAddress(key.PublicKey)
 		funds   = big.NewInt(1000000000)
 
-		aa        = common.HexToAddress("0x7217d81b76bdd8707601e959454e3d776aee5f43")
+		aa        = accounts.InternAddress(common.HexToAddress("0x7217d81b76bdd8707601e959454e3d776aee5f43"))
 		aaStorage = make(map[common.Hash]common.Hash)          // Initial storage in AA
 		aaCode    = []byte{byte(vm.PC), byte(vm.SELFDESTRUCT)} // Code for AA (simple selfdestruct)
 	)
@@ -1669,7 +1699,7 @@ func TestDeleteRecreateAccount(t *testing.T) {
 		Alloc: types.GenesisAlloc{
 			address: {Balance: funds},
 			// The address 0xAAAAA selfdestructs if called
-			aa: {
+			aa.Value(): {
 				// Code needs to just selfdestruct
 				Code:    aaCode,
 				Nonce:   1,
@@ -1678,17 +1708,17 @@ func TestDeleteRecreateAccount(t *testing.T) {
 			},
 		},
 	}
-	m := mock.MockWithGenesis(t, gspec, key, false)
+	m := execmoduletester.New(t, execmoduletester.WithGenesisSpec(gspec), execmoduletester.WithKey(key))
 
 	chain, err := blockgen.GenerateChain(m.ChainConfig, m.Genesis, m.Engine, m.DB, 1, func(i int, b *blockgen.BlockGen) {
 		b.SetCoinbase(common.Address{1})
 		// One transaction to AA, to kill it
-		tx, _ := types.SignTx(types.NewTransaction(0, aa,
-			u256.Num0, 50000, u256.Num1, nil), *types.LatestSignerForChainID(nil), key)
+		tx, _ := types.SignTx(types.NewTransaction(0, aa.Value(),
+			&u256.Num0, 50000, &u256.Num1, nil), *types.LatestSignerForChainID(nil), key)
 		b.AddTx(tx)
 		// One transaction to AA, to recreate it (but without storage
-		tx, _ = types.SignTx(types.NewTransaction(1, aa,
-			u256.Num1, 100000, u256.Num1, nil), *types.LatestSignerForChainID(nil), key)
+		tx, _ = types.SignTx(types.NewTransaction(1, aa.Value(),
+			&u256.Num1, 100000, &u256.Num1, nil), *types.LatestSignerForChainID(nil), key)
 		b.AddTx(tx)
 	})
 	if err != nil {
@@ -1702,14 +1732,15 @@ func TestDeleteRecreateAccount(t *testing.T) {
 		statedb := state.New(m.NewHistoryStateReader(2, tx))
 
 		// If all is correct, then both slots are zero
-		key1 := common.HexToHash("01")
-		var got uint256.Int
-		statedb.GetState(aa, key1, &got)
+		key1 := accounts.InternKey(common.HexToHash("01"))
+		got, err := statedb.GetState(aa, key1)
+		require.NoError(t, err)
 		if !got.IsZero() {
 			t.Errorf("got %x exp %x", got, 0)
 		}
-		key2 := common.HexToHash("02")
-		statedb.GetState(aa, key2, &got)
+		key2 := accounts.InternKey(common.HexToHash("02"))
+		got, err = statedb.GetState(aa, key2)
+		require.NoError(t, err)
 		if !got.IsZero() {
 			t.Errorf("got %x exp %x", got, 0)
 		}
@@ -1787,15 +1818,15 @@ func TestDeleteRecreateSlotsAcrossManyBlocks(t *testing.T) {
 		byte(vm.CREATE2),
 	}...)
 
-	initHash := crypto.Keccak256Hash(initCode)
-	aa := types.CreateAddress2(bb, [32]byte{}, initHash[:])
+	initHash := accounts.InternCodeHash(crypto.HashData(initCode))
+	aa := accounts.InternAddress(types.CreateAddress2(bb, [32]byte{}, initHash))
 	t.Logf("Destination address: %x\n", aa)
 	gspec := &types.Genesis{
 		Config: libchain.TestChainConfig,
 		Alloc: types.GenesisAlloc{
 			address: {Balance: funds},
 			// The address 0xAAAAA selfdestructs if called
-			aa: {
+			aa.Value(): {
 				// Code needs to just selfdestruct
 				Code:    aaCode,
 				Nonce:   1,
@@ -1809,7 +1840,7 @@ func TestDeleteRecreateSlotsAcrossManyBlocks(t *testing.T) {
 			},
 		},
 	}
-	m := mock.MockWithGenesis(t, gspec, key, false)
+	m := execmoduletester.New(t, execmoduletester.WithGenesisSpec(gspec), execmoduletester.WithKey(key))
 	var nonce uint64
 
 	type expectation struct {
@@ -1824,8 +1855,8 @@ func TestDeleteRecreateSlotsAcrossManyBlocks(t *testing.T) {
 	}
 	var expectations []*expectation
 	var newDestruct = func(e *expectation) types.Transaction {
-		tx, _ := types.SignTx(types.NewTransaction(nonce, aa,
-			u256.Num0, 50000, u256.Num1, nil), *types.LatestSignerForChainID(nil), key)
+		tx, _ := types.SignTx(types.NewTransaction(nonce, aa.Value(),
+			&u256.Num0, 50000, &u256.Num1, nil), *types.LatestSignerForChainID(nil), key)
 		nonce++
 		if e.exist {
 			e.exist = false
@@ -1836,7 +1867,7 @@ func TestDeleteRecreateSlotsAcrossManyBlocks(t *testing.T) {
 	}
 	var newResurrect = func(e *expectation) types.Transaction {
 		tx, _ := types.SignTx(types.NewTransaction(nonce, bb,
-			u256.Num0, 100000, u256.Num1, nil), *types.LatestSignerForChainID(nil), key)
+			&u256.Num0, 100000, &u256.Num1, nil), *types.LatestSignerForChainID(nil), key)
 		nonce++
 		if !e.exist {
 			e.exist = true
@@ -1885,14 +1916,15 @@ func TestDeleteRecreateSlotsAcrossManyBlocks(t *testing.T) {
 
 			statedb := state.New(m.NewStateReader(tx))
 			// If all is correct, then slot 1 and 2 are zero
-			key1 := common.HexToHash("01")
-			var got uint256.Int
-			statedb.GetState(aa, key1, &got)
+			key1 := accounts.InternKey(common.HexToHash("01"))
+			got, err := statedb.GetState(aa, key1)
+			require.NoError(t, err)
 			if !got.IsZero() {
 				t.Errorf("block %d, got %x exp %x", blockNum, got, 0)
 			}
-			key2 := common.HexToHash("02")
-			statedb.GetState(aa, key2, &got)
+			key2 := accounts.InternKey(common.HexToHash("02"))
+			got, err = statedb.GetState(aa, key2)
+			require.NoError(t, err)
 			if !got.IsZero() {
 				t.Errorf("block %d, got %x exp %x", blockNum, got, 0)
 			}
@@ -1906,9 +1938,9 @@ func TestDeleteRecreateSlotsAcrossManyBlocks(t *testing.T) {
 					t.Fatalf("block %d, expected %x to exist, it did not", blockNum, aa)
 				}
 				for slot, val := range exp.values {
-					key := asHash(slot)
-					var gotValue uint256.Int
-					statedb.GetState(aa, key, &gotValue)
+					key := accounts.InternKey(asHash(slot))
+					gotValue, err := statedb.GetState(aa, key)
+					require.NoError(t, err)
 					if gotValue.Uint64() != uint64(val) {
 						t.Fatalf("block %d, slot %d, got %x exp %x", blockNum, slot, gotValue, val)
 					}
@@ -1944,6 +1976,9 @@ func TestDeleteRecreateSlotsAcrossManyBlocks(t *testing.T) {
 // We need to either roll back the snapDestructs, or not place it into snapDestructs
 // in the first place.
 func TestInitThenFailCreateContract(t *testing.T) {
+	if testing.Short() {
+		t.Skip("slow test")
+	}
 	t.Parallel()
 	var (
 		// Generate a canonical chain to act as the main dataset
@@ -1988,8 +2023,8 @@ func TestInitThenFailCreateContract(t *testing.T) {
 		byte(vm.CREATE2),
 	}...)
 
-	initHash := crypto.Keccak256Hash(initCode)
-	aa := types.CreateAddress2(bb, [32]byte{}, initHash[:])
+	initHash := accounts.InternCodeHash(crypto.HashData(initCode))
+	aa := accounts.InternAddress(types.CreateAddress2(bb, [32]byte{}, initHash))
 	t.Logf("Destination address: %x\n", aa)
 
 	gspec := &types.Genesis{
@@ -1997,7 +2032,7 @@ func TestInitThenFailCreateContract(t *testing.T) {
 		Alloc: types.GenesisAlloc{
 			address: {Balance: funds},
 			// The address aa has some funds
-			aa: {Balance: big.NewInt(100000)},
+			aa.Value(): {Balance: big.NewInt(100000)},
 			// The contract BB tries to create code onto AA
 			bb: {
 				Code:    bbCode,
@@ -2005,14 +2040,14 @@ func TestInitThenFailCreateContract(t *testing.T) {
 			},
 		},
 	}
-	m := mock.MockWithGenesis(t, gspec, key, false)
+	m := execmoduletester.New(t, execmoduletester.WithGenesisSpec(gspec), execmoduletester.WithKey(key))
 	nonce := uint64(0)
 
 	chain, err := blockgen.GenerateChain(m.ChainConfig, m.Genesis, m.Engine, m.DB, 4, func(i int, b *blockgen.BlockGen) {
 		b.SetCoinbase(common.Address{1})
 		// One transaction to BB
 		tx, _ := types.SignTx(types.NewTransaction(nonce, bb,
-			u256.Num0, 100000, u256.Num1, nil), *types.LatestSignerForChainID(nil), key)
+			&u256.Num0, 100000, &u256.Num1, nil), *types.LatestSignerForChainID(nil), key)
 		b.AddTx(tx)
 		nonce++
 	})
@@ -2063,6 +2098,9 @@ func TestInitThenFailCreateContract(t *testing.T) {
 // checking that the gas usage of a hot SLOAD and a cold SLOAD are calculated
 // correctly.
 func TestEIP2718Transition(t *testing.T) {
+	if testing.Short() {
+		t.Skip("slow test")
+	}
 	t.Parallel()
 	var (
 		aa = common.HexToAddress("0x000000000000000000000000000000000000aaaa")
@@ -2091,7 +2129,7 @@ func TestEIP2718Transition(t *testing.T) {
 			},
 		}
 	)
-	m := mock.MockWithGenesis(t, gspec, key, false)
+	m := execmoduletester.New(t, execmoduletester.WithGenesisSpec(gspec), execmoduletester.WithKey(key))
 
 	chain, err := blockgen.GenerateChain(m.ChainConfig, m.Genesis, m.Engine, m.DB, 1, func(i int, b *blockgen.BlockGen) {
 		b.SetCoinbase(common.Address{1})
@@ -2164,14 +2202,14 @@ func TestEIP1559Transition(t *testing.T) {
 		// A sender who makes transactions, has some funds
 		key1, _ = crypto.HexToECDSA("b71c71a67e1177ad4e901695e1b4b9ee17ae16c6668d313eac2f96dbcda3f291")
 		key2, _ = crypto.HexToECDSA("8a1f9a8f95be41cd7ccb6168179afb4504aefe388d1e14474d32c45c72ce7b7a")
-		addr1   = crypto.PubkeyToAddress(key1.PublicKey)
-		addr2   = crypto.PubkeyToAddress(key2.PublicKey)
-		funds   = new(uint256.Int).Mul(u256.Num1, new(uint256.Int).SetUint64(common.Ether))
+		addr1   = accounts.InternAddress(crypto.PubkeyToAddress(key1.PublicKey))
+		addr2   = accounts.InternAddress(crypto.PubkeyToAddress(key2.PublicKey))
+		funds   = new(uint256.Int).Mul(&u256.Num1, new(uint256.Int).SetUint64(common.Ether))
 		gspec   = &types.Genesis{
 			Config: chainspec.Sepolia.Config,
 			Alloc: types.GenesisAlloc{
-				addr1: {Balance: funds.ToBig()},
-				addr2: {Balance: funds.ToBig()},
+				addr1.Value(): {Balance: funds.ToBig()},
+				addr2.Value(): {Balance: funds.ToBig()},
 				// The address 0xAAAA sloads 0x00 and 0x01
 				aa: {
 					Code: []byte{
@@ -2187,7 +2225,7 @@ func TestEIP1559Transition(t *testing.T) {
 		}
 		signer = types.LatestSigner(gspec.Config)
 	)
-	m := mock.MockWithGenesis(t, gspec, key1, false)
+	m := execmoduletester.New(t, execmoduletester.WithGenesisSpec(gspec), execmoduletester.WithKey(key1))
 
 	chain, err := blockgen.GenerateChain(m.ChainConfig, m.Genesis, m.Engine, m.DB, 501, func(i int, b *blockgen.BlockGen) {
 		if i == 500 {
@@ -2213,7 +2251,7 @@ func TestEIP1559Transition(t *testing.T) {
 				},
 				ChainID:    &chainID,
 				FeeCap:     new(uint256.Int).Mul(new(uint256.Int).SetUint64(5), new(uint256.Int).SetUint64(common.GWei)),
-				TipCap:     u256.Num2,
+				TipCap:     &u256.Num2,
 				AccessList: accesses,
 			}
 			txn, _ = types.SignTx(txn, *signer, key1)
@@ -2242,7 +2280,7 @@ func TestEIP1559Transition(t *testing.T) {
 		statedb := state.New(m.NewHistoryStateReader(1, tx))
 
 		// 3: Ensure that miner received only the tx's tip.
-		actual, err := statedb.GetBalance(block.Coinbase())
+		actual, err := statedb.GetBalance(accounts.InternAddress(block.Coinbase()))
 		if err != nil {
 			return err
 		}
@@ -2272,7 +2310,7 @@ func TestEIP1559Transition(t *testing.T) {
 	chain, err = blockgen.GenerateChain(m.ChainConfig, block, m.Engine, m.DB, 1, func(i int, b *blockgen.BlockGen) {
 		b.SetCoinbase(common.Address{2})
 
-		var txn types.Transaction = types.NewTransaction(0, aa, u256.Num0, 30000, new(uint256.Int).Mul(new(uint256.Int).SetUint64(5), new(uint256.Int).SetUint64(common.GWei)), nil)
+		var txn types.Transaction = types.NewTransaction(0, aa, &u256.Num0, 30000, new(uint256.Int).Mul(new(uint256.Int).SetUint64(5), new(uint256.Int).SetUint64(common.GWei)), nil)
 		txn, _ = types.SignTx(txn, *signer, key2)
 
 		b.AddTx(txn)
@@ -2288,11 +2326,11 @@ func TestEIP1559Transition(t *testing.T) {
 	block = chain.Blocks[0]
 	err = m.DB.ViewTemporal(m.Ctx, func(tx kv.TemporalTx) error {
 		statedb := state.New(m.NewHistoryStateReader(1, tx))
-		baseFee := uint256.MustFromBig(block.BaseFee())
+		baseFee := block.BaseFee()
 		effectiveTip := block.Transactions()[0].GetEffectiveGasTip(baseFee).Uint64()
 
 		// 6+5: Ensure that miner received only the tx's effective tip.
-		actual, err := statedb.GetBalance(block.Coinbase())
+		actual, err := statedb.GetBalance(accounts.InternAddress(block.Coinbase()))
 		if err != nil {
 			return err
 		}
@@ -2317,4 +2355,68 @@ func TestEIP1559Transition(t *testing.T) {
 		return nil
 	})
 	require.NoError(t, err)
+}
+
+// Regression test for https://github.com/erigontech/erigon/issues/20169
+//
+// Tests the SharedDomains StateCache directly, reproducing the exact
+// sequence that caused Hoodi nodes to get stuck:
+//
+//  1. DomainPut writes key=0x42 (populates stateCache with 0x42)
+//  2. Flush + ClearRam (persists to DB, clears mem buffer)
+//  3. DomainDel deletes the key (stateCache.Delete removes entry)
+//  4. Flush + ClearRam (persists deletion to DB, clears mem buffer)
+//  5. GetLatest reads the key — should return nil (deleted)
+//
+// With the bug, step 3's DomainDel calls stateCache.Delete (removing
+// the entry) but step 4's Flush path calls GetLatest which reads nil
+// from mem buffer and does stateCache.Put(nil) → which ALSO deletes
+// from cache. After ClearRam, the mem buffer is empty and the stateCache
+// has no entry. Step 5's GetLatest falls through to the DB, which
+// returns nil (correct, since Flush persisted the deletion).
+//
+// However, if the stateCache was populated between step 2 and step 3
+// by a GetLatest (which caches 0x42 from DB), and the DomainDel's
+// stateCache.Delete removes it, and then stateCache.Put(nil) removes
+// the deletion sentinel, the cache has NO entry for the key. If the
+// DB read in step 5 somehow returns the stale value (e.g. due to
+// transaction isolation), the stale value is returned.
+//
+// This test exercises the StateCache at the cache level to verify
+// that Put(nil) correctly records the deletion as a cache hit.
+func TestStateCacheDeletedStorageSSTOREGas(t *testing.T) {
+	t.Parallel()
+
+	c := cache.NewStateCache(100, 100, 100, 100, 100)
+
+	key := make([]byte, 52) // addr(20) + slot(32)
+	key[0] = 0x1d
+	key[51] = 0xa2
+
+	value := []byte{0x42}
+
+	// Step 1: Put a value (simulates DomainPut caching a storage value)
+	c.Put(kv.StorageDomain, key, value)
+	v, ok := c.Get(kv.StorageDomain, key)
+	require.True(t, ok, "after Put: should be cached")
+	require.Equal(t, value, v)
+
+	// Step 2: Delete the key (simulates DomainDel)
+	c.Delete(kv.StorageDomain, key)
+
+	// Step 3: Put nil (simulates GetLatest caching a deletion from mem buffer)
+	// This is the exact sequence in SharedDomains.GetLatest:
+	//   v, step, ok := sd.mem.GetLatest(domain, k)  // ok=true, v=nil
+	//   sd.stateCache.Put(domain, k, v)              // v=nil
+	c.Put(kv.StorageDomain, key, nil)
+
+	// Step 4: Get must return a cache HIT with empty value.
+	// This is the critical assertion: with the bug, Get returns (nil, false)
+	// meaning "not in cache", so the caller falls through to the DB.
+	v, ok = c.Get(kv.StorageDomain, key)
+	require.True(t, ok,
+		"after Delete+Put(nil): Get must return (nil, true) — cached as deleted. "+
+			"Returning false causes the caller to read stale data from the DB, "+
+			"which is the root cause of the Hoodi gas mismatch (#20169).")
+	require.Empty(t, v, "cached value for a deleted key must be empty")
 }

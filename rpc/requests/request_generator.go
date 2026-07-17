@@ -78,9 +78,10 @@ type RequestGenerator interface {
 	GetTransactionCount(address common.Address, blockRef rpc.BlockReference) (*big.Int, error)
 	BlockNumber() (uint64, error)
 	SendTransaction(signedTx types.Transaction) (common.Hash, error)
+	SendRawTransactionSync(signedTx types.Transaction, timeoutMs *uint64) (*types.Receipt, error)
 	FilterLogs(ctx context.Context, query ethereum.FilterQuery) ([]types.Log, error)
 	SubscribeFilterLogs(ctx context.Context, query ethereum.FilterQuery, ch chan<- types.Log) (ethereum.Subscription, error)
-	Subscribe(ctx context.Context, method SubMethod, subChan interface{}, args ...interface{}) (ethereum.Subscription, error)
+	Subscribe(ctx context.Context, method SubMethod, subChan any, args ...any) (ethereum.Subscription, error)
 	TxpoolContent() (int, int, int, error)
 	Call(args ethapi.CallArgs, blockRef rpc.BlockReference, overrides *ethapi.StateOverrides) ([]byte, error)
 	TraceCall(blockRef rpc.BlockReference, args ethapi.CallArgs, traceOpts ...TraceOpt) (*TraceCallResult, error)
@@ -116,6 +117,8 @@ var Methods = struct {
 	ETHGetBalance RPCMethod
 	// ETHSendRawTransaction represents the eth_sendRawTransaction method
 	ETHSendRawTransaction RPCMethod
+	// ETHSendRawTransactionSync represents the eth_sendRawTransactionSync method
+	ETHSendRawTransactionSync RPCMethod
 	// ETHGetBlockByNumber represents the eth_getBlockByNumber method
 	ETHGetBlockByNumber RPCMethod
 	// ETHGetBlock represents the eth_getBlock method
@@ -145,32 +148,33 @@ var Methods = struct {
 	BorGetRootHash           RPCMethod
 	ETHCall                  RPCMethod
 }{
-	ETHGetTransactionCount:   "eth_getTransactionCount",
-	ETHGetBalance:            "eth_getBalance",
-	ETHSendRawTransaction:    "eth_sendRawTransaction",
-	ETHGetBlockByNumber:      "eth_getBlockByNumber",
-	ETHGetBlock:              "eth_getBlock",
-	ETHGetLogs:               "eth_getLogs",
-	ETHBlockNumber:           "eth_blockNumber",
-	AdminNodeInfo:            "admin_nodeInfo",
-	TxpoolContent:            "txpool_content",
-	OTSGetBlockDetails:       "ots_getBlockDetails",
-	ETHNewHeads:              "eth_newHeads",
-	ETHLogs:                  "eth_logs",
-	TraceCall:                "trace_call",
-	TraceTransaction:         "trace_transaction",
-	DebugAccountAt:           "debug_accountAt",
-	ETHGetCode:               "eth_getCode",
-	ETHEstimateGas:           "eth_estimateGas",
-	ETHGasPrice:              "eth_gasPrice",
-	ETHGetTransactionByHash:  "eth_getTransactionByHash",
-	ETHGetTransactionReceipt: "eth_getTransactionReceipt",
-	ETHGetBlockReceipts:      "eth_getBlockReceipts",
-	BorGetRootHash:           "bor_getRootHash",
-	ETHCall:                  "eth_call",
+	ETHGetTransactionCount:    "eth_getTransactionCount",
+	ETHGetBalance:             "eth_getBalance",
+	ETHSendRawTransaction:     "eth_sendRawTransaction",
+	ETHSendRawTransactionSync: "eth_sendRawTransactionSync",
+	ETHGetBlockByNumber:       "eth_getBlockByNumber",
+	ETHGetBlock:               "eth_getBlock",
+	ETHGetLogs:                "eth_getLogs",
+	ETHBlockNumber:            "eth_blockNumber",
+	AdminNodeInfo:             "admin_nodeInfo",
+	TxpoolContent:             "txpool_content",
+	OTSGetBlockDetails:        "ots_getBlockDetails",
+	ETHNewHeads:               "eth_newHeads",
+	ETHLogs:                   "eth_logs",
+	TraceCall:                 "trace_call",
+	TraceTransaction:          "trace_transaction",
+	DebugAccountAt:            "debug_accountAt",
+	ETHGetCode:                "eth_getCode",
+	ETHEstimateGas:            "eth_estimateGas",
+	ETHGasPrice:               "eth_gasPrice",
+	ETHGetTransactionByHash:   "eth_getTransactionByHash",
+	ETHGetTransactionReceipt:  "eth_getTransactionReceipt",
+	ETHGetBlockReceipts:       "eth_getBlockReceipts",
+	BorGetRootHash:            "bor_getRootHash",
+	ETHCall:                   "eth_call",
 }
 
-func (req *requestGenerator) rpcCallJSON(method RPCMethod, body string, response interface{}) callResult {
+func (req *requestGenerator) rpcCallJSON(method RPCMethod, body string, response any) callResult {
 	ctx := context.Background()
 	req.reqID++
 	start := time.Now()
@@ -190,7 +194,7 @@ func (req *requestGenerator) rpcCallJSON(method RPCMethod, body string, response
 	}
 }
 
-func (req *requestGenerator) rpcCall(ctx context.Context, result interface{}, method RPCMethod, args ...interface{}) error {
+func (req *requestGenerator) rpcCall(ctx context.Context, result any, method RPCMethod, args ...any) error {
 	client, err := req.rpcClient(ctx)
 	if err != nil {
 		return err
@@ -199,6 +203,15 @@ func (req *requestGenerator) rpcCall(ctx context.Context, result interface{}, me
 	return retryConnects(ctx, func(ctx context.Context) error {
 		return client.CallContext(ctx, result, string(method), args...)
 	})
+}
+
+func (req *requestGenerator) rpcCallOnce(ctx context.Context, result any, method RPCMethod, args ...any) error {
+	client, err := req.rpcClient(ctx)
+	if err != nil {
+		return err
+	}
+
+	return client.CallContext(ctx, result, string(method), args...)
 }
 
 const requestTimeout = time.Second * 20
@@ -334,7 +347,7 @@ func (req *requestGenerator) rpcClient(ctx context.Context) (*rpc.Client, error)
 	return req.requestClient, nil
 }
 
-func post(ctx context.Context, client *http.Client, url, method, request string, response interface{}, logger log.Logger) error {
+func post(ctx context.Context, client *http.Client, url, method, request string, response any, logger log.Logger) error {
 	start := time.Now()
 
 	req, err := http.NewRequest("POST", url, strings.NewReader(request))
@@ -380,7 +393,7 @@ func post(ctx context.Context, client *http.Client, url, method, request string,
 }
 
 // subscribe connects to a websocket client and returns the subscription handler and a channel buffer
-func (req *requestGenerator) Subscribe(ctx context.Context, method SubMethod, subChan interface{}, args ...interface{}) (ethereum.Subscription, error) {
+func (req *requestGenerator) Subscribe(ctx context.Context, method SubMethod, subChan any, args ...any) (ethereum.Subscription, error) {
 	if req.subscriptionClient == nil {
 		err := retryConnects(ctx, func(ctx context.Context) error {
 			var err error
@@ -398,7 +411,7 @@ func (req *requestGenerator) Subscribe(ctx context.Context, method SubMethod, su
 		return nil, fmt.Errorf("cannot get namespace and submethod from method: %v", err)
 	}
 
-	args = append([]interface{}{subMethod}, args...)
+	args = append([]any{subMethod}, args...)
 
 	return req.subscriptionClient.Subscribe(ctx, namespace, subChan, args...)
 }

@@ -25,8 +25,8 @@ import (
 	"github.com/erigontech/erigon/common/empty"
 	"github.com/erigontech/erigon/common/length"
 	"github.com/erigontech/erigon/db/config3"
+	"github.com/erigontech/erigon/execution/protocol/misc"
 	"github.com/erigontech/erigon/execution/protocol/rules"
-	"github.com/erigontech/erigon/execution/protocol/rules/misc"
 	"github.com/erigontech/erigon/execution/types"
 )
 
@@ -35,9 +35,6 @@ import (
 // looking those up from the database. This is useful for concurrently verifying
 // a batch of new headers.
 func (c *Clique) verifyHeader(chain rules.ChainHeaderReader, header *types.Header, parents []*types.Header) error {
-	if header.Number == nil {
-		return errUnknownBlock
-	}
 	number := header.Number.Uint64()
 
 	now := time.Now()
@@ -88,7 +85,7 @@ func (c *Clique) verifyHeader(chain rules.ChainHeaderReader, header *types.Heade
 	}
 	// Ensure that the block's difficulty is meaningful (may not be correct at this point)
 	if number > 0 {
-		if header.Difficulty == nil || (header.Difficulty.Cmp(DiffInTurn) != 0 && header.Difficulty.Cmp(diffNoTurn) != 0) {
+		if header.Difficulty.CmpUint64(DiffInTurn) != 0 && header.Difficulty.CmpUint64(diffNoTurn) != 0 {
 			return errInvalidDifficulty
 		}
 	}
@@ -99,6 +96,14 @@ func (c *Clique) verifyHeader(chain rules.ChainHeaderReader, header *types.Heade
 
 	if header.RequestsHash != nil {
 		return rules.ErrUnexpectedRequests
+	}
+
+	if header.SlotNumber != nil {
+		return rules.ErrUnexpectedSlotNumber
+	}
+
+	if header.BlockAccessListHash != nil {
+		return rules.ErrUnexpectedBlockAccessListHash
 	}
 
 	// All basic checks passed, verify cascading fields
@@ -282,11 +287,11 @@ func (c *Clique) verifySeal(chain rules.ChainHeaderReader, header *types.Header,
 
 	// Ensure that the difficulty corresponds to the turn-ness of the signer
 	if !c.FakeDiff {
-		inturn := snap.inturn(header.Number.Uint64(), signer)
-		if inturn && header.Difficulty.Cmp(DiffInTurn) != 0 {
+		inturn := snap.inturn(header.Number.Uint64(), signer.Value())
+		if inturn && header.Difficulty.CmpUint64(DiffInTurn) != 0 {
 			return errWrongDifficulty
 		}
-		if !inturn && header.Difficulty.Cmp(diffNoTurn) != 0 {
+		if !inturn && header.Difficulty.CmpUint64(diffNoTurn) != 0 {
 			return errWrongDifficulty
 		}
 	}

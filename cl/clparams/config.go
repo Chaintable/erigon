@@ -51,6 +51,11 @@ type CaplinConfig struct {
 	ImmediateBlobsBackfilling bool
 	BlobPruningDisabled       bool
 	SnapshotGenerationEnabled bool
+	// ColumnKeepSlots is the number of slots to keep PeerDAS data column sidecars.
+	// Default: MIN_EPOCHS_FOR_DATA_COLUMN_SIDECARS_REQUESTS * SLOTS_PER_EPOCH (4096 * 32 = 131072, ~18 days).
+	// Increase for DA oracle nodes or rollups that need longer history; decrease only if disk is constrained
+	// and spec compliance for column serving is not required.
+	ColumnKeepSlots uint64
 	// Network related config
 	NetworkId NetworkType
 	// DisableCheckpointSync is optional and is used to disable checkpoint sync used by default in the node
@@ -74,6 +79,7 @@ type CaplinConfig struct {
 	SubscribeAllTopics          bool
 	MaxPeerCount                uint64
 	EnableUPnP                  bool
+	CaplinNAT                   string // NAT mode for Caplin P2P (extip:<IP>|stun|upnp|pmp|none)
 	MaxInboundTrafficPerPeer    datasize.ByteSize
 	MaxOutboundTrafficPerPeer   datasize.ByteSize
 	AdptableTrafficRequirements bool
@@ -138,7 +144,7 @@ var (
 		"enr:-LK4QA8FfhaAjlb_BXsXxSfiysR7R52Nhi9JBt4F8SPssu8hdE1BXQQEtVDC3qStCW60LSO7hEsVHv5zm8_6Vnjhcn0Bh2F0dG5ldHOIAAAAAAAAAACEZXRoMpC1MD8qAAAAAP__________gmlkgnY0gmlwhAN4aBKJc2VjcDI1NmsxoQJerDhsJ-KxZ8sHySMOCmTO6sHM3iCFQ6VMvLTe948MyYN0Y3CCI4yDdWRwgiOM",
 		"enr:-LK4QKWrXTpV9T78hNG6s8AM6IO4XH9kFT91uZtFg1GcsJ6dKovDOr1jtAAFPnS2lvNltkOGA9k29BUN7lFh_sjuc9QBh2F0dG5ldHOIAAAAAAAAAACEZXRoMpC1MD8qAAAAAP__________gmlkgnY0gmlwhANAdd-Jc2VjcDI1NmsxoQLQa6ai7y9PMN5hpLe5HmiJSlYzMuzP7ZhwRiwHvqNXdoN0Y3CCI4yDdWRwgiOM",
 	}
-	SepoliaBootstrapNodes = append(MainnetBootstrapNodes,
+	SepoliaBootstrapNodes = []string{
 		"enr:-Iq4QMCTfIMXnow27baRUb35Q8iiFHSIDBJh6hQM5Axohhf4b6Kr_cOCu0htQ5WvVqKvFgY28893DHAg8gnBAXsAVqmGAX53x8JggmlkgnY0gmlwhLKAlv6Jc2VjcDI1NmsxoQK6S-Cii_KmfFdUJL2TANL3ksaKUnNXvTCv1tLwXs0QgIN1ZHCCIyk",
 		"enr:-KG4QE5OIg5ThTjkzrlVF32WT_-XT14WeJtIz2zoTqLLjQhYAmJlnk4ItSoH41_2x0RX0wTFIe5GgjRzU2u7Q1fN4vADhGV0aDKQqP7o7pAAAHAyAAAAAAAAAIJpZIJ2NIJpcISlFsStiXNlY3AyNTZrMaEC-Rrd_bBZwhKpXzFCrStKp1q_HmGOewxY3KwM8ofAj_ODdGNwgiMog3VkcIIjKA",
 		"enr:-L64QC9Hhov4DhQ7mRukTOz4_jHm4DHlGL726NWH4ojH1wFgEwSin_6H95Gs6nW2fktTWbPachHJ6rUFu0iJNgA0SB2CARqHYXR0bmV0c4j__________4RldGgykDb6UBOQAABx__________-CaWSCdjSCaXCEA-2vzolzZWNwMjU2azGhA17lsUg60R776rauYMdrAz383UUgESoaHEzMkvm4K6k6iHN5bmNuZXRzD4N0Y3CCIyiDdWRwgiMo",
@@ -151,9 +157,9 @@ var (
 		"enr:-Ku4QHRyRwEPT7s0XLYzJ_EeeWvZTXBQb4UCGy1F_3m-YtCNTtDlGsCMr4UTgo4uR89pv11uM-xq4w6GKfKhqU31hTgCh2F0dG5ldHOIAAAAAAAAAACEZXRoMpCo_ujukAAAaf__________gmlkgnY0gmlwhIrFM7WJc2VjcDI1NmsxoQI4diTwChN3zAAkarf7smOHCdFb1q3DSwdiQ_Lc_FdzFIN1ZHCCIy0",
 		"enr:-Ku4QOkvvf0u5Hg4-HhY-SJmEyft77G5h3rUM8VF_e-Hag5cAma3jtmFoX4WElLAqdILCA-UWFRN1ZCDJJVuEHrFeLkDh2F0dG5ldHOIAAAAAAAAAACEZXRoMpCo_ujukAAAaf__________gmlkgnY0gmlwhJK-AWeJc2VjcDI1NmsxoQLFcT5VE_NMiIC8Ll7GypWDnQ4UEmuzD7hF_Hf4veDJwIN1ZHCCIy0",
 		"enr:-Ku4QH6tYsHKITYeHUu5kdfXgEZWI18EWk_2RtGOn1jBPlx2UlS_uF3Pm5Dx7tnjOvla_zs-wwlPgjnEOcQDWXey51QCh2F0dG5ldHOIAAAAAAAAAACEZXRoMpCo_ujukAAAaf__________gmlkgnY0gmlwhIs7Mc6Jc2VjcDI1NmsxoQIET4Mlv9YzhrYhX_H9D7aWMemUrvki6W4J2Qo0YmFMp4N1ZHCCIy0",
-		"enr:-Ku4QDmz-4c1InchGitsgNk4qzorWMiFUoaPJT4G0IiF8r2UaevrekND1o7fdoftNucirj7sFFTTn2-JdC2Ej0p1Mn8Ch2F0dG5ldHOIAAAAAAAAAACEZXRoMpCo_ujukAAAaf__________gmlkgnY0gmlwhKpA-liJc2VjcDI1NmsxoQMpHP5U1DK8O_JQU6FadmWbE42qEdcGlllR8HcSkkfWq4N1ZHCCIy0")
-
-	GnosisBootstrapNodes = append(MainnetBootstrapNodes, []string{
+		"enr:-Ku4QDmz-4c1InchGitsgNk4qzorWMiFUoaPJT4G0IiF8r2UaevrekND1o7fdoftNucirj7sFFTTn2-JdC2Ej0p1Mn8Ch2F0dG5ldHOIAAAAAAAAAACEZXRoMpCo_ujukAAAaf__________gmlkgnY0gmlwhKpA-liJc2VjcDI1NmsxoQMpHP5U1DK8O_JQU6FadmWbE42qEdcGlllR8HcSkkfWq4N1ZHCCIy0",
+	}
+	GnosisBootstrapNodes = []string{
 		"enr:-Ly4QIAhiTHk6JdVhCdiLwT83wAolUFo5J4nI5HrF7-zJO_QEw3cmEGxC1jvqNNUN64Vu-xxqDKSM528vKRNCehZAfEBh2F0dG5ldHOIAAAAAAAAAACEZXRoMpCCS-QxAgAAZP__________gmlkgnY0gmlwhEFtZ5SJc2VjcDI1NmsxoQJwgL5C-30E8RJmW8gCb7sfwWvvfre7wGcCeV4X1G2wJYhzeW5jbmV0cwCDdGNwgiMog3VkcIIjKA",
 		"enr:-Ly4QDhEjlkf8fwO5uWAadexy88GXZneTuUCIPHhv98v8ZfXMtC0S1S_8soiT0CMEgoeLe9Db01dtkFQUnA9YcnYC_8Bh2F0dG5ldHOIAAAAAAAAAACEZXRoMpCCS-QxAgAAZP__________gmlkgnY0gmlwhEFtZ5WJc2VjcDI1NmsxoQMRSho89q2GKx_l2FZhR1RmnSiQr6o_9hfXfQUuW6bjMohzeW5jbmV0cwCDdGNwgiMog3VkcIIjKA",
 		"enr:-Ly4QLKgv5M2D4DYJgo6s4NG_K4zu4sk5HOLCfGCdtgoezsbfRbfGpQ4iSd31M88ec3DHA5FWVbkgIas9EaJeXia0nwBh2F0dG5ldHOIAAAAAAAAAACEZXRoMpCCS-QxAgAAZP__________gmlkgnY0gmlwhI1eYRaJc2VjcDI1NmsxoQLpK_A47iNBkVjka9Mde1F-Kie-R0sq97MCNKCxt2HwOIhzeW5jbmV0cwCDdGNwgiMog3VkcIIjKA",
@@ -162,7 +168,7 @@ var (
 		"enr:-KK4QKXJq1QOVWuJAGige4uaT8LRPQGCVRf3lH3pxjaVScMRUfFW1eiiaz8RwOAYvw33D4EX-uASGJ5QVqVCqwccxa-Bi4RldGgykCGm-DYDAABk__________-CaWSCdjSCaXCEM0QnzolzZWNwMjU2azGhAhNvrRkpuK4MWTf3WqiOXSOePL8Zc-wKVpZ9FQx_BDadg3RjcIIjKIN1ZHCCIyg",
 		"enr:-LO4QO87Rn2ejN3SZdXkx7kv8m11EZ3KWWqoIN5oXwQ7iXR9CVGd1dmSyWxOL1PGsdIqeMf66OZj4QGEJckSi6okCdWBpIdhdHRuZXRziAAAAABgAAAAhGV0aDKQPr_UhAQAAGT__________4JpZIJ2NIJpcIQj0iX1iXNlY3AyNTZrMaEDd-_eqFlWWJrUfEp8RhKT9NxdYaZoLHvsp3bbejPyOoeDdGNwgiMog3VkcIIjKA",
 		"enr:-LK4QIJUAxX9uNgW4ACkq8AixjnSTcs9sClbEtWRq9F8Uy9OEExsr4ecpBTYpxX66cMk6pUHejCSX3wZkK2pOCCHWHEBh2F0dG5ldHOIAAAAAAAAAACEZXRoMpA-v9SEBAAAZP__________gmlkgnY0gmlwhCPSnDuJc2VjcDI1NmsxoQNuaAjFE-ANkH3pbeBdPiEIwjR5kxFuKaBWxHkqFuPz5IN0Y3CCIyiDdWRwgiMo",
-	}...)
+	}
 	ChiadoBootstrapNodes = []string{
 		// chiado-lighthouse-0
 		"enr:-L64QOijsdi9aVIawMb5h5PWueaPM9Ai6P17GNPFlHzz7MGJQ8tFMdYrEx8WQitNKLG924g2Q9cCdzg54M0UtKa3QIKCMxaHYXR0bmV0c4j__________4RldGgykDE2cEMCAABv__________-CaWSCdjSCaXCEi5AaWYlzZWNwMjU2azGhA8CjTkD4m1s8FbKCN18LgqlYcE65jrT148vFtwd9U62SiHN5bmNuZXRzD4N0Y3CCIyiDdWRwgiMo",
@@ -188,6 +194,16 @@ var (
 		"enr:-Ku4QIC89sMC0o-irosD4_23lJJ4qCGOvdUz7SmoShWx0k6AaxCFTKviEHa-sa7-EzsiXpDp0qP0xzX6nKdXJX3X-IQBh2F0dG5ldHOIAAAAAAAAAACEZXRoMpBd9cEGEAAJEP__________gmlkgnY0gmlwhIbRilSJc2VjcDI1NmsxoQK_m0f1DzDc9Cjrspm36zuRa7072HSiMGYWLsKiVSbP34N1ZHCCIyk",
 		"enr:-Ku4QNkWjw5tNzo8DtWqKm7CnDdIq_y7xppD6c1EZSwjB8rMOkSFA1wJPLoKrq5UvA7wcxIotH6Usx3PAugEN2JMncIBh2F0dG5ldHOIAAAAAAAAAACEZXRoMpBd9cEGEAAJEP__________gmlkgnY0gmlwhIbHuBeJc2VjcDI1NmsxoQP3FwrhFYB60djwRjAoOjttq6du94DtkQuaN99wvgqaIYN1ZHCCIyk",
 		"enr:-OS4QMJGE13xEROqvKN1xnnt7U-noc51VXyM6wFMuL9LMhQDfo1p1dF_zFdS4OsnXz_vIYk-nQWnqJMWRDKvkSK6_CwDh2F0dG5ldHOIAAAAADAAAACGY2xpZW502IpMaWdodGhvdXNljDcuMC4wLWJldGEuM4RldGgykNLxmX9gAAkQAAgAAAAAAACCaWSCdjSCaXCEhse4F4RxdWljgiMqiXNlY3AyNTZrMaECef77P8k5l3PC_raLw42OAzdXfxeQ-58BJriNaqiRGJSIc3luY25ldHMAg3RjcIIjKIN1ZHCCIyg",
+	}
+	BloatnetBootstrapNodes = []string{
+		"enr:-Iq4QO5d3m9DzBlj1PLCovLotwN8b9mFp_MrCx-KiNjzltphcYYT7oeD-VU7qyuNJd50X3wlJwjd6C989B3DkVcQ3tiGAZfpKz9kgmlkgnY0gmlwhJ20DuWJc2VjcDI1NmsxoQJJ3h8aUO3GJHv-bdvHtsQZ2OEisutelYfGjXO4lSg8BYN1ZHCCIzI",
+		"enr:-LK4QL8T5e1VWIkPmwdj_tYp0aR-GAqiKg2dO6azs25df44IT6TTZt-iybpRpAblEWEARfYKr3LWglSS0TNzlQ243nUEh2F0dG5ldHOIAAAAAAAAAAyEZXRoMpCpeSKMYDZEaf__________gmlkgnY0gmlwhJ20DuWJc2VjcDI1NmsxoQPlfW3XDntHy35jQwan5Cyesx4lrVVXDdyfOlcsnBL6S4N0Y3CCIyiDdWRwgiMo",
+		"enr:-N24QFEzQ_JIL0cEz4HROg-YhNJgX75kjiawDIhTt3DGKU-sYnxnTfOuCeO6B3mS0nl7-aNSPMXPzl8Gi4knbOjbGkkDh2F0dG5ldHOIAAAAAAAABgCGY2xpZW500YpMaWdodGhvdXNlhTguMS4whGV0aDKQqXkijGA2RGn__________4JpZIJ2NIJpcITOvTovhHF1aWOCIymJc2VjcDI1NmsxoQL8higsdFOIx759KuDWcM09KXKQvMqTARVKnN6S5qELUohzeW5jbmV0cwCDdGNwgiMog3VkcIIjKA",
+		"enr:-N24QPb7SqEEvJK5ws9HxJWC4K0kcSJW5ZwlWDRo7TEM2w0xIXQMRJjT8hYVlYx5e_KWZa2JMEF6kNfQ0XVijo_5a5IDh2F0dG5ldHOIAAAAYAAAAACGY2xpZW500YpMaWdodGhvdXNlhTguMS4whGV0aDKQqXkijGA2RGn__________4JpZIJ2NIJpcISdtA7mhHF1aWOCIymJc2VjcDI1NmsxoQJMmRIjDEBzk1RE01Bvb_fIXG9ZfxKs92CypoBJTE6y44hzeW5jbmV0cwCDdGNwgiMog3VkcIIjKA",
+		"enr:-N24QHsp9pbbf-6tYpyaUP1eaXNbUKgkQ_kkVOqxAgF3vOrIHjDbeqVltdhkHVVzD4C4lC9zhP5HbLplCZrw5c9idNsDh2F0dG5ldHOIAAAAAMAAAACGY2xpZW500YpMaWdodGhvdXNlhTguMS4whGV0aDKQqXkijGA2RGn__________4JpZIJ2NIJpcISdtA7jhHF1aWOCIymJc2VjcDI1NmsxoQJMAIcNubXwQuD9RYFo4rcOc58C5YqexXLAS5sFzWJNTohzeW5jbmV0cwCDdGNwgiMog3VkcIIjKA",
+		"enr:-Le4QGFJJPou4aP5ghuvjc_aIohwh1-hE2f2M3Ec5Qn4CJbQTMCMmzEDA8L5eiv9pLwjmrR9xcPky9S-U1YFTUo2_7cDh2F0dG5ldHOIAAADAAAAAACDY2djBIRldGgykKl5IoxgNkRp__________-CaWSCdjSCaXCEnbQO4olzZWNwMjU2azGhAlvTDd_xk8EfKIqq0uqh7RYxTkVq4KjYoE0rB75SyzGqg3RjcIIjKIN1ZHCCIyg",
+		"enr:-Mq4QGYx7TrWf9SO6dJUxcON0pT6G3LsoeHXxl7FvEOlPQpSK-pc6jqWk3REApaO5mIUzLcz9SK29Zj0naftKvJg-6eGAZxwhJQCh2F0dG5ldHOIAAAAAAAAAAyEZXRoMpCpeSKMcAAAAP__________gmlkgnY0gmlwhJ20DuGEcXVpY4IyyIlzZWNwMjU2azGhA3rJ9h5udMo-Bz4vMDH1h1YSDoKRiE4oYK6xOMictvbziHN5bmNuZXRzD4N0Y3CCIyiDdWRwgiMo",
+		"enr:-LK4QFs_NfU-2-9t1yjePgJFVsZZoVsEx_mXN8BkKgo5f30CIUtZcxAfcDL5bE33Y77fD4rcOXD9OGbO360Vvpk9oZcEh2F0dG5ldHOIDAAAAAAAAACEZXRoMpCpeSKMYDZEaf__________gmlkgnY0gmlwhJ20DuSJc2VjcDI1NmsxoQIwulbHaiOcC3DFsV7btzBVbU1jBIM0BpwsunpYg-t8OoN0Y3CCIyiDdWRwgiMo",
 	}
 )
 
@@ -321,6 +337,27 @@ var NetworkConfigs map[NetworkType]NetworkConfig = map[NetworkType]NetworkConfig
 		MinimumPeersInSubnetSearch:      20,
 		BootNodes:                       HoodiBootstrapNodes,
 	},
+
+	chainspec.BloatnetNetworkID: { // Bloatnet - uses mainnet config
+		GossipMaxSize:                   10485760,
+		GossipMaxSizeBellatrix:          15728640,
+		MaxChunkSize:                    MaxChunkSize,
+		AttestationSubnetCount:          64,
+		AttestationPropagationSlotRange: 32,
+		AttestationSubnetPrefixBits:     6,
+		TtfbTimeout:                     ConfigDurationSec(ReqTimeout),
+		RespTimeout:                     ConfigDurationSec(RespTimeout),
+		MaximumGossipClockDisparity:     ConfigDurationMSec(500 * time.Millisecond),
+		MessageDomainInvalidSnappy:      [4]byte{00, 00, 00, 00},
+		MessageDomainValidSnappy:        [4]byte{01, 00, 00, 00},
+		Eth2key:                         "eth2",
+		AttSubnetKey:                    "attnets",
+		SyncCommsSubnetKey:              "syncnets",
+		CgcKey:                          "cgc",
+		NfdKey:                          "nfd",
+		MinimumPeersInSubnetSearch:      20,
+		BootNodes:                       BloatnetBootstrapNodes,
+	},
 }
 
 // Trusted checkpoint sync endpoints: https://eth-clients.github.io/checkpoint-sync-endpoints/
@@ -347,6 +384,9 @@ var CheckpointSyncEndpoints = map[NetworkType][]string{
 	chainspec.HoodiChainID: {
 		"https://checkpoint-sync.hoodi.ethpandaops.io/eth/v2/debug/beacon/states/finalized",
 		"https://hoodi-checkpoint-sync.attestant.io/eth/v2/debug/beacon/states/finalized",
+	},
+	chainspec.BloatnetNetworkID: {
+		"https://checkpoint-sync.perf-devnet-3.ethpandaops.io/eth/v2/debug/beacon/states/finalized",
 	},
 }
 
@@ -1084,6 +1124,63 @@ func hoodiConfig() BeaconChainConfig {
 
 }
 
+func bloatnetConfig() BeaconChainConfig {
+	cfg := MainnetBeaconConfig
+	cfg.ConfigName = "testnet"
+	cfg.MinGenesisActiveValidatorCount = 500
+	cfg.MinGenesisTime = 1771423200 // 2026-Feb-19 02:00:00 AM UTC
+	cfg.GenesisForkVersion = 0x10364469
+	cfg.GenesisDelay = 60
+
+	// Time parameters
+	cfg.SecondsPerSlot = 12
+	cfg.SecondsPerETH1Block = 12
+	cfg.Eth1FollowDistance = 2048
+	cfg.MinValidatorWithdrawabilityDelay = 2
+	cfg.ShardCommitteePeriod = 256
+
+	// Validator cycle
+	cfg.InactivityScoreBias = 4
+	cfg.InactivityScoreRecoveryRate = 16
+	cfg.EjectionBalance = 16000000000
+	cfg.MinPerEpochChurnLimit = 4
+	cfg.ChurnLimitQuotient = 128
+	cfg.MaxPerEpochActivationChurnLimit = 8
+
+	// Forking - all forks at epoch 0 except Fulu
+	cfg.AltairForkEpoch = 0
+	cfg.AltairForkVersion = 0x20364469
+	cfg.BellatrixForkEpoch = 0
+	cfg.BellatrixForkVersion = 0x30364469
+	cfg.CapellaForkEpoch = 0
+	cfg.CapellaForkVersion = 0x40364469
+	cfg.DenebForkEpoch = 0
+	cfg.DenebForkVersion = 0x50364469
+	cfg.ElectraForkEpoch = 0
+	cfg.ElectraForkVersion = 0x60364469
+	cfg.FuluForkEpoch = math.MaxUint64
+	cfg.FuluForkVersion = 0x70000000
+	cfg.TerminalTotalDifficulty = "58750000000000000000000"
+	cfg.TerminalBlockHash = [32]byte{}
+	cfg.TerminalBlockHashActivationEpoch = math.MaxUint64
+
+	// Deposit contract (same as mainnet)
+	cfg.DepositContractAddress = "0x00000000219ab540356cBB839Cbe05303d7705Fa"
+	cfg.DepositChainID = chainspec.MainnetChainID
+	cfg.DepositNetworkID = chainspec.MainnetChainID
+
+	// Blob parameters
+	cfg.MaxBlobsPerBlock = 6
+	cfg.MaxBlobsPerBlockElectra = 9
+	cfg.BlobSidecarSubnetCountElectra = 9
+
+	// Clear BlobSchedule since Fulu/Osaka is disabled on bloatnet
+	cfg.BlobSchedule = []BlobParameters{}
+
+	cfg.InitializeForkSchedule()
+	return cfg
+}
+
 func gnosisConfig() BeaconChainConfig {
 	cfg := MainnetBeaconConfig
 	cfg.PresetBase = "gnosis"
@@ -1237,11 +1334,12 @@ func (b *BeaconChainConfig) GetPenaltyQuotient(version StateVersion) uint64 {
 
 // Beacon configs
 var BeaconConfigs map[NetworkType]BeaconChainConfig = map[NetworkType]BeaconChainConfig{
-	chainspec.MainnetChainID: mainnetConfig(),
-	chainspec.SepoliaChainID: sepoliaConfig(),
-	chainspec.HoodiChainID:   hoodiConfig(),
-	chainspec.GnosisChainID:  gnosisConfig(),
-	chainspec.ChiadoChainID:  chiadoConfig(),
+	chainspec.MainnetChainID:    mainnetConfig(),
+	chainspec.SepoliaChainID:    sepoliaConfig(),
+	chainspec.HoodiChainID:      hoodiConfig(),
+	chainspec.GnosisChainID:     gnosisConfig(),
+	chainspec.ChiadoChainID:     chiadoConfig(),
+	chainspec.BloatnetNetworkID: bloatnetConfig(),
 }
 
 // Eth1DataVotesLength returns the maximum length of the votes on the Eth1 data,
@@ -1368,6 +1466,10 @@ func GetConfigsByNetworkName(net string) (*NetworkConfig, *BeaconChainConfig, Ne
 	case networkname.Hoodi:
 		networkCfg, beaconCfg := GetConfigsByNetwork(chainspec.HoodiChainID)
 		return networkCfg, beaconCfg, chainspec.HoodiChainID, nil
+	case networkname.Bloatnet:
+		// Bloatnet uses mainnet CL config but on isolated network
+		networkCfg, beaconCfg := GetConfigsByNetwork(chainspec.MainnetChainID)
+		return networkCfg, beaconCfg, chainspec.MainnetChainID, nil
 	default:
 		return nil, nil, chainspec.MainnetChainID, errors.New("chain not found")
 	}
@@ -1422,12 +1524,17 @@ func GetCheckpointSyncEndpoint(net NetworkType) string {
 }
 
 // Check if chain with a specific ID is supported or not
-func EmbeddedSupported(id uint64) bool {
-	return id == chainspec.MainnetChainID ||
-		id == chainspec.SepoliaChainID ||
-		id == chainspec.GnosisChainID ||
-		id == chainspec.ChiadoChainID ||
-		id == chainspec.HoodiChainID
+//
+// note: the following code uses chainID constants because they are usually the same as the network ID,
+// but the context of usage is they are checked against network ID. Shadowforks like bloatnet make
+// this evident (same chainID as mainnet, but different network ID))
+func EmbeddedSupported(networkId uint64) bool {
+	return networkId == chainspec.MainnetChainID ||
+		networkId == chainspec.SepoliaChainID ||
+		networkId == chainspec.GnosisChainID ||
+		networkId == chainspec.ChiadoChainID ||
+		networkId == chainspec.HoodiChainID ||
+		networkId == chainspec.BloatnetNetworkID
 }
 
 func SupportBackfilling(networkId uint64) bool {
@@ -1435,7 +1542,8 @@ func SupportBackfilling(networkId uint64) bool {
 		networkId == chainspec.SepoliaChainID ||
 		networkId == chainspec.GnosisChainID ||
 		networkId == chainspec.ChiadoChainID ||
-		networkId == chainspec.HoodiChainID
+		networkId == chainspec.HoodiChainID ||
+		networkId == chainspec.BloatnetNetworkID
 }
 
 func EpochToPaths(slot uint64, config *BeaconChainConfig, suffix string) (string, string) {

@@ -33,6 +33,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/erigontech/erigon/common"
+	"github.com/erigontech/erigon/common/crypto"
 	"github.com/erigontech/erigon/common/log/v3"
 	"github.com/erigontech/erigon/db/datadir"
 	"github.com/erigontech/erigon/db/kv"
@@ -44,8 +45,10 @@ import (
 	"github.com/erigontech/erigon/execution/protocol"
 	"github.com/erigontech/erigon/execution/protocol/rules"
 	"github.com/erigontech/erigon/execution/state"
+	"github.com/erigontech/erigon/execution/tracing"
 	"github.com/erigontech/erigon/execution/tracing/tracers/logger"
 	"github.com/erigontech/erigon/execution/types"
+	"github.com/erigontech/erigon/execution/types/accounts"
 	"github.com/erigontech/erigon/execution/vm"
 	"github.com/erigontech/erigon/execution/vm/asm"
 	"github.com/erigontech/erigon/execution/vm/program"
@@ -59,18 +62,11 @@ func TestDefaults(t *testing.T) {
 	if cfg.Difficulty == nil {
 		t.Error("expected difficulty to be non nil")
 	}
-
-	if cfg.Time == nil {
-		t.Error("expected time to be non nil")
-	}
 	if cfg.GasLimit == 0 {
 		t.Error("didn't expect gaslimit to be zero")
 	}
 	if cfg.GetHashFn == nil {
 		t.Error("expected time to be non nil")
-	}
-	if cfg.BlockNumber == nil {
-		t.Error("expected block number to be non nil")
 	}
 }
 
@@ -121,7 +117,7 @@ func TestCall(t *testing.T) {
 	tx, domains := testTemporalTxSD(t, db)
 
 	state := state.New(state.NewReaderV3(domains.AsGetter(tx)))
-	address := common.HexToAddress("0xaa")
+	address := accounts.InternAddress(common.HexToAddress("0xaa"))
 	state.SetCode(address, []byte{
 		byte(vm.PUSH1), 10,
 		byte(vm.PUSH1), 0,
@@ -151,7 +147,7 @@ func testTemporalTxSD(t testing.TB, db kv.TemporalRwDB) (kv.TemporalRwTx, *execc
 	require.NoError(t, err)
 	t.Cleanup(tx.Rollback)
 
-	sd, err := execctx.NewSharedDomains(tx, log.New())
+	sd, err := execctx.NewSharedDomains(context.Background(), tx, log.New())
 	require.NoError(t, err)
 	t.Cleanup(sd.Close)
 
@@ -180,12 +176,12 @@ func BenchmarkCall(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	cfg := &Config{ChainConfig: &chain.Config{}, BlockNumber: big.NewInt(0), Time: big.NewInt(0), Value: *uint256.MustFromBig(big.NewInt(13377))}
+	cfg := &Config{ChainConfig: &chain.Config{}, BlockNumber: 0, Time: 0, Value: *uint256.MustFromBig(big.NewInt(13377))}
 	db := testTemporalDB(b)
 	tx, sd := testTemporalTxSD(b, db)
 	//cfg.w = state.NewWriter(execctx, nil)
 	cfg.State = state.New(state.NewReaderV3(sd.AsGetter(tx)))
-	cfg.EVMConfig.JumpDestCache = vm.NewJumpDestCache(128)
+	//cfg.EVMConfig.JumpDestCache = vm.NewJumpDestCache(128)
 
 	tmpdir := b.TempDir()
 
@@ -207,8 +203,8 @@ func benchmarkEVM_Create(b *testing.B, code string) {
 
 	var (
 		statedb  = state.New(state.NewReaderV3(domains.AsGetter(tx)))
-		sender   = common.BytesToAddress([]byte("sender"))
-		receiver = common.BytesToAddress([]byte("receiver"))
+		sender   = accounts.InternAddress(common.BytesToAddress([]byte("sender")))
+		receiver = accounts.InternAddress(common.BytesToAddress([]byte("receiver")))
 	)
 
 	statedb.CreateAccount(sender, true)
@@ -217,10 +213,10 @@ func benchmarkEVM_Create(b *testing.B, code string) {
 		Origin:      sender,
 		State:       statedb,
 		GasLimit:    10000000,
-		Difficulty:  big.NewInt(0x200000),
-		Time:        new(big.Int).SetUint64(0),
-		Coinbase:    common.Address{},
-		BlockNumber: new(big.Int).SetUint64(1),
+		Difficulty:  uint256.NewInt(0x200000),
+		Time:        0,
+		Coinbase:    accounts.ZeroAddress,
+		BlockNumber: 1,
 		ChainConfig: &chain.Config{
 			ChainID:               big.NewInt(1),
 			HomesteadBlock:        new(big.Int),
@@ -230,12 +226,11 @@ func benchmarkEVM_Create(b *testing.B, code string) {
 			SpuriousDragonBlock:   new(big.Int),
 		},
 		EVMConfig: vm.Config{
-			JumpDestCache: vm.NewJumpDestCache(128),
+			//JumpDestCache: vm.NewJumpDestCache(128),
 		},
 	}
 	// Warm up the intpools and stuff
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		_, _, _ = Call(receiver, []byte{}, &runtimeConfig)
 	}
 	b.StopTimer()
@@ -274,7 +269,7 @@ func BenchmarkEVM_RETURN(b *testing.B) {
 	tx, domains := testTemporalTxSD(b, db)
 
 	statedb := state.New(state.NewReaderV3(domains.AsGetter(tx)))
-	contractAddr := common.BytesToAddress([]byte("contract"))
+	contractAddr := accounts.InternAddress(common.BytesToAddress([]byte("contract")))
 
 	for _, n := range []uint64{1_000, 10_000, 100_000, 1_000_000} {
 		b.Run(strconv.FormatUint(n, 10), func(b *testing.B) {
@@ -283,7 +278,7 @@ func BenchmarkEVM_RETURN(b *testing.B) {
 			contractCode := returnContract(n)
 			statedb.SetCode(contractAddr, contractCode)
 
-			for i := 0; i < b.N; i++ {
+			for b.Loop() {
 				ret, _, err := Call(contractAddr, []byte{}, &Config{State: statedb})
 				if err != nil {
 					b.Fatal(err)
@@ -299,12 +294,11 @@ func BenchmarkEVM_RETURN(b *testing.B) {
 func fakeHeader(n uint64, parentHash common.Hash) *types.Header {
 	return &types.Header{
 		Coinbase:   common.HexToAddress("0x00000000000000000000000000000000deadbeef"),
-		Number:     new(big.Int).SetUint64(n),
+		Number:     *uint256.NewInt(n),
 		ParentHash: parentHash,
 		Time:       n,
 		Nonce:      types.BlockNonce{0x1},
 		Extra:      []byte{},
-		Difficulty: big.NewInt(0),
 		GasLimit:   100000,
 	}
 }
@@ -327,12 +321,11 @@ func (cr *FakeChainHeaderReader) CurrentSafeHeader() *types.Header      { return
 func (cr *FakeChainHeaderReader) GetHeader(hash common.Hash, number uint64) *types.Header {
 	return &types.Header{
 		Coinbase:   common.HexToAddress("0x00000000000000000000000000000000deadbeef"),
-		Number:     new(big.Int).SetUint64(number),
+		Number:     *uint256.NewInt(number),
 		ParentHash: common.BigToHash(new(big.Int).SetUint64(number - 1)),
 		Time:       number,
 		Nonce:      types.BlockNonce{0x1},
 		Extra:      []byte{},
-		Difficulty: big.NewInt(0),
 		GasLimit:   100000,
 	}
 }
@@ -415,8 +408,7 @@ func TestBlockhash(t *testing.T) {
 	chain := &dummyChain{}
 	cfg := &Config{
 		GetHashFn:   protocol.GetHashFn(header, chain.GetHeader),
-		BlockNumber: new(big.Int).Set(header.Number),
-		Time:        new(big.Int),
+		BlockNumber: header.Number.Uint64(),
 	}
 	setDefaults(cfg)
 	cfg.ChainConfig.PragueTime = big.NewInt(1)
@@ -459,6 +451,7 @@ func benchmarkNonModifyingCode(gas uint64, code []byte, name string, tracerCode 
 
 	cfg.State = state.New(state.NewReaderV3(domains.AsGetter(tx)))
 	cfg.GasLimit = gas
+	cfg.Origin = accounts.ZeroAddress
 	//if len(tracerCode) > 0 {
 	//	tracer, err := tracers.DefaultDirectory.New(tracerCode, new(tracers.Context), nil, cfg.ChainConfig)
 	//	if err != nil {
@@ -470,17 +463,17 @@ func benchmarkNonModifyingCode(gas uint64, code []byte, name string, tracerCode 
 	//}
 
 	var (
-		destination = common.BytesToAddress([]byte("contract"))
+		destination = accounts.InternAddress(common.BytesToAddress([]byte("contract")))
 		vmenv       = NewEnv(cfg)
 		sender      = cfg.Origin
 	)
 	cfg.State.CreateAccount(destination, true)
-	eoa := common.HexToAddress("E0")
+	eoa := accounts.InternAddress(common.HexToAddress("E0"))
 	{
 		cfg.State.CreateAccount(eoa, true)
 		cfg.State.SetNonce(eoa, 100)
 	}
-	reverting := common.HexToAddress("EE")
+	reverting := accounts.InternAddress(common.HexToAddress("EE"))
 	{
 		cfg.State.CreateAccount(reverting, true)
 		cfg.State.SetCode(reverting, []byte{
@@ -497,7 +490,7 @@ func benchmarkNonModifyingCode(gas uint64, code []byte, name string, tracerCode 
 
 	b.Run(name, func(b *testing.B) {
 		b.ReportAllocs()
-		for i := 0; i < b.N; i++ {
+		for b.Loop() {
 			vmenv.Call(sender, destination, nil, gas, cfg.Value, false /* bailout */) // nolint:errcheck
 		}
 	})
@@ -546,6 +539,17 @@ func BenchmarkSimpleLoop(b *testing.B) {
 		Op(vm.PUSH6).Append(make([]byte, 6)).Op(vm.JUMP). // Jumpdest zero expressed in 6 bytes
 		Jump(lbl).Bytes()
 
+	loopingCode3 := []byte{
+		byte(vm.JUMPDEST), //  [ count ]
+		// push args for the call
+		byte(vm.PUSH4), 1, 2, 3, 4,
+		byte(vm.PUSH5), 1, 2, 3, 4, 5,
+
+		byte(vm.POP), byte(vm.POP),
+		byte(vm.PUSH6), 0, 0, 0, 0, 0, 0, // jumpdestination
+		byte(vm.JUMP),
+	}
+
 	p, lbl = program.New().Jumpdest()
 	callRevertingContractWithInput := p.
 		Call(nil, 0xee, 0, 0, 0x20, 0x0, 0x0).
@@ -562,6 +566,7 @@ func BenchmarkSimpleLoop(b *testing.B) {
 	benchmarkNonModifyingCode(100_000_000, callIdentity, "call-identity-100M", "", b)
 	benchmarkNonModifyingCode(100_000_000, loopingCode, "loop-100M", "", b)
 	benchmarkNonModifyingCode(100_000_000, loopingCode2, "loop2-100M", "", b)
+	benchmarkNonModifyingCode(100_000_000, loopingCode3, "loop3-100M", "", b)
 	benchmarkNonModifyingCode(100_000_000, callInexistant, "call-nonexist-100M", "", b)
 	benchmarkNonModifyingCode(100_000_000, callEOA, "call-EOA-100M", "", b)
 	benchmarkNonModifyingCode(100_000_000, callRevertingContractWithInput, "call-reverting-100M", "", b)
@@ -701,17 +706,143 @@ func BenchmarkEVM_SWAP1(b *testing.B) {
 	db := testTemporalDB(b)
 	tx, domains := testTemporalTxSD(b, db)
 	state := state.New(state.NewReaderV3(domains.AsGetter(tx)))
-	contractAddr := common.BytesToAddress([]byte("contract"))
+	contractAddr := accounts.InternAddress(common.BytesToAddress([]byte("contract")))
 
 	b.Run("10k", func(b *testing.B) {
 		contractCode := swapContract(10_000)
 		state.SetCode(contractAddr, contractCode)
 
-		for i := 0; i < b.N; i++ {
+		for b.Loop() {
 			_, _, err := Call(contractAddr, []byte{}, &Config{State: state})
 			if err != nil {
 				b.Fatal(err)
 			}
 		}
 	})
+}
+
+// TestCreate2CollisionWithEIP7702Delegation verifies that CREATE2 to an address
+// with an EIP-7702 delegation designator triggers ErrContractAddressCollision,
+// matching geth's behavior. The delegation designator (0xef0100 ++ address) is
+// non-empty code and must be treated as an occupied account.
+// See https://github.com/ethereum-bounty/erigon/issues/2
+func TestCreate2CollisionWithEIP7702Delegation(t *testing.T) {
+	t.Parallel()
+
+	db := testTemporalDB(t)
+	tx, domains := testTemporalTxSD(t, db)
+	statedb := state.New(state.NewReaderV3(domains.AsGetter(tx)))
+
+	sender := accounts.InternAddress(common.HexToAddress("0x1234"))
+	statedb.CreateAccount(sender, true)
+	statedb.AddBalance(sender, *uint256.NewInt(1e18), tracing.BalanceChangeUnspecified)
+
+	// Initcode that just returns empty runtime code (PUSH1 0, PUSH1 0, RETURN).
+	initcode := []byte{byte(vm.PUSH1), 0, byte(vm.PUSH1), 0, byte(vm.RETURN)}
+
+	// Compute the CREATE2 target address: keccak256(0xff ++ factory ++ salt ++ keccak256(initcode))[12:]
+	salt := uint256.NewInt(0)
+	factoryAddr := common.HexToAddress("0xfac0")
+	create2Addr := types.CreateAddress2(factoryAddr, salt.Bytes32(), accounts.InternCodeHash(crypto.HashData(initcode)))
+	delegatedAddr := accounts.InternAddress(create2Addr)
+
+	// Set an EIP-7702 delegation on the target address (points to some arbitrary empty account).
+	delegationTarget := common.HexToAddress("0xdead")
+	delegationCode := types.AddressToDelegation(accounts.InternAddress(delegationTarget))
+	statedb.CreateAccount(delegatedAddr, true)
+	statedb.SetCode(delegatedAddr, delegationCode)
+
+	// Build a factory contract that executes CREATE2 with the initcode and salt=0.
+	// The factory is placed at factoryAddr.
+	factory := program.New()
+	factory.Create2(initcode, salt)
+	// Push the result to storage slot 0 for inspection.
+	factory.Push(0).Op(vm.SSTORE)
+
+	statedb.CreateAccount(accounts.InternAddress(factoryAddr), true)
+	statedb.SetCode(accounts.InternAddress(factoryAddr), factory.Bytes())
+
+	cfg := &Config{
+		State:  statedb,
+		Origin: sender,
+	}
+
+	_, _, err := Call(accounts.InternAddress(factoryAddr), nil, cfg)
+	require.NoError(t, err) // the CALL itself succeeds; CREATE2 failure is internal
+
+	// The CREATE2 should have failed (collision), so the factory's SSTORE
+	// should have stored the zero address (CREATE2 returns 0 on failure).
+	val, err := statedb.GetState(accounts.InternAddress(factoryAddr), accounts.StorageKey{})
+	require.NoError(t, err)
+	require.True(t, val.IsZero(), "CREATE2 should have returned 0 (collision), but got %x", val)
+
+	// Also verify that the delegation code on the target address is still intact.
+	code, err := statedb.GetCode(delegatedAddr)
+	require.NoError(t, err)
+	require.Equal(t, delegationCode, code, "delegation code should be unchanged")
+}
+
+// TestCreateCollisionWithEIP7702Delegation verifies that CREATE (not just CREATE2)
+// also collides with an EIP-7702 delegated account.
+func TestCreateCollisionWithEIP7702Delegation(t *testing.T) {
+	t.Parallel()
+
+	db := testTemporalDB(t)
+	tx, domains := testTemporalTxSD(t, db)
+	statedb := state.New(state.NewReaderV3(domains.AsGetter(tx)))
+
+	sender := accounts.InternAddress(common.HexToAddress("0x1234"))
+	statedb.CreateAccount(sender, true)
+	statedb.AddBalance(sender, *uint256.NewInt(1e18), tracing.BalanceChangeUnspecified)
+
+	// Initcode that returns empty runtime code.
+	initcode := []byte{byte(vm.PUSH1), 0, byte(vm.PUSH1), 0, byte(vm.RETURN)}
+
+	// Compute the CREATE target address: keccak256(rlp([factory, nonce]))[12:]
+	// Factory nonce starts at 1 (after SpuriousDragon sets it during create).
+	// But for the factory contract already deployed, its nonce is 0 initially;
+	// CREATE uses current nonce then increments. So target = CreateAddress(factory, 1)
+	// because the factory itself has nonce=1 set by SpuriousDragon during deployment.
+	// We'll use a simpler approach: just precompute and set delegation on the target.
+	factoryAddr := common.HexToAddress("0xfac1")
+	factoryAcct := accounts.InternAddress(factoryAddr)
+
+	// Factory nonce will be 1 (set by SpuriousDragon on CreateAccount).
+	// CREATE uses nonce of the calling contract. The factory already exists with nonce=0.
+	// EVM increments nonce before CREATE, but here the factory's nonce is 0.
+	// Actually in the EVM, CREATE does: target = CreateAddress(caller, callerNonce), then increments.
+	// Since our factory is pre-deployed with nonce 0, CREATE target = CreateAddress(factoryAddr, 0).
+	createAddr := types.CreateAddress(factoryAddr, 0)
+	delegatedAddr := accounts.InternAddress(createAddr)
+
+	// Set an EIP-7702 delegation on the target address.
+	delegationTarget := common.HexToAddress("0xdead")
+	delegationCode := types.AddressToDelegation(accounts.InternAddress(delegationTarget))
+	statedb.CreateAccount(delegatedAddr, true)
+	statedb.SetCode(delegatedAddr, delegationCode)
+
+	// Build a factory that executes CREATE with the initcode.
+	factory := program.New()
+	factory.MstoreSmall(initcode, 0)
+	factory.Push(len(initcode)). // size
+					Push(32 - len(initcode)). // offset (right-aligned in the 32-byte word)
+					Push(0).                  // value
+					Op(vm.CREATE)
+	factory.Push(0).Op(vm.SSTORE) // store result in slot 0
+
+	statedb.CreateAccount(factoryAcct, true)
+	statedb.SetCode(factoryAcct, factory.Bytes())
+
+	cfg := &Config{
+		State:  statedb,
+		Origin: sender,
+	}
+
+	_, _, err := Call(factoryAcct, nil, cfg)
+	require.NoError(t, err)
+
+	// CREATE should have failed (collision), returning 0.
+	val, err := statedb.GetState(factoryAcct, accounts.StorageKey{})
+	require.NoError(t, err)
+	require.True(t, val.IsZero(), "CREATE should have returned 0 (collision), but got %x", val)
 }

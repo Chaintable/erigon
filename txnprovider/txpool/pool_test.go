@@ -45,6 +45,7 @@ import (
 	"github.com/erigontech/erigon/execution/rlp"
 	"github.com/erigontech/erigon/execution/tests/testforks"
 	"github.com/erigontech/erigon/execution/types"
+	"github.com/erigontech/erigon/execution/types/accounts"
 	accounts3 "github.com/erigontech/erigon/execution/types/accounts"
 	"github.com/erigontech/erigon/node/gointerfaces"
 	"github.com/erigontech/erigon/node/gointerfaces/remoteproto"
@@ -80,7 +81,7 @@ func TestNonceFromAddress(t *testing.T) {
 	acc := accounts3.Account{
 		Nonce:       2,
 		Balance:     *uint256.NewInt(1 * common.Ether),
-		CodeHash:    common.Hash{},
+		CodeHash:    accounts.EmptyCodeHash,
 		Incarnation: 1,
 	}
 	v := accounts3.SerialiseV3(&acc)
@@ -334,7 +335,7 @@ func TestMultipleAuthorizations(t *testing.T) {
 	acc := accounts3.Account{
 		Nonce:       0,
 		Balance:     *uint256.NewInt(10 * common.Ether),
-		CodeHash:    common.Hash{},
+		CodeHash:    accounts.EmptyCodeHash,
 		Incarnation: 1,
 	}
 	v := accounts3.SerialiseV3(&acc)
@@ -342,8 +343,7 @@ func TestMultipleAuthorizations(t *testing.T) {
 		Action:  remoteproto.Action_UPSERT,
 		Address: gointerfaces.ConvertAddressToH160(addrA),
 		Data:    v,
-	})
-	change.ChangeBatch[0].Changes = append(change.ChangeBatch[0].Changes, &remoteproto.AccountChange{
+	}, &remoteproto.AccountChange{
 		Action:  remoteproto.Action_UPSERT,
 		Address: gointerfaces.ConvertAddressToH160(addrB),
 		Data:    v,
@@ -459,7 +459,7 @@ func TestReplaceWithHigherFee(t *testing.T) {
 	acc := accounts3.Account{
 		Nonce:       2,
 		Balance:     *uint256.NewInt(1 * common.Ether),
-		CodeHash:    common.Hash{},
+		CodeHash:    accounts.EmptyCodeHash,
 		Incarnation: 1,
 	}
 	v := accounts3.SerialiseV3(&acc)
@@ -582,7 +582,7 @@ func TestReverseNonces(t *testing.T) {
 	acc := accounts3.Account{
 		Nonce:       2,
 		Balance:     *uint256.NewInt(1 * common.Ether),
-		CodeHash:    common.Hash{},
+		CodeHash:    accounts.EmptyCodeHash,
 		Incarnation: 1,
 	}
 	v := accounts3.SerialiseV3(&acc)
@@ -712,7 +712,7 @@ func TestTxnPoke(t *testing.T) {
 	acc := accounts3.Account{
 		Nonce:       2,
 		Balance:     *uint256.NewInt(1 * common.Ether),
-		CodeHash:    common.Hash{},
+		CodeHash:    accounts.EmptyCodeHash,
 		Incarnation: 1,
 	}
 	v := accounts3.SerialiseV3(&acc)
@@ -861,6 +861,9 @@ func TestTxnPoke(t *testing.T) {
 }
 
 func TestShanghaiValidateTxn(t *testing.T) {
+	if testing.Short() {
+		t.Skip("slow test")
+	}
 	asrt := assert.New(t)
 	tests := map[string]struct {
 		expected   txpoolcfg.DiscardReason
@@ -923,9 +926,9 @@ func TestShanghaiValidateTxn(t *testing.T) {
 			ctx, cancel := context.WithCancel(context.Background())
 			t.Cleanup(cancel)
 			tx, err := coreDB.BeginTemporalRw(ctx)
-			defer tx.Rollback()
 			asrt.NoError(err)
-			sd, err := execctx.NewSharedDomains(tx, logger)
+			defer tx.Rollback()
+			sd, err := execctx.NewSharedDomains(ctx, tx, logger)
 			asrt.NoError(err)
 			defer sd.Close()
 			cache := kvcache.NewDummy()
@@ -935,7 +938,7 @@ func TestShanghaiValidateTxn(t *testing.T) {
 			sndr := accounts3.Account{Nonce: 0, Balance: *uint256.NewInt(math.MaxUint64)}
 			sndrBytes := accounts3.SerialiseV3(&sndr)
 			txNum := uint64(0)
-			err = sd.DomainPut(kv.AccountsDomain, tx, []byte{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, sndrBytes, txNum, nil, 0)
+			err = sd.DomainPut(kv.AccountsDomain, tx, []byte{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, sndrBytes, txNum, nil)
 			asrt.NoError(err)
 
 			err = sd.Flush(ctx, tx)
@@ -996,7 +999,7 @@ func TestTooHighGasLimitTxnValidation(t *testing.T) {
 	acc := accounts3.Account{
 		Nonce:       2,
 		Balance:     *uint256.NewInt(1 * common.Ether),
-		CodeHash:    common.Hash{},
+		CodeHash:    accounts.EmptyCodeHash,
 		Incarnation: 1,
 	}
 	v := accounts3.SerialiseV3(&acc)
@@ -1047,16 +1050,16 @@ func TestSetCodeTxnValidationWithLargeAuthorizationValues(t *testing.T) {
 	require.NoError(t, err)
 	pool.blockGasLimit.Store(30_000_000)
 	tx, err := coreDB.BeginTemporalRw(ctx)
-	defer tx.Rollback()
 	require.NoError(t, err)
-	sd, err := execctx.NewSharedDomains(tx.(kv.TemporalTx), logger)
+	defer tx.Rollback()
+	sd, err := execctx.NewSharedDomains(ctx, tx.(kv.TemporalTx), logger)
 	require.NoError(t, err)
 	defer sd.Close()
 
 	sndr := accounts3.Account{Nonce: 0, Balance: *uint256.NewInt(math.MaxUint64)}
 	sndrBytes := accounts3.SerialiseV3(&sndr)
 	txNum := uint64(0)
-	err = sd.DomainPut(kv.AccountsDomain, tx, []byte{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, sndrBytes, txNum, nil, 0)
+	err = sd.DomainPut(kv.AccountsDomain, tx, []byte{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, sndrBytes, txNum, nil)
 	require.NoError(t, err)
 
 	err = sd.Flush(ctx, tx)
@@ -1085,6 +1088,7 @@ func TestSetCodeTxnValidationWithLargeAuthorizationValues(t *testing.T) {
 
 // Blob gas price bump + other requirements to replace existing txns in the pool
 func TestBlobTxnReplacement(t *testing.T) {
+	t.Parallel()
 	assert, require := assert.New(t), require.New(t)
 	ch := make(chan Announcements, 5)
 	coreDB := temporaltest.NewTestDB(t, datadir.New(t.TempDir()))
@@ -1116,7 +1120,7 @@ func TestBlobTxnReplacement(t *testing.T) {
 	acc := accounts3.Account{
 		Nonce:       2,
 		Balance:     *uint256.NewInt(1 * common.Ether),
-		CodeHash:    common.Hash{},
+		CodeHash:    accounts.EmptyCodeHash,
 		Incarnation: 1,
 	}
 	v := accounts3.SerialiseV3(&acc)
@@ -1304,7 +1308,7 @@ func makeWrappedBlobTxnRlpWithCellProofs(t *testing.T, chainID *uint256.Int, blo
 		require.NoError(err)
 
 		copy(wrapper.Commitments[i][:], commitment[:])
-		for _, proof := range cellProofs {
+		for _, proof := range &cellProofs {
 			var proofBytes types.KZGProof
 			copy(proofBytes[:], proof[:])
 			wrapper.Proofs = append(wrapper.Proofs, proofBytes)
@@ -1367,7 +1371,7 @@ func TestDropRemoteAtNoGossip(t *testing.T) {
 	acc := accounts3.Account{
 		Nonce:       2,
 		Balance:     *uint256.NewInt(1 * common.Ether),
-		CodeHash:    common.Hash{},
+		CodeHash:    accounts.EmptyCodeHash,
 		Incarnation: 1,
 	}
 	v := accounts3.SerialiseV3(&acc)
@@ -1443,6 +1447,9 @@ func TestDropRemoteAtNoGossip(t *testing.T) {
 }
 
 func TestBlobSlots(t *testing.T) {
+	if testing.Short() {
+		t.Skip("slow test")
+	}
 	assert, require := assert.New(t), require.New(t)
 	ch := make(chan Announcements, 5)
 	coreDB := temporaltest.NewTestDB(t, datadir.New(t.TempDir()))
@@ -1475,7 +1482,7 @@ func TestBlobSlots(t *testing.T) {
 	acc := accounts3.Account{
 		Nonce:       0,
 		Balance:     *uint256.NewInt(1 * common.Ether),
-		CodeHash:    common.Hash{},
+		CodeHash:    accounts.EmptyCodeHash,
 		Incarnation: 1,
 	}
 	v := accounts3.SerialiseV3(&acc)
@@ -1563,7 +1570,7 @@ func TestOsakaProofShapeMismatchDiscardsCompletely(t *testing.T) {
 	acc := accounts3.Account{
 		Nonce:       0,
 		Balance:     *uint256.NewInt(1 * common.Ether),
-		CodeHash:    common.Hash{},
+		CodeHash:    accounts.EmptyCodeHash,
 		Incarnation: 1,
 	}
 	v := accounts3.SerialiseV3(&acc)
@@ -1630,6 +1637,9 @@ func TestOsakaProofShapeMismatchDiscardsCompletely(t *testing.T) {
 }
 
 func TestWrappedSixBlobTxnExceedsRlpLimit(t *testing.T) {
+	if testing.Short() {
+		t.Skip("slow test")
+	}
 	require := require.New(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
@@ -1654,7 +1664,7 @@ func TestWrappedSixBlobTxnExceedsRlpLimit(t *testing.T) {
 	require.NoError(err)
 }
 
-func TestGetBlobsV1(t *testing.T) {
+func TestGetBlobs(t *testing.T) {
 	assert, require := assert.New(t), require.New(t)
 	ch := make(chan Announcements, 5)
 	coreDB := temporaltest.NewTestDB(t, datadir.New(t.TempDir()))
@@ -1688,7 +1698,7 @@ func TestGetBlobsV1(t *testing.T) {
 	acc := accounts3.Account{
 		Nonce:       0,
 		Balance:     *uint256.NewInt(1 * common.Ether),
-		CodeHash:    common.Hash{},
+		CodeHash:    accounts.EmptyCodeHash,
 		Incarnation: 1,
 	}
 	v := accounts3.SerialiseV3(&acc)
@@ -1730,10 +1740,7 @@ func TestGetBlobsV1(t *testing.T) {
 	proofs := make([]goethkzg.KZGProof, 0, len(blobBundles))
 	for _, bb := range blobBundles {
 		blobs = append(blobs, bb.Blob)
-		for _, p := range bb.Proofs {
-			proofs = append(proofs, p)
-		}
-
+		proofs = append(proofs, bb.Proofs...)
 	}
 	require.Equal(len(proofs), len(blobHashes))
 	assert.Equal(blobTxn.BlobBundles[0].Blob, blobs[0])
@@ -1763,7 +1770,7 @@ func TestGasLimitChanged(t *testing.T) {
 	acc := accounts3.Account{
 		Nonce:       0,
 		Balance:     *uint256.NewInt(1 * common.Ether),
-		CodeHash:    common.Hash{},
+		CodeHash:    accounts.EmptyCodeHash,
 		Incarnation: 1,
 	}
 	v := accounts3.SerialiseV3(&acc)
@@ -1863,7 +1870,7 @@ func BenchmarkProcessRemoteTxns(b *testing.B) {
 		acc := accounts3.Account{
 			Nonce:       0,
 			Balance:     *uint256.NewInt(1 * common.Ether),
-			CodeHash:    common.Hash{},
+			CodeHash:    accounts.EmptyCodeHash,
 			Incarnation: 1,
 		}
 		v := accounts3.SerialiseV3(&acc)
@@ -1883,7 +1890,7 @@ func BenchmarkProcessRemoteTxns(b *testing.B) {
 
 	// Create test transactions for benchmarking
 	var testTxns TxnSlots
-	for i := 0; i < b.N; i++ {
+	for i := 0; b.Loop(); i++ {
 		var addr [20]byte
 		addr[0] = uint8(i%100 + 1) // Use one of our test accounts
 		txnSlot := &TxnSlot{
@@ -1941,7 +1948,7 @@ func TestZombieQueuedEviction(t *testing.T) {
 	acc := accounts3.Account{
 		Nonce:       5,
 		Balance:     *uint256.NewInt(1 * common.Ether),
-		CodeHash:    common.Hash{},
+		CodeHash:    accounts.EmptyCodeHash,
 		Incarnation: 0,
 	}
 	v := accounts3.SerialiseV3(&acc)
@@ -2029,7 +2036,7 @@ func TestZombieQueuedEviction(t *testing.T) {
 		acc2 := accounts3.Account{
 			Nonce:    baseNonce,
 			Balance:  *uint256.NewInt(10 * common.Ether),
-			CodeHash: common.Hash{},
+			CodeHash: accounts.EmptyCodeHash,
 		}
 		v2 := accounts3.SerialiseV3(&acc2)
 		var addr2 [20]byte

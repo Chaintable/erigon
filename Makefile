@@ -1,10 +1,15 @@
-SHELL := /bin/bash
+ifeq ($(OS),Windows_NT)
+  SHELL := bash
+else
+  SHELL := /bin/bash
+endif
 
 GO ?= go # if using docker, should not need to be installed/linked
 GOAMD64_VERSION ?= v2 # See https://go.dev/wiki/MinimumRequirements#microarchitecture-support
 GOBINREL := build/bin
-GOBIN := $(CURDIR)/$(GOBINREL)
+export GOBIN := $(CURDIR)/$(GOBINREL)
 GOARCH ?= $(shell go env GOHOSTARCH)
+GOEXE := $(shell $(GO) env GOEXE 2>/dev/null)
 UNAME := $(shell uname) # Supported: Darwin, Linux
 DOCKER := $(shell command -v docker 2> /dev/null)
 DOCKER_BINARIES ?= "erigon"
@@ -13,6 +18,12 @@ GIT_COMMIT ?= $(shell git rev-list -1 HEAD)
 SHORT_COMMIT := $(shell echo $(GIT_COMMIT) | cut -c 1-8)
 GIT_BRANCH ?= $(shell git rev-parse --abbrev-ref HEAD)
 GIT_TAG    ?= $(shell git describe --tags '--match=*.*.*' --abbrev=7 --dirty)
+
+# Use git tag value for "release/" branches only. Otherwise it make no sense.
+ifeq (,$(findstring release/,$(GIT_BRANCH)))
+  GIT_TAG	:= .
+endif
+
 ERIGON_USER ?= erigon
 # if using volume-mounting data dir, then must exist on host OS
 DOCKER_UID ?= $(shell id -u)
@@ -57,7 +68,7 @@ endif
 
 BUILD_TAGS =
 
-ifneq ($(shell "$(CURDIR)/node/silkworm/silkworm_compat_check.sh"),)
+ifneq ($(shell $(CURDIR)/node/silkworm/silkworm_compat_check.sh),)
 	BUILD_TAGS := $(BUILD_TAGS),nosilkworm
 endif
 
@@ -77,7 +88,7 @@ GO_BUILD_ENV = GOARCH=${GOARCH} ${CPU_ARCH} CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLA
 GOBUILD = $(GO_BUILD_ENV) $(GO) build $(GO_RELEASE_FLAGS) $(GO_FLAGS) -tags $(BUILD_TAGS)
 DLV_GO_FLAGS := -gcflags='all="-N -l" -trimpath=false'
 GO_BUILD_DEBUG = $(GO_BUILD_ENV) CGO_CFLAGS="$(CGO_CFLAGS) -DMDBX_DEBUG=1" $(GO) build $(DLV_GO_FLAGS) $(GO_FLAGS) -tags $(BUILD_TAGS),debug
-GOTEST = $(GO_BUILD_ENV) CGO_CXXFLAGS="$(CGO_CXXFLAGS)" GODEBUG=cgocheck=0 GOTRACEBACK=1 GOEXPERIMENT=synctest $(GO) test $(GO_FLAGS) ./...
+GOTEST = $(GO_BUILD_ENV) CGO_CXXFLAGS="$(CGO_CXXFLAGS)" GODEBUG=cgocheck=0 GOTRACEBACK=1 ERIGON_ASSERT=true $(GO) test $(GO_FLAGS) ./...
 
 GOINSTALL = CGO_CXXFLAGS="$(CGO_CXXFLAGS)" go install -trimpath
 
@@ -101,8 +112,8 @@ default: all
 
 ## go-version:                        print and verify go version
 go-version:
-	@if [ $(shell $(GO) version | cut -c 16-17) -lt 20 ]; then \
-		echo "minimum required Golang version is 1.20"; \
+	@if [ $(shell $(GO) version | cut -c 16-17) -lt 25 ]; then \
+		echo "minimum required Golang version is 1.25"; \
 		exit 1 ;\
 	fi
 
@@ -151,7 +162,7 @@ dbg:
 
 .PHONY: %.cmd
 # Deferred (=) because $* isn't defined until the rule is executed.
-%.cmd: override OUTPUT = $(GOBIN)/$*$(CMD_BUILD_SUFFIX)
+%.cmd: override OUTPUT = $(GOBIN)/$*$(GOEXE)
 %.cmd:
 	@echo Building '$(OUTPUT)'
 	cd ./cmd/$* && $(GOBUILD) -o $(OUTPUT)
@@ -162,7 +173,7 @@ geth: erigon
 
 ## erigon:                            build erigon
 erigon: go-version erigon.cmd
-	@rm -f $(GOBIN)/tg # Remove old binary to prevent confusion where users still use it because of the scripts
+	@rm -f $(GOBIN)/tg$(GOEXE) # Remove old binary to prevent confusion where users still use it because of the scripts
 
 COMMANDS += capcli
 COMMANDS += downloader
@@ -175,10 +186,10 @@ COMMANDS += sentry
 COMMANDS += state
 COMMANDS += txpool
 COMMANDS += evm
-COMMANDS += sentinel
 COMMANDS += caplin
 COMMANDS += snapshots
 COMMANDS += diag
+COMMANDS += mcp
 
 # build each command using %.cmd rule
 $(COMMANDS): %: %.cmd
@@ -188,6 +199,10 @@ all: erigon $(COMMANDS)
 
 ## db-tools:                          build db tools
 db-tools:
+ifeq ($(GOEXE),.exe)
+	@echo "db-tools is not supported on Windows. Use WSL or Docker."
+	@exit 1
+else
 	@echo "Building db-tools"
 
 	go mod vendor
@@ -196,6 +211,7 @@ db-tools:
 	cd vendor/github.com/erigontech/mdbx-go/libmdbx && cp mdbx_chk $(GOBIN) && cp mdbx_copy $(GOBIN) && cp mdbx_dump $(GOBIN) && cp mdbx_drop $(GOBIN) && cp mdbx_load $(GOBIN) && cp mdbx_stat $(GOBIN)
 	rm -rf vendor
 	@echo "Run \"$(GOBIN)/mdbx_stat -h\" to get info about mdbx db file."
+endif
 
 test-filtered:
 	(set -o pipefail && $(GOTEST) | tee run.log | (grep -v -e '^=== CONT ' -e '^=== RUN ' -e '^=== PAUSE ' -e '^PASS' -e '--- PASS:' || true))
@@ -222,6 +238,21 @@ test-hive:
 		act -j test-hive -s GITHUB_TOKEN=$(GITHUB_TOKEN) ; \
 	fi
 
+eest-bal:
+	@if [ ! -d "temp" ]; then mkdir temp; fi
+	docker build -t "test/erigon:$(SHORT_COMMIT)" .
+	rm -rf "temp/eest-hive-$(SHORT_COMMIT)" && mkdir "temp/eest-hive-$(SHORT_COMMIT)"
+	cd "temp/eest-hive-$(SHORT_COMMIT)" && git clone https://github.com/ethereum/hive
+	cd "temp/eest-hive-$(SHORT_COMMIT)/hive" && \
+	$(if $(filter Darwin,$(UNAME)), \
+		sed -i '' "s/^ARG baseimage=erigontech\/erigon$$/ARG baseimage=test\/erigon/" clients/erigon/Dockerfile && \
+		sed -i '' "s/^ARG tag=main-latest$$/ARG tag=$(SHORT_COMMIT)/" clients/erigon/Dockerfile, \
+		sed -i "s/^ARG baseimage=erigontech\/erigon$$/ARG baseimage=test\/erigon/" clients/erigon/Dockerfile && \
+		sed -i "s/^ARG tag=main-latest$$/ARG tag=$(SHORT_COMMIT)/" clients/erigon/Dockerfile \
+	)
+	cd "temp/eest-hive-$(SHORT_COMMIT)/hive" && go build . 2>&1 | tee buildlogs.log
+	cd "temp/eest-hive-$(SHORT_COMMIT)/hive" && go build ./cmd/hiveview && ./hiveview --serve --logdir ./workspace/logs &
+	cd "temp/eest-hive-$(SHORT_COMMIT)/hive" && $(call run_suite,eels/consume-engine,".*amsterdam.*",--sim.buildarg branch=hive --sim.buildarg branch=tests-bal@v5.1.0 --sim.buildarg fixtures=https://github.com/ethereum/execution-spec-tests/releases/download/bal%40v5.1.0/fixtures_bal.tar.gz)
 
 # Define the run_suite function
 define run_suite
@@ -290,7 +321,7 @@ eest-hive:
 define run-kurtosis-assertoor
 	docker build -t test/erigon:current . ; \
 	kurtosis enclave rm -f makefile-kurtosis-testnet ; \
-	kurtosis run --enclave makefile-kurtosis-testnet github.com/ethpandaops/ethereum-package --args-file $(1) ; \
+	kurtosis run --enclave makefile-kurtosis-testnet github.com/ethpandaops/ethereum-package@5.0.1 --args-file $(1) ; \
 	printf "\nTo view logs: \nkurtosis service logs makefile-kurtosis-testnet el-1-erigon-lighthouse\n"
 endef
 
@@ -315,10 +346,6 @@ kurtosis-cleanup:
 	@echo "-----------------------------------\n"
 	kurtosis enclave rm -f makefile-kurtosis-testnet
 
-## lint-deps:                         install lint dependencies
-lint-deps:
-	@./tools/golangci_lint.sh --install-deps
-
 ## lintci:                            run golangci-lint linters
 lintci:
 	@CGO_CXXFLAGS="$(CGO_CXXFLAGS)" ./tools/golangci_lint.sh
@@ -342,7 +369,7 @@ $(GOBINREL):
 
 $(GOBINREL)/protoc: | $(GOBINREL)
 	$(eval PROTOC_TMP := $(shell mktemp -d))
-	curl -sSL https://github.com/protocolbuffers/protobuf/releases/download/v32.0/protoc-32.0-$(PROTOC_OS)-$(ARCH).zip -o "$(PROTOC_TMP)/protoc.zip"
+	curl -sSL https://github.com/protocolbuffers/protobuf/releases/download/v33.1/protoc-33.1-$(PROTOC_OS)-$(ARCH).zip -o "$(PROTOC_TMP)/protoc.zip"
 	cd "$(PROTOC_TMP)" && unzip protoc.zip
 	cp "$(PROTOC_TMP)/bin/protoc" "$(GOBIN)"
 	mkdir -p "$(PROTOC_INCLUDE)"
@@ -444,8 +471,7 @@ stringer:
 	PATH="$(GOBIN):$(PATH)" go generate -run "stringer" ./...
 
 ## gen:                               generate all auto-generated code in the codebase
-gen:
-	mocks solc abigen gencodec graphql grpc stringer
+gen: mocks solc abigen gencodec graphql grpc stringer
 
 ## bindings:                          generate test contracts and core contracts
 bindings:

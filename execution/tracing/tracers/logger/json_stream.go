@@ -19,7 +19,6 @@ package logger
 import (
 	"context"
 	"encoding/hex"
-	"sort"
 
 	"github.com/holiman/uint256"
 
@@ -27,6 +26,7 @@ import (
 	"github.com/erigontech/erigon/execution/tracing"
 	"github.com/erigontech/erigon/execution/tracing/tracers"
 	"github.com/erigontech/erigon/execution/types"
+	"github.com/erigontech/erigon/execution/types/accounts"
 	"github.com/erigontech/erigon/execution/vm"
 	"github.com/erigontech/erigon/rpc/jsonstream"
 )
@@ -44,7 +44,7 @@ type JsonStreamLogger struct {
 	firstCapture bool
 
 	locations common.Hashes // For sorting
-	storage   map[common.Address]Storage
+	storage   map[accounts.Address]Storage
 	logs      []StructLog
 	output    []byte //nolint
 	err       error  //nolint
@@ -56,7 +56,7 @@ func NewJsonStreamLogger(cfg *LogConfig, ctx context.Context, stream jsonstream.
 	logger := &JsonStreamLogger{
 		ctx:          ctx,
 		stream:       stream,
-		storage:      make(map[common.Address]Storage),
+		storage:      make(map[accounts.Address]Storage),
 		firstCapture: true,
 	}
 	if cfg != nil {
@@ -75,8 +75,31 @@ func (l *JsonStreamLogger) Tracer() *tracers.Tracer {
 	}
 }
 
-func (l *JsonStreamLogger) OnTxStart(env *tracing.VMContext, tx types.Transaction, from common.Address) {
+func (l *JsonStreamLogger) OnTxStart(env *tracing.VMContext, tx types.Transaction, from accounts.Address) {
 	l.env = env
+}
+
+// hexWithPrefix encodes b as a 0x-prefixed hex string using the internal buffer.
+func (l *JsonStreamLogger) hexWithPrefix(b []byte) string {
+	l.hexEncodeBuf[0] = '0'
+	l.hexEncodeBuf[1] = 'x'
+	n := hex.Encode(l.hexEncodeBuf[2:], b)
+	return string(l.hexEncodeBuf[:2+n])
+}
+
+// writeMemoryWordRaw writes a memory word as a JSON string "0x<hex>" directly
+// to the stream without any heap allocations. Pads to 32 bytes if needed.
+func (l *JsonStreamLogger) writeMemoryWordRaw(chunk []byte) {
+	if len(chunk) < 32 {
+		var word [32]byte
+		copy(word[:], chunk)
+		hex.Encode(l.hexEncodeBuf[:], word[:])
+	} else {
+		hex.Encode(l.hexEncodeBuf[:], chunk)
+	}
+	l.stream.WriteRaw(`"0x`)
+	l.stream.Write(l.hexEncodeBuf[:64]) //nolint:errcheck
+	l.stream.WriteRaw(`"`)
 }
 
 func (l *JsonStreamLogger) OnExit(depth int, output []byte, gasUsed uint64, err error, reverted bool) {
@@ -123,11 +146,11 @@ func (l *JsonStreamLogger) OnOpcode(pc uint64, typ byte, gas, cost uint64, scope
 		// capture SLOAD opcodes and record the read entry in the local storage
 		if op == vm.SLOAD && len(stack) >= 1 {
 			var (
-				address = common.Hash(stack[len(stack)-1].Bytes32())
+				address = accounts.InternKey(stack[len(stack)-1].Bytes32())
 				value   uint256.Int
 			)
-			l.env.IntraBlockState.GetState(contractAddr, address, &value)
-			l.storage[contractAddr][address] = value.Bytes32()
+			value, _ = l.env.IntraBlockState.GetState(contractAddr, address)
+			l.storage[contractAddr][address.Value()] = value.Bytes32()
 			outputStorage = true
 		}
 		// capture SSTORE opcodes and record the written entry in the local storage.
@@ -181,15 +204,18 @@ func (l *JsonStreamLogger) OnOpcode(pc uint64, typ byte, gas, cost uint64, scope
 		l.stream.WriteArrayEnd()
 	}
 	if !l.cfg.DisableMemory {
-		memData := memory
 		l.stream.WriteMore()
 		l.stream.WriteObjectField("memory")
 		l.stream.WriteArrayStart()
-		for i := 0; i+32 <= len(memData); i += 32 {
+		for i := 0; i < len(memory); i += 32 {
+			end := i + 32
+			if end > len(memory) {
+				end = len(memory)
+			}
 			if i > 0 {
 				l.stream.WriteMore()
 			}
-			l.stream.WriteString(string(l.hexEncodeBuf[0:hex.Encode(l.hexEncodeBuf[:], memData[i:i+32])]))
+			l.writeMemoryWordRaw(memory[i:end])
 		}
 		l.stream.WriteArrayEnd()
 	}
@@ -206,7 +232,7 @@ func (l *JsonStreamLogger) OnOpcode(pc uint64, typ byte, gas, cost uint64, scope
 		for loc := range s {
 			l.locations = append(l.locations, loc)
 		}
-		sort.Sort(l.locations)
+		l.locations.Sort()
 		for _, loc := range l.locations {
 			value := s[loc]
 			if first {
@@ -214,8 +240,8 @@ func (l *JsonStreamLogger) OnOpcode(pc uint64, typ byte, gas, cost uint64, scope
 			} else {
 				l.stream.WriteMore()
 			}
-			l.stream.WriteObjectField(string(l.hexEncodeBuf[0:hex.Encode(l.hexEncodeBuf[:], loc[:])]))
-			l.stream.WriteString(string(l.hexEncodeBuf[0:hex.Encode(l.hexEncodeBuf[:], value[:])]))
+			l.stream.WriteObjectField(l.hexWithPrefix(loc[:]))
+			l.stream.WriteString(l.hexWithPrefix(value[:]))
 		}
 		l.stream.WriteObjectEnd()
 	}

@@ -19,8 +19,11 @@ package services
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"time"
+
+	"github.com/libp2p/go-libp2p/core/peer"
 
 	"github.com/erigontech/erigon/cl/beacon/beaconevents"
 	"github.com/erigontech/erigon/cl/beacon/synced_data"
@@ -37,7 +40,6 @@ import (
 	"github.com/erigontech/erigon/common"
 	"github.com/erigontech/erigon/common/log/v3"
 	"github.com/erigontech/erigon/db/kv"
-	"github.com/erigontech/erigon/node/gointerfaces/sentinelproto"
 )
 
 var (
@@ -79,7 +81,7 @@ func NewBlockService(
 	ethClock eth_clock.EthereumClock,
 	beaconCfg *clparams.BeaconChainConfig,
 	emitter *beaconevents.EventEmitter,
-) Service[*cltypes.SignedBeaconBlock] {
+) BlockService {
 	seenBlocksCache, err := lru.New[proposerIndexAndSlot, struct{}]("seenblocks", seenBlockCacheSize)
 	if err != nil {
 		panic(err)
@@ -97,13 +99,17 @@ func NewBlockService(
 	return b
 }
 
+func (b *blockService) Names() []string {
+	return []string{gossip.TopicNameBeaconBlock}
+}
+
 func (b *blockService) IsMyGossipMessage(name string) bool {
 	return name == gossip.TopicNameBeaconBlock
 }
 
-func (b *blockService) DecodeGossipMessage(data *sentinelproto.GossipData, version clparams.StateVersion) (*cltypes.SignedBeaconBlock, error) {
+func (b *blockService) DecodeGossipMessage(_ peer.ID, data []byte, version clparams.StateVersion) (*cltypes.SignedBeaconBlock, error) {
 	obj := cltypes.NewSignedBeaconBlock(b.beaconCfg, version)
-	if err := obj.DecodeSSZ(data.Data, int(version)); err != nil {
+	if err := obj.DecodeSSZ(data, int(version)); err != nil {
 		return nil, err
 	}
 	return obj, nil
@@ -111,11 +117,11 @@ func (b *blockService) DecodeGossipMessage(data *sentinelproto.GossipData, versi
 
 // ProcessMessage processes a block message according to https://github.com/ethereum/consensus-specs/blob/dev/specs/phase0/p2p-interface.md#beacon_block
 func (b *blockService) ProcessMessage(ctx context.Context, _ *uint64, msg *cltypes.SignedBeaconBlock) error {
-	log.Debug("Received block via gossip", "slot", msg.Block.Slot)
+	log.Trace("Received block via gossip", "slot", msg.Block.Slot)
 	blockEpoch := msg.Block.Slot / b.beaconCfg.SlotsPerEpoch
 
 	if b.syncedData.Syncing() {
-		return ErrIgnore
+		return fmt.Errorf("%w: syncing", ErrIgnore)
 	}
 
 	currentSlot := b.syncedData.HeadSlot()
@@ -123,7 +129,7 @@ func (b *blockService) ProcessMessage(ctx context.Context, _ *uint64, msg *cltyp
 	// [IGNORE] The block is not from a future slot (with a MAXIMUM_GOSSIP_CLOCK_DISPARITY allowance) -- i.e. validate that
 	//signed_beacon_block.message.slot <= current_slot (a client MAY queue future blocks for processing at the appropriate slot).
 	if currentSlot < msg.Block.Slot && !b.ethClock.IsSlotCurrentSlotWithMaximumClockDisparity(msg.Block.Slot) {
-		return ErrIgnore
+		return fmt.Errorf("%w: block is not from a future slot: %d > %d", ErrIgnore, currentSlot, msg.Block.Slot)
 	}
 
 	// [IGNORE] The block is the first block with valid signature received for the proposer for the slot, signed_beacon_block.message.slot.
@@ -132,14 +138,14 @@ func (b *blockService) ProcessMessage(ctx context.Context, _ *uint64, msg *cltyp
 		slot:          msg.Block.Slot,
 	}
 	if b.seenBlocksCache.Contains(seenCacheKey) {
-		return ErrIgnore
+		return nil
 	}
 
 	if err := b.syncedData.ViewHeadState(func(headState *state.CachingBeaconState) error {
 		// [IGNORE] The block is from a slot greater than the latest finalized slot -- i.e. validate that signed_beacon_block.message.slot > compute_start_slot_at_epoch(store.finalized_checkpoint.epoch)
 		// (a client MAY choose to validate and store such blocks for additional purposes -- e.g. slashing detection, archive nodes, etc).
 		if blockEpoch <= headState.FinalizedCheckpoint().Epoch {
-			return ErrIgnore
+			return fmt.Errorf("%w: block is not from a slot greater than the latest finalized slot: %d > %d", ErrIgnore, blockEpoch, headState.FinalizedCheckpoint().Epoch)
 		}
 
 		if ok, err := eth2.VerifyBlockSignature(headState, msg); err != nil {
@@ -159,7 +165,7 @@ func (b *blockService) ProcessMessage(ctx context.Context, _ *uint64, msg *cltyp
 	parentHeader, ok := b.forkchoiceStore.GetHeader(msg.Block.ParentRoot)
 	if !ok {
 		b.scheduleBlockForLaterProcessing(msg)
-		return ErrIgnore
+		return fmt.Errorf("%w: parent header not found: %v", ErrIgnore, msg.Block.ParentRoot)
 	}
 	if parentHeader.Slot >= msg.Block.Slot {
 		return ErrBlockYoungerThanParent
@@ -182,7 +188,7 @@ func (b *blockService) ProcessMessage(ctx context.Context, _ *uint64, msg *cltyp
 	if err := b.processAndStoreBlock(ctx, msg); err != nil {
 		if errors.Is(err, forkchoice.ErrEIP4844DataNotAvailable) || errors.Is(err, forkchoice.ErrEIP7594ColumnDataNotAvailable) {
 			b.scheduleBlockForLaterProcessing(msg)
-			return ErrIgnore
+			return nil
 		}
 		return err
 	}
@@ -208,7 +214,7 @@ func (b *blockService) publishBlockGossipEvent(block *cltypes.SignedBeaconBlock)
 
 // scheduleBlockForLaterProcessing schedules a block for later processing
 func (b *blockService) scheduleBlockForLaterProcessing(block *cltypes.SignedBeaconBlock) {
-	log.Debug("Block scheduled for later processing", "slot", block.Block.Slot, "block", block.Block.Body.ExecutionPayload.BlockNumber)
+	log.Trace("Block scheduled for later processing", "slot", block.Block.Slot, "block", block.Block.Body.ExecutionPayload.BlockNumber)
 	blockRoot, err := block.Block.HashSSZ()
 	if err != nil {
 		log.Debug("Failed to hash block", "block", block, "error", err)
@@ -272,7 +278,7 @@ func (b *blockService) importBlockOperations(block *cltypes.SignedBeaconBlock) {
 		}
 		return true
 	})
-	log.Debug("import operations", "time", time.Since(start))
+	log.Trace("import operations", "time", time.Since(start))
 }
 
 // loop is the main loop of the block service

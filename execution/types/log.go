@@ -64,19 +64,23 @@ type Log struct {
 type Logs []*Log
 
 type ErigonLog struct {
-	Address     common.Address `json:"address" gencodec:"required" codec:"1"`
-	Topics      []common.Hash  `json:"topics" gencodec:"required" codec:"2"`
-	Data        []byte         `json:"data" gencodec:"required" codec:"3"`
-	BlockNumber uint64         `json:"blockNumber" codec:"-"`
-	TxHash      common.Hash    `json:"transactionHash" gencodec:"required" codec:"-"`
-	TxIndex     uint           `json:"transactionIndex" codec:"-"`
-	BlockHash   common.Hash    `json:"blockHash" codec:"-"`
-	Index       uint           `json:"logIndex" codec:"-"`
-	Removed     bool           `json:"removed" codec:"-"`
-	Timestamp   uint64         `json:"timestamp" codec:"-"`
+	Log
+	Timestamp uint64 `json:"timestamp" codec:"-"`
 }
 
 type ErigonLogs []*ErigonLog
+
+// ToErigonLogs converts Logs to ErigonLogs, adding a timestamp to each entry.
+func (logs Logs) ToErigonLogs(timestamp uint64) ErigonLogs {
+	result := make(ErigonLogs, len(logs))
+	for i, l := range logs {
+		result[i] = &ErigonLog{
+			Log:       *l,
+			Timestamp: timestamp,
+		}
+	}
+	return result
+}
 
 // RPCLog Extends `types.Log` and add BlockTimestamp field
 type RPCLog struct {
@@ -189,41 +193,6 @@ func (logs Logs) ContainingTopics(addrMap map[common.Address]struct{}, topicsMap
 		}
 	}
 	return o
-}
-
-func (logs Logs) FilterOld(addresses map[common.Address]struct{}, topics [][]common.Hash) Logs {
-	result := make(Logs, 0, len(logs))
-	// populate a set of addresses
-Logs:
-	for _, log := range logs {
-		// empty address list means no filter
-		if len(addresses) > 0 {
-			// this is basically the includes function but done with a map
-			if _, ok := addresses[log.Address]; !ok {
-				continue
-			}
-		}
-		// If the to filtered topics is greater than the amount of topics in logs, skip.
-		if len(topics) > len(log.Topics) {
-			continue
-		}
-		for i, sub := range topics {
-			match := len(sub) == 0 // empty rule set == wildcard
-			// iterate over the subtopics and look for any match.
-			for _, topic := range sub {
-				if log.Topics[i] == topic {
-					match = true
-					break
-				}
-			}
-			// there was no match, so this log is invalid.
-			if !match {
-				continue Logs
-			}
-		}
-		result = append(result, log)
-	}
-	return result
 }
 
 type logMarshaling struct {

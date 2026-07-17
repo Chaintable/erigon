@@ -7,6 +7,7 @@ import (
 
 	"github.com/erigontech/erigon/common"
 	"github.com/erigontech/erigon/db/kv"
+	"github.com/erigontech/erigon/db/kv/kvcache"
 	"github.com/erigontech/erigon/db/kv/rawdbv3"
 	"github.com/erigontech/erigon/db/rawdb/rawtemporaldb"
 	"github.com/erigontech/erigon/db/services"
@@ -26,10 +27,11 @@ type BorGenerator struct {
 	receiptCache *lru.Cache[common.Hash, *types.Receipt]
 	blockReader  services.FullBlockReader
 	engine       rules.EngineReader
+	stateCache   kvcache.Cache
 }
 
 func NewBorGenerator(blockReader services.FullBlockReader,
-	engine rules.EngineReader) *BorGenerator {
+	engine rules.EngineReader, stateCache kvcache.Cache) *BorGenerator {
 	receiptCache, err := lru.New[common.Hash, *types.Receipt](receiptsCacheLimit)
 	if err != nil {
 		panic(err)
@@ -39,6 +41,7 @@ func NewBorGenerator(blockReader services.FullBlockReader,
 		receiptCache: receiptCache,
 		blockReader:  blockReader,
 		engine:       engine,
+		stateCache:   stateCache,
 	}
 }
 
@@ -54,13 +57,13 @@ func (g *BorGenerator) GenerateBorReceipt(ctx context.Context, tx kv.TemporalTx,
 		return nil, err
 	}
 
-	txNumsReader := g.blockReader.TxnumReader(ctx)
-	ibs, blockContext, _, _, _, err := transactions.ComputeBlockContext(ctx, g.engine, block.HeaderNoCopy(), chainConfig, g.blockReader, txNumsReader, tx, len(block.Transactions())) // we want to get the state at the end of the block
+	txNumsReader := g.blockReader.TxnumReader()
+	ibs, blockContext, _, _, _, err := transactions.ComputeBlockContext(ctx, g.engine, block.HeaderNoCopy(), chainConfig, g.blockReader, g.stateCache, txNumsReader, tx, len(block.Transactions())) // we want to get the state at the end of the block
 	if err != nil {
 		return nil, err
 	}
 
-	txNum, err := txNumsReader.Max(tx, block.NumberU64())
+	txNum, err := txNumsReader.Max(ctx, tx, block.NumberU64())
 	if err != nil {
 		return nil, err
 	}
@@ -83,7 +86,7 @@ func (g *BorGenerator) GenerateBorReceipt(ctx context.Context, tx kv.TemporalTx,
 }
 
 func (g *BorGenerator) GenerateBorLogs(ctx context.Context, msgs []*types.Message, txNumsReader rawdbv3.TxNumsReader, tx kv.TemporalTx, header *types.Header, chainConfig *chain.Config, txIndex int, txNum uint64) (types.Logs, error) {
-	ibs, blockContext, _, _, _, err := transactions.ComputeBlockContext(ctx, g.engine, header, chainConfig, g.blockReader, txNumsReader, tx, txIndex)
+	ibs, blockContext, _, _, _, err := transactions.ComputeBlockContext(ctx, g.engine, header, chainConfig, g.blockReader, g.stateCache, txNumsReader, tx, txIndex)
 	if err != nil {
 		return nil, err
 	}
@@ -133,19 +136,20 @@ func getBorLogs(msgs []*types.Message, evm *vm.EVM, gp *protocol.GasPool, ibs *s
 }
 
 func applyBorTransaction(msgs []*types.Message, evm *vm.EVM, gp *protocol.GasPool, ibs *state.IntraBlockState, block *types.Block, cumulativeGasUsed uint64, logIdxAfterTx uint, receiptWithFirstLogIdx bool) (*types.Receipt, error) {
-	receiptLogs, err := getBorLogs(msgs, evm, gp, ibs, block.Number().Uint64(), block.Hash(), uint(len(block.Transactions())), logIdxAfterTx, receiptWithFirstLogIdx)
+	receiptLogs, err := getBorLogs(msgs, evm, gp, ibs, block.NumberU64(), block.Hash(), uint(len(block.Transactions())), logIdxAfterTx, receiptWithFirstLogIdx)
 	if err != nil {
 		return nil, err
 	}
 
 	numReceipts := len(block.Transactions())
+	blockNum := block.Number()
 	receipt := types.Receipt{
 		Type:              0,
 		CumulativeGasUsed: cumulativeGasUsed,
 		TxHash:            bortypes.ComputeBorTxHash(block.NumberU64(), block.Hash()),
 		GasUsed:           0,
 		BlockHash:         block.Hash(),
-		BlockNumber:       block.Number(),
+		BlockNumber:       &blockNum,
 		TransactionIndex:  uint(numReceipts),
 		Logs:              receiptLogs,
 		Status:            types.ReceiptStatusSuccessful,

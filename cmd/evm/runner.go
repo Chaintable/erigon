@@ -25,7 +25,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"math/big"
 	"os"
 	goruntime "runtime"
 	"runtime/pprof"
@@ -40,6 +39,7 @@ import (
 	"github.com/erigontech/erigon/cmd/utils/flags"
 	"github.com/erigontech/erigon/common"
 	"github.com/erigontech/erigon/common/dbg"
+	"github.com/erigontech/erigon/common/dir"
 	"github.com/erigontech/erigon/common/hexutil"
 	"github.com/erigontech/erigon/common/log/v3"
 	"github.com/erigontech/erigon/db/datadir"
@@ -52,7 +52,7 @@ import (
 	"github.com/erigontech/erigon/execution/tracing/tracers"
 	"github.com/erigontech/erigon/execution/tracing/tracers/logger"
 	"github.com/erigontech/erigon/execution/types"
-	"github.com/erigontech/erigon/execution/vm"
+	"github.com/erigontech/erigon/execution/types/accounts"
 	"github.com/erigontech/erigon/execution/vm/evmtypes"
 	"github.com/erigontech/erigon/execution/vm/runtime"
 )
@@ -157,8 +157,8 @@ func runCmd(ctx *cli.Context) error {
 		debugLogger   *logger.StructLogger
 		statedb       *state.IntraBlockState
 		chainConfig   *chain.Config
-		sender        = common.BytesToAddress([]byte("sender"))
-		receiver      = common.BytesToAddress([]byte("receiver"))
+		sender        = accounts.InternAddress(common.BytesToAddress([]byte("sender")))
+		receiver      = accounts.InternAddress(common.BytesToAddress([]byte("receiver")))
 		genesisConfig *types.Genesis
 	)
 	if machineFriendlyOutput {
@@ -169,11 +169,16 @@ func runCmd(ctx *cli.Context) error {
 	} else {
 		debugLogger = logger.NewStructLogger(logconfig)
 	}
-	db := temporaltest.NewTestDB(nil, datadir.New(os.TempDir()))
+	tmpDir, err := os.MkdirTemp("", "erigon-evm-run-*")
+	if err != nil {
+		return err
+	}
+	defer dir.RemoveAll(tmpDir)
+	db := temporaltest.NewTestDB(nil, datadir.New(tmpDir))
 	defer db.Close()
 	if ctx.String(GenesisFlag.Name) != "" {
 		gen := readGenesis(ctx.String(GenesisFlag.Name))
-		genesiswrite.MustCommitGenesis(gen, db, datadir.New(""), log.Root())
+		genesiswrite.MustCommitGenesis(gen, db, datadir.New(tmpDir), log.Root())
 		genesisConfig = gen
 		chainConfig = gen.Config
 	} else {
@@ -186,7 +191,7 @@ func runCmd(ctx *cli.Context) error {
 	}
 	defer tx.Rollback()
 
-	sd, err := execctx.NewSharedDomains(tx, log.Root())
+	sd, err := execctx.NewSharedDomains(context.Background(), tx, log.Root())
 	if err != nil {
 		return err
 	}
@@ -194,12 +199,12 @@ func runCmd(ctx *cli.Context) error {
 	stateReader := state.NewReaderV3(sd.AsGetter(tx))
 	statedb = state.New(stateReader)
 	if ctx.String(SenderFlag.Name) != "" {
-		sender = common.HexToAddress(ctx.String(SenderFlag.Name))
+		sender = accounts.InternAddress(common.HexToAddress(ctx.String(SenderFlag.Name)))
 	}
 	statedb.CreateAccount(sender, true)
 
 	if ctx.String(ReceiverFlag.Name) != "" {
-		receiver = common.HexToAddress(ctx.String(ReceiverFlag.Name))
+		receiver = accounts.InternAddress(common.HexToAddress(ctx.String(ReceiverFlag.Name)))
 	}
 
 	var code []byte
@@ -259,15 +264,14 @@ func runCmd(ctx *cli.Context) error {
 		GasPrice:    *gasPrice,
 		Value:       *value,
 		Difficulty:  genesisConfig.Difficulty,
-		Time:        new(big.Int).SetUint64(genesisConfig.Timestamp),
-		Coinbase:    genesisConfig.Coinbase,
-		BlockNumber: new(big.Int).SetUint64(genesisConfig.Number),
+		Time:        genesisConfig.Timestamp,
+		Coinbase:    accounts.InternAddress(genesisConfig.Coinbase),
+		BlockNumber: genesisConfig.Number,
 	}
 
 	if tracer != nil {
 		runtimeConfig.EVMConfig.Tracer = tracer.Hooks
 	}
-	runtimeConfig.EVMConfig.JumpDestCache = vm.NewJumpDestCache(16)
 
 	if cpuProfilePath := ctx.String(CPUProfileFlag.Name); cpuProfilePath != "" {
 		f, err := os.Create(cpuProfilePath)
@@ -324,8 +328,8 @@ func runCmd(ctx *cli.Context) error {
 		rules := &chain.Rules{}
 		if chainConfig != nil {
 			blockContext := evmtypes.BlockContext{
-				BlockNumber: runtimeConfig.BlockNumber.Uint64(),
-				Time:        runtimeConfig.Time.Uint64(),
+				BlockNumber: runtimeConfig.BlockNumber,
+				Time:        runtimeConfig.Time,
 			}
 			rules = blockContext.Rules(chainConfig)
 		}

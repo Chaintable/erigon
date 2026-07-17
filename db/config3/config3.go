@@ -16,12 +16,27 @@
 
 package config3
 
-// Default number of transactions (txNums) in one "step". One static file can have [1, DefaultStepsInFrozenFile] steps.
-const DefaultStepSize = 1_562_500 // = 100M / 64. Dividers: 2, 5, 10, 20, 50, 100, 500
+import "math"
+
+// Step size up to Erigon 3.3
+const LegacyStepSize = 1_562_500
+
+// Steps in frozen files up to Erigon 3.3
+const LegacyStepsInFrozenFile = 64
+
+// DefaultStepSize is the default number of transactions (txNums) in one "step".
+// Prefer reading the actual step size from erigondb.toml via state.ResolveErigonDBSettings or tx.Debug().StepSize().
+const DefaultStepSize = 1_562_500
 
 // DefaultStepsInFrozenFile - files of this size are completely frozen/immutable.
 // files of smaller size are also immutable, but can be removed after merge to bigger files.
+// Prefer reading the actual value from erigondb.toml via state.ResolveErigonDBSettings.
 const DefaultStepsInFrozenFile = 64
+
+// UnboundedDomainMerge is a sentinel "steps in frozen file" value used to signal domain merges
+// are unbounded, i.e., can be merged infinitely. This was the default behavior for Erigon <= 3.4 and
+// this value can be used to restore it.
+const UnboundedDomainMerge uint64 = math.MaxUint64
 
 const EnableHistoryV4InTest = true
 

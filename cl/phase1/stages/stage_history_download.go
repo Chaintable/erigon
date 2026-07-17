@@ -101,6 +101,7 @@ func SpawnStageHistoryDownload(cfg StageHistoryReconstructionCfg, ctx context.Co
 	// Setup slot and block root
 	cfg.downloader.SetSlotToDownload(currentSlot)
 	cfg.downloader.SetExpectedRoot(blockRoot)
+	cfg.downloader.SetBlockChecker(cfg.executionBlocksCollector)
 
 	var initialBeaconBlock *cltypes.SignedBeaconBlock
 
@@ -186,7 +187,6 @@ func SpawnStageHistoryDownload(cfg StageHistoryReconstructionCfg, ctx context.Co
 				(slot <= destinationSlotForEL || isInElSnapshots),
 			tx.Commit()
 	})
-	prevProgress := cfg.downloader.Progress()
 
 	finishCh := make(chan struct{})
 	// Start logging thread
@@ -194,13 +194,13 @@ func SpawnStageHistoryDownload(cfg StageHistoryReconstructionCfg, ctx context.Co
 	isBackfilling := atomic.Bool{}
 
 	go func() {
+		startTimeLoop := time.Now()
+		initialProgress := cfg.downloader.Progress()
 		logInterval := time.NewTicker(logIntervalTime)
 		defer logInterval.Stop()
 		for {
 			select {
 			case <-logInterval.C:
-				logTime := logIntervalTime
-
 				if cfg.engine != nil && cfg.engine.SupportInsertion() {
 					if ready, err := cfg.engine.Ready(ctx); !ready {
 						if err != nil {
@@ -210,12 +210,14 @@ func SpawnStageHistoryDownload(cfg StageHistoryReconstructionCfg, ctx context.Co
 					}
 
 				}
-				logArgs := []interface{}{}
+				logArgs := []any{}
 				currProgress := cfg.downloader.Progress()
-				blockProgress := float64(prevProgress - currProgress)
-				ratio := float64(logTime / time.Second)
-				speed := blockProgress / ratio
-				prevProgress = currProgress
+				speed := math.Abs(float64(currProgress)-float64(initialProgress)) / time.Since(startTimeLoop).Seconds()
+				if speed > 1000.0 { // to avoid spamming logs on fast syncs
+					initialProgress = currProgress
+					startTimeLoop = time.Now()
+					continue
+				}
 
 				if speed == 0 || initialBeaconBlock == nil {
 					continue

@@ -36,6 +36,7 @@ import (
 	"github.com/erigontech/erigon/common/length"
 	"github.com/erigontech/erigon/common/log/v3"
 	"github.com/erigontech/erigon/db/datadir"
+	"github.com/erigontech/erigon/db/datastruct/btindex"
 	"github.com/erigontech/erigon/db/etl"
 	"github.com/erigontech/erigon/db/kv"
 	"github.com/erigontech/erigon/db/kv/temporal/temporaltest"
@@ -66,7 +67,7 @@ func BenchmarkAggregator_Processing(b *testing.B) {
 	require.NoError(b, err)
 	defer tx.Rollback()
 
-	domains, err := execctx.NewSharedDomains(tx, log.New())
+	domains, err := execctx.NewSharedDomains(ctx, tx, log.New())
 	require.NoError(b, err)
 	defer domains.Close()
 
@@ -78,7 +79,7 @@ func BenchmarkAggregator_Processing(b *testing.B) {
 		key := <-longKeys
 		val := <-vals
 		txNum := uint64(i)
-		err := domains.DomainPut(kv.StorageDomain, tx, key, val, txNum, prev, 0)
+		err := domains.DomainPut(kv.StorageDomain, tx, key, val, txNum, prev)
 		prev = val
 		require.NoError(b, err)
 
@@ -108,18 +109,23 @@ func queueKeys(ctx context.Context, seed, ofSize uint64) <-chan []byte {
 }
 
 func Benchmark_BtreeIndex_Search(b *testing.B) {
+	dataPath := "../../data/storage.256-288.kv"
+	f, err := os.Stat(dataPath)
+	if err != nil || f.IsDir() {
+		b.Skip("requires existing KV file at ../../data/storage.256-288.kv")
+	}
+
 	logger := log.New()
 	rnd := newRnd(uint64(time.Now().UnixNano()))
 	tmp := b.TempDir()
 	defer dir.RemoveAll(tmp)
-	dataPath := "../../data/storage.256-288.kv"
 
 	indexPath := filepath.Join(tmp, filepath.Base(dataPath)+".bti")
 	comp := seg.CompressKeys | seg.CompressVals
 	buildBtreeIndex(b, dataPath, indexPath, comp, 1, logger, true)
 
 	M := 1024
-	kv, bt, err := state.OpenBtreeIndexAndDataFile(indexPath, dataPath, uint64(M), comp, false)
+	kv, bt, err := btindex.OpenBtreeIndexAndDataFile(indexPath, dataPath, uint64(M), comp, false)
 	require.NoError(b, err)
 	defer bt.Close()
 	defer kv.Close()
@@ -145,7 +151,7 @@ type bTreeParameters struct {
 	KeyCount  int
 }
 
-func benchInitBtreeIndex(b *testing.B, params bTreeParameters, compression seg.FileCompression) (*seg.Decompressor, *state.BtIndex, [][]byte, string) {
+func benchInitBtreeIndex(b *testing.B, params bTreeParameters, compression seg.FileCompression) (*seg.Decompressor, *btindex.BtIndex, [][]byte, string) {
 	b.Helper()
 
 	logger := log.New()
@@ -157,7 +163,7 @@ func benchInitBtreeIndex(b *testing.B, params bTreeParameters, compression seg.F
 
 	buildBtreeIndex(b, dataPath, indexPath, compression, 1, logger, true)
 
-	kv, bt, err := state.OpenBtreeIndexAndDataFile(indexPath, dataPath, params.M, compression, false)
+	kv, bt, err := btindex.OpenBtreeIndexAndDataFile(indexPath, dataPath, params.M, compression, false)
 	require.NoError(b, err)
 	b.Cleanup(func() { bt.Close() })
 	b.Cleanup(func() { kv.Close() })
@@ -179,7 +185,7 @@ func Benchmark_BTree_SeekVsGetCompressedV(b *testing.B) {
 	getter := seg.NewReader(kv.MakeGetter(), compress)
 
 	b.Run("seek_only_v", func(b *testing.B) {
-		for i := 0; i < b.N; i++ {
+		for b.Loop() {
 			p := rnd.IntN(len(keys))
 
 			cur, err := bt.Seek(getter, keys[p])
@@ -194,7 +200,7 @@ func Benchmark_BTree_SeekVsGetCompressedV(b *testing.B) {
 	})
 
 	b.Run("get_only_v", func(b *testing.B) {
-		for i := 0; i < b.N; i++ {
+		for b.Loop() {
 			p := rnd.IntN(len(keys))
 
 			k, _, _, _, err := bt.Get(keys[p], getter)
@@ -221,7 +227,7 @@ func Benchmark_BTree_SeekVsGetCompressedK(b *testing.B) {
 	getter := seg.NewReader(kv.MakeGetter(), compress)
 
 	b.Run("seek_only_k", func(b *testing.B) {
-		for i := 0; i < b.N; i++ {
+		for b.Loop() {
 			p := rnd.IntN(len(keys))
 
 			cur, err := bt.Seek(getter, keys[p])
@@ -236,7 +242,7 @@ func Benchmark_BTree_SeekVsGetCompressedK(b *testing.B) {
 	})
 
 	b.Run("get_only_k", func(b *testing.B) {
-		for i := 0; i < b.N; i++ {
+		for b.Loop() {
 			p := rnd.IntN(len(keys))
 
 			k, _, _, _, err := bt.Get(keys[p], getter)
@@ -263,7 +269,7 @@ func Benchmark_BTree_SeekVsGetCompressedKV(b *testing.B) {
 	getter := seg.NewReader(kv.MakeGetter(), compress)
 
 	b.Run("seek_only_kv", func(b *testing.B) {
-		for i := 0; i < b.N; i++ {
+		for b.Loop() {
 			p := rnd.IntN(len(keys))
 
 			cur, err := bt.Seek(getter, keys[p])
@@ -278,7 +284,7 @@ func Benchmark_BTree_SeekVsGetCompressedKV(b *testing.B) {
 	})
 
 	b.Run("get_only_kv", func(b *testing.B) {
-		for i := 0; i < b.N; i++ {
+		for b.Loop() {
 			p := rnd.IntN(len(keys))
 
 			k, _, _, _, err := bt.Get(keys[p], getter)
@@ -305,7 +311,7 @@ func Benchmark_BTree_SeekVsGetUncompressed(b *testing.B) {
 	getter := seg.NewReader(kv.MakeGetter(), compress)
 
 	b.Run("seek_only", func(b *testing.B) {
-		for i := 0; i < b.N; i++ {
+		for b.Loop() {
 			p := rnd.IntN(len(keys))
 
 			cur, err := bt.Seek(getter, keys[p])
@@ -320,7 +326,7 @@ func Benchmark_BTree_SeekVsGetUncompressed(b *testing.B) {
 	})
 
 	b.Run("get_only", func(b *testing.B) {
-		for i := 0; i < b.N; i++ {
+		for b.Loop() {
 			p := rnd.IntN(len(keys))
 
 			k, _, _, _, err := bt.Get(keys[p], getter)
@@ -347,7 +353,7 @@ func Benchmark_BTree_SeekThenNext(b *testing.B) {
 	getter := seg.NewReader(kv.MakeGetter(), compress)
 
 	b.Run("seek_then_next", func(b *testing.B) {
-		for i := 0; i < b.N; i++ {
+		for i := 0; b.Loop(); i++ {
 			p := rnd.IntN(len(keys))
 
 			cur, err := bt.Seek(getter, keys[p])
@@ -438,14 +444,15 @@ func BenchmarkAggregator_BeginFilesRo_Latency(b *testing.B) {
 	_, agg := testDbAndAggregatorBench(b, aggStep)
 
 	b.Run("begin_files_ro", func(b *testing.B) {
-		for i := 0; i < b.N; i++ {
+		for b.Loop() {
 			agg.BeginFilesRo()
 		}
 	})
 }
 
 var parallel = flag.Int("bench.parallel", 1, "parallelism value") // runs 1 *maxprocs
-var loopv = flag.Int("bench.loopv", 100000, "loop value")
+var cpuIters = flag.Int("bench.cpu-iters", 1000, "CPU work iterations between BeginFilesRo and Close")
+var sleepMs = flag.Int("bench.sleep-ms", 5, "sleep duration in milliseconds between BeginRo and Rollback")
 
 func BenchmarkAggregator_BeginFilesRo_Throughput(b *testing.B) {
 	// RESULT: deteriorates after 2^21 goroutines
@@ -455,7 +462,7 @@ func BenchmarkAggregator_BeginFilesRo_Throughput(b *testing.B) {
 		cpus=$((1 << $cpu))  # Same as 2^cpu
 		echo -n "($cpus, "
 		echo -n $(go test -benchmem -run=^$ -bench ^BenchmarkAggregator_BeginFilesRo_Throughput$ github.com/erigontech/erigon/db/state  \
-		-bench.parallel=$cpus -bench.loopv=1000 | grep 'BenchmarkAggregator_BeginFilesRo_Throughput' | cut -f3 | xargs|cut -d' ' -f1)
+		-bench.parallel=$cpus -bench.cpu-iters=1000 | grep 'BenchmarkAggregator_BeginFilesRo_Throughput' | cut -f3 | xargs|cut -d' ' -f1)
 		echo -n "), "
 	done
 	**/
@@ -463,7 +470,7 @@ func BenchmarkAggregator_BeginFilesRo_Throughput(b *testing.B) {
 	if !flag.Parsed() {
 		flag.Parse()
 	}
-	//b.Logf("Running with parallel=%d work=%d, #goroutines:%d", *parallel, *loopv, *parallel*runtime.GOMAXPROCS(0))
+	//b.Logf("Running with parallel=%d work=%d, #goroutines:%d", *parallel, *cpuIters, *parallel*runtime.GOMAXPROCS(0))
 
 	aggStep := uint64(100_00)
 	_, agg := testDbAndAggregatorBench(b, aggStep)
@@ -473,7 +480,7 @@ func BenchmarkAggregator_BeginFilesRo_Throughput(b *testing.B) {
 		foo := 0
 		for b.Next() {
 			tx := agg.BeginFilesRo()
-			for i := 0; i < *loopv; i++ {
+			for i := 0; i < *cpuIters; i++ {
 				foo *= 2
 				foo /= 2
 			}
@@ -490,7 +497,7 @@ func BenchmarkDb_BeginFiles_Throughput(b *testing.B) {
 	    cpus=$((1 << $cpu))  # Same as 2^cpu
 	    echo -n "($cpus, "
 	    echo -n $(go test -benchmem -run=^$ -bench ^BenchmarkDb_BeginFiles_Throughput$ github.com/erigontech/erigon/db/state  \
-		-bench.parallel=$cpus -bench.loopv=1000 | grep 'BenchmarkDb_BeginFiles_Throughput' | cut -f3 | xargs|cut -d' ' -f1)
+		-bench.parallel=$cpus -bench.sleep-ms=1000 | grep 'BenchmarkDb_BeginFiles_Throughput' | cut -f3 | xargs|cut -d' ' -f1)
 	    echo -n "), "
 	done
 	**/
@@ -499,7 +506,7 @@ func BenchmarkDb_BeginFiles_Throughput(b *testing.B) {
 	if !flag.Parsed() {
 		flag.Parse()
 	}
-	//b.Logf("Running with parallel=%d work=%d, #goroutines:%d", *parallel, *loopv, *parallel*runtime.GOMAXPROCS(0))
+	//b.Logf("Running with parallel=%d work=%d, #goroutines:%d", *parallel, *sleepMs, *parallel*runtime.GOMAXPROCS(0))
 
 	aggStep := uint64(100_00)
 	db, _ := testDbAndAggregatorBench(b, aggStep)
@@ -509,17 +516,11 @@ func BenchmarkDb_BeginFiles_Throughput(b *testing.B) {
 	b.RunParallel(func(pb *testing.PB) {
 		//foo := 0
 		for pb.Next() {
-			tx, err := db.BeginRo(ctx)
+			tx, err := db.BeginRo(ctx) //nolint:gocritic
 			if err != nil {
 				b.Fatalf("%v", err)
 			}
-			millis := *loopv * 1000000
-			time.Sleep(time.Duration(int64(millis)))
-
-			// for i := 0; i < *loopv; i++ {
-			// 	foo *= 2
-			// 	foo /= 2
-			// }
+			time.Sleep(time.Duration(*sleepMs) * time.Millisecond)
 			tx.Rollback()
 		}
 	})
@@ -552,7 +553,7 @@ func BenchmarkDb_BeginFiles_Throughput_IO(b *testing.B) {
 	b.SetParallelism(*parallel) // p * maxprocs
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
-			tx, err := db.BeginRo(ctx)
+			tx, err := db.BeginRo(ctx) //nolint:gocritic
 			if err != nil {
 				b.Fatalf("%v", err)
 			}
@@ -604,11 +605,12 @@ func generateKV(tb testing.TB, tmp string, keySize, valueSize, keyCount int, log
 	if keyCount > 1000 { // windows CI can't handle much small parallel disk flush
 		bufSize = 1 * datasize.MB
 	}
-	collector := etl.NewCollector(state.BtreeLogPrefix+" genCompress", tb.TempDir(), etl.NewSortableBuffer(bufSize), logger)
+	collector := etl.NewCollector(btindex.BtreeLogPrefix+" genCompress", tmp, etl.NewSortableBuffer(bufSize), logger)
+	defer collector.Close()
 
 	for i := 0; i < keyCount; i++ {
 		key := make([]byte, keySize)
-		n, err := rnd.Read(key[:])
+		n, err := rnd.Read(key)
 		require.Equal(tb, keySize, n)
 		binary.BigEndian.PutUint64(key[keySize-8:], uint64(i))
 		require.NoError(tb, err)
@@ -647,7 +649,7 @@ func generateKV(tb testing.TB, tmp string, keySize, valueSize, keyCount int, log
 
 	IndexFile := filepath.Join(tmp, fmt.Sprintf("%dk.bt", keyCount/1000))
 	r := seg.NewReader(decomp.MakeGetter(), compressFlags)
-	err = state.BuildBtreeIndexWithDecompressor(IndexFile, r, ps, tb.TempDir(), 777, logger, true, statecfg.AccessorBTree|statecfg.AccessorExistence)
+	err = btindex.BuildBtreeIndexWithDecompressor(IndexFile, r, ps, tmp, 777, logger, true, statecfg.AccessorBTree|statecfg.AccessorExistence)
 	require.NoError(tb, err)
 
 	return compPath
@@ -661,6 +663,6 @@ func buildBtreeIndex(tb testing.TB, dataPath, indexPath string, compressed seg.F
 	defer decomp.Close()
 
 	r := seg.NewReader(decomp.MakeGetter(), compressed)
-	err = state.BuildBtreeIndexWithDecompressor(indexPath, r, background.NewProgressSet(), filepath.Dir(indexPath), seed, logger, noFsync, statecfg.AccessorBTree|statecfg.AccessorExistence)
+	err = btindex.BuildBtreeIndexWithDecompressor(indexPath, r, background.NewProgressSet(), filepath.Dir(indexPath), seed, logger, noFsync, statecfg.AccessorBTree|statecfg.AccessorExistence)
 	require.NoError(tb, err)
 }
