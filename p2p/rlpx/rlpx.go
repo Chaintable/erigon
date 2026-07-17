@@ -34,6 +34,7 @@ import (
 	"io"
 	mrand "math/rand"
 	"net"
+	"slices"
 	"time"
 
 	keccak "github.com/erigontech/fastkeccak"
@@ -156,7 +157,7 @@ func (c *Conn) Read() (code uint64, data []byte, wireSize int, err error) {
 		if actualSize > maxUint24 {
 			return code, nil, 0, errPlainMessageTooLarge
 		}
-		c.snappyReadBuffer = growslice(c.snappyReadBuffer, actualSize)
+		c.snappyReadBuffer = slices.Grow(c.snappyReadBuffer[:0], actualSize)[:actualSize]
 		data, err = snappy.Decode(c.snappyReadBuffer, data)
 	}
 	return code, data, wireSize, err
@@ -222,7 +223,8 @@ func (c *Conn) Write(code uint64, data []byte) (uint32, error) {
 		// Ensure the buffer has sufficient size.
 		// Package snappy will allocate its own buffer if the provided
 		// one is smaller than MaxEncodedLen.
-		c.snappyWriteBuffer = growslice(c.snappyWriteBuffer, snappy.MaxEncodedLen(len(data)))
+		snappyBound := snappy.MaxEncodedLen(len(data))
+		c.snappyWriteBuffer = slices.Grow(c.snappyWriteBuffer[:0], snappyBound)[:snappyBound]
 		data = snappy.Encode(c.snappyWriteBuffer, data)
 	}
 
@@ -235,7 +237,7 @@ func (h *sessionState) writeFrame(conn io.Writer, code uint64, data []byte) erro
 	h.wbuf.reset()
 
 	// Write header.
-	fsize := rlp.IntSize(code) + len(data)
+	fsize := rlp.U64Len(code) + len(data)
 	if fsize > maxUint24 {
 		return errPlainMessageTooLarge
 	}
@@ -636,7 +638,7 @@ func (h *handshakeState) sealEIP8(msg any) ([]byte, error) {
 	// the message distinguishable from pre-EIP-8 handshakes.
 	h.wbuf.appendZero(mrand.Intn(100) + 100) //nolint:gosec
 
-	prefix := make([]byte, 2)
+	prefix := make([]byte, 2) //nolint:prealloc
 	binary.BigEndian.PutUint16(prefix, uint16(len(h.wbuf.data)+eciesOverhead))
 
 	enc, err := ecies.Encrypt(rand.Reader, h.remote, h.wbuf.data, nil, prefix)

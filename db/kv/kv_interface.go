@@ -311,6 +311,37 @@ type PseudoDupSortRwCursor interface { // For both DupSort and usual cursors (us
 	CountDuplicates() (uint64, error) // CountDuplicates - number of duplicates for the current key
 }
 
+// RwCursorPseudoDupSort wraps any RwCursor to satisfy PseudoDupSortRwCursor
+// for non-DupSort tables. Each key has exactly one value, so dup operations
+// are trivial: CountDuplicates returns 1, NextDup returns nil, etc.
+type RwCursorPseudoDupSort struct {
+	RwCursor
+}
+
+func (c *RwCursorPseudoDupSort) DeleteExact(k1, k2 []byte) error {
+	return c.Delete(k1)
+}
+func (c *RwCursorPseudoDupSort) NextNoDup() ([]byte, []byte, error) {
+	return c.Next()
+}
+func (c *RwCursorPseudoDupSort) NextDup() ([]byte, []byte, error) {
+	return nil, nil, nil
+}
+func (c *RwCursorPseudoDupSort) FirstDup() ([]byte, error) {
+	_, v, err := c.Current()
+	return v, err
+}
+func (c *RwCursorPseudoDupSort) LastDup() ([]byte, error) {
+	_, v, err := c.Current()
+	return v, err
+}
+func (c *RwCursorPseudoDupSort) DeleteCurrentDuplicates() error {
+	return c.DeleteCurrent()
+}
+func (c *RwCursorPseudoDupSort) CountDuplicates() (uint64, error) {
+	return 1, nil
+}
+
 const Unlim int = -1 // const Unbounded/EOF/EndOfTable []byte = nil
 
 type StatelessRwTx interface {
@@ -389,9 +420,13 @@ type Putter interface {
 
 // ---- Temporal part
 
-// Step - amount of txNums in the smallest file
+// A Step is the smallest batch of txs; the amount of txs it contains is defined by StepSize and it depends on
+// how the node was synced.
+//
+// This type represents a step in time across the chain history or an amount of steps.
 type Step uint64
 
+// Returns the txNum of the first tx in the step.
 func (s Step) ToTxNum(stepSize uint64) uint64 { return uint64(s) * stepSize }
 
 type (
@@ -501,6 +536,7 @@ type TemporalMemBatch interface {
 	Unwind(txNumUnwindTo uint64, changeset *[DomainLen][]DomainEntryDiff)
 	GetAsOf(domain Domain, key []byte, ts uint64) (v []byte, ok bool, err error)
 	SetInMemHistoryReads(v bool)
+	InMemHistoryReads() bool
 }
 
 type WithFreezeInfo interface {
@@ -697,13 +733,14 @@ var (
 	//DbGcSelfPnlMergeCalls  = metrics.NewCounter(`db_gc_pnl{phase="slef_merge_calls"}`)                //nolint
 )
 
-// ErrServerOverloaded is returned by BeginRo when the DB semaphore is full and the caller is an RPC handler.
-var ErrServerOverloaded = errors.New("server overloaded, retry later")
+// ErrReadTxLimitExceeded is returned by BeginRo when the read-tx semaphore is full and no slot is
+// available for a new concurrent read transaction. The RPC layer remaps this to HTTP 503 / JSON-RPC -32005.
+var ErrReadTxLimitExceeded = errors.New("read-tx limit exceeded: too many concurrent read transactions")
 
 type nonBlockingAcquireKey struct{}
 
 // WithNonBlockingAcquire tags ctx to request fail-fast semaphore acquisition in BeginRo.
-// When set, BeginRo uses TryAcquire and returns ErrServerOverloaded immediately if the
+// When set, BeginRo uses TryAcquire and returns ErrReadTxLimitExceeded immediately if the
 // read-tx semaphore is full, instead of blocking until a slot is available.
 func WithNonBlockingAcquire(ctx context.Context) context.Context {
 	return context.WithValue(ctx, nonBlockingAcquireKey{}, struct{}{})

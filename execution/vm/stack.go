@@ -20,12 +20,18 @@
 package vm
 
 import (
-	"github.com/holiman/uint256"
+	"sync"
 
-	"github.com/erigontech/erigon/execution/protocol/params"
+	"github.com/holiman/uint256"
 )
 
-const stackLimit = params.StackLimit
+const stackLimit = 1024
+
+var stackPool = sync.Pool{
+	New: func() any {
+		return &Stack{}
+	},
+}
 
 // Stack is an object for basic stack operations. Items popped to the stack are
 // expected to be changed and modified. stack does not take care of adding newly
@@ -35,8 +41,12 @@ type Stack struct {
 	top  int
 }
 
+func New() *Stack {
+	return stackPool.Get().(*Stack)
+}
+
 func (st *Stack) push(d uint256.Int) {
-	// NOTE: stack overflow is enforced by the interpreter via operation.maxStack.
+	// NOTE push limit (1024) is checked in baseCheck
 	st.data[st.top] = d
 	st.top++
 }
@@ -48,7 +58,7 @@ func (st *Stack) pop() (ret uint256.Int) {
 }
 
 func (st *Stack) Cap() int {
-	return int(stackLimit)
+	return stackLimit
 }
 
 func (st *Stack) swap(n int) {
@@ -75,4 +85,9 @@ func (st *Stack) Reset() {
 
 func (st *Stack) len() int {
 	return st.top
+}
+
+func ReturnNormalStack(s *Stack) {
+	s.top = 0
+	stackPool.Put(s)
 }

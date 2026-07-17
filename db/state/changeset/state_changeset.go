@@ -23,7 +23,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-	"unsafe"
 
 	"github.com/erigontech/erigon/common"
 	"github.com/erigontech/erigon/common/dbg"
@@ -155,12 +154,12 @@ func deserializeDiffSetV1(in []byte) []kv.DomainEntryDiff {
 			value := in[:valueLen]
 			in = in[valueLen:]
 			diffSet[i] = kv.DomainEntryDiff{
-				Key:   toStringZeroCopy(key),
+				Key:   common.ToStringZeroCopy(key),
 				Value: value,
 			}
 		} else {
 			diffSet[i] = kv.DomainEntryDiff{
-				Key:   toStringZeroCopy(key),
+				Key:   common.ToStringZeroCopy(key),
 				Value: nil, // delete only
 			}
 		}
@@ -201,7 +200,7 @@ func deserializeDiffSetV0(in []byte) []kv.DomainEntryDiff {
 		// Skip dictIdx (1 byte) — PrevStepBytes is discarded
 		in = in[1:]
 		diffSet[i] = kv.DomainEntryDiff{
-			Key:   toStringZeroCopy(key),
+			Key:   common.ToStringZeroCopy(key),
 			Value: value, // nil when valueLen == 0 (don't restore)
 		}
 	}
@@ -449,14 +448,6 @@ func ReadLowestUnwindableBlock(tx kv.Tx) (uint64, error) {
 	return blockNumber, nil
 
 }
-func toStringZeroCopy(v []byte) string {
-	if len(v) == 0 {
-		return ""
-	}
-	return unsafe.String(&v[0], len(v))
-}
-
-func toBytesZeroCopy(s string) []byte { return unsafe.Slice(unsafe.StringData(s), len(s)) }
 
 type DomainIOMetrics struct {
 	CacheReadCount    int64
@@ -478,18 +469,7 @@ type DomainIOMetrics struct {
 type DomainMetrics struct {
 	sync.RWMutex
 	DomainIOMetrics
-	Domains [kv.DomainLen]*DomainIOMetrics
-}
-
-// domainMetrics returns the per-domain metrics entry, initialising it on first access.
-// Caller must hold dm.Lock().
-func (dm *DomainMetrics) domainMetrics(domain kv.Domain) *DomainIOMetrics {
-	if d := dm.Domains[domain]; d != nil {
-		return d
-	}
-	d := &DomainIOMetrics{}
-	dm.Domains[domain] = d
-	return d
+	Domains map[kv.Domain]*DomainIOMetrics
 }
 
 func (dm *DomainMetrics) UpdateCacheReads(domain kv.Domain, start time.Time) {
@@ -498,9 +478,15 @@ func (dm *DomainMetrics) UpdateCacheReads(domain kv.Domain, start time.Time) {
 	dm.CacheReadCount++
 	readDuration := time.Since(start)
 	dm.CacheReadDuration += readDuration
-	d := dm.domainMetrics(domain)
-	d.CacheReadCount++
-	d.CacheReadDuration += readDuration
+	if d, ok := dm.Domains[domain]; ok {
+		d.CacheReadCount++
+		d.CacheReadDuration += readDuration
+	} else {
+		dm.Domains[domain] = &DomainIOMetrics{
+			CacheReadCount:    1,
+			CacheReadDuration: readDuration,
+		}
+	}
 }
 
 func (dm *DomainMetrics) UpdateDbReads(domain kv.Domain, start time.Time) {
@@ -509,9 +495,15 @@ func (dm *DomainMetrics) UpdateDbReads(domain kv.Domain, start time.Time) {
 	dm.DbReadCount++
 	readDuration := time.Since(start)
 	dm.DbReadDuration += readDuration
-	d := dm.domainMetrics(domain)
-	d.DbReadCount++
-	d.DbReadDuration += readDuration
+	if d, ok := dm.Domains[domain]; ok {
+		d.DbReadCount++
+		d.DbReadDuration += readDuration
+	} else {
+		dm.Domains[domain] = &DomainIOMetrics{
+			DbReadCount:    1,
+			DbReadDuration: readDuration,
+		}
+	}
 }
 
 func (dm *DomainMetrics) UpdateFileReads(domain kv.Domain, start time.Time) {
@@ -520,7 +512,13 @@ func (dm *DomainMetrics) UpdateFileReads(domain kv.Domain, start time.Time) {
 	dm.FileReadCount++
 	readDuration := time.Since(start)
 	dm.FileReadDuration += readDuration
-	d := dm.domainMetrics(domain)
-	d.FileReadCount++
-	d.FileReadDuration += readDuration
+	if d, ok := dm.Domains[domain]; ok {
+		d.FileReadCount++
+		d.FileReadDuration += readDuration
+	} else {
+		dm.Domains[domain] = &DomainIOMetrics{
+			FileReadCount:    1,
+			FileReadDuration: readDuration,
+		}
+	}
 }

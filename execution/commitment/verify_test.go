@@ -17,7 +17,7 @@ import (
 func TestVerifyBranchHashes_RoundTrip(t *testing.T) {
 	t.Parallel()
 
-	hph := NewHexPatriciaHashed(length.Addr, nil)
+	hph := NewHexPatriciaHashed(length.Addr, nil, DefaultTrieConfig())
 
 	// Build a cell with account data.
 	c := new(cell)
@@ -63,12 +63,9 @@ func TestVerifyBranchHashes_RoundTrip(t *testing.T) {
 	touchMap := uint16(1 << nibble)
 	afterMap := touchMap
 
-	row := [16]*cell{}
-	row[nibble] = c
-	readCell := func(nib int, skip bool) (*cell, error) {
-		return row[nib], nil
-	}
-	branchData, _, err := encoder.EncodeBranch(touchMap, afterMap, touchMap, readCell)
+	var cellData [16]cellEncodeData
+	cellData[nibble] = cellEncodeDataFromCell(c)
+	branchData, err := encoder.EncodeBranch(touchMap, afterMap, touchMap, &cellData)
 	require.NoError(t, err)
 	require.True(t, len(branchData) > 0)
 
@@ -106,7 +103,7 @@ func TestVerifyBranchHashes_RoundTrip(t *testing.T) {
 func TestVerifyBranchHashes_Singleton(t *testing.T) {
 	t.Parallel()
 
-	hph := NewHexPatriciaHashed(length.Addr, nil)
+	hph := NewHexPatriciaHashed(length.Addr, nil, DefaultTrieConfig())
 
 	// Build a singleton cell with BOTH account and storage data at depth=2.
 	c := new(cell)
@@ -167,12 +164,9 @@ func TestVerifyBranchHashes_Singleton(t *testing.T) {
 	touchMap := uint16(1 << nibble)
 	afterMap := touchMap
 
-	row := [16]*cell{}
-	row[nibble] = c
-	readCell := func(nib int, skip bool) (*cell, error) {
-		return row[nib], nil
-	}
-	branchData, _, err := encoder.EncodeBranch(touchMap, afterMap, touchMap, readCell)
+	var cellData [16]cellEncodeData
+	cellData[nibble] = cellEncodeDataFromCell(c)
+	branchData, err := encoder.EncodeBranch(touchMap, afterMap, touchMap, &cellData)
 	require.NoError(t, err)
 
 	// branchKey for depth=2: depth-1 = 1 nibble of the hashed account key path
@@ -200,7 +194,7 @@ func TestVerifyBranchHashes_Singleton(t *testing.T) {
 func TestVerifyBranchHashes_SingletonDepth1(t *testing.T) {
 	t.Parallel()
 
-	hph := NewHexPatriciaHashed(length.Addr, nil)
+	hph := NewHexPatriciaHashed(length.Addr, nil, DefaultTrieConfig())
 
 	c := new(cell)
 	addr := common.HexToAddress("0x4c888535841acbe0709b0758083f61d375bc02b4")
@@ -256,12 +250,9 @@ func TestVerifyBranchHashes_SingletonDepth1(t *testing.T) {
 	touchMap := uint16(1 << nibble)
 	afterMap := touchMap
 
-	row := [16]*cell{}
-	row[nibble] = c
-	readCell := func(nib int, skip bool) (*cell, error) {
-		return row[nib], nil
-	}
-	branchData, _, err := encoder.EncodeBranch(touchMap, afterMap, touchMap, readCell)
+	var cellData [16]cellEncodeData
+	cellData[nibble] = cellEncodeDataFromCell(c)
+	branchData, err := encoder.EncodeBranch(touchMap, afterMap, touchMap, &cellData)
 	require.NoError(t, err)
 
 	// branchKey for root branch: empty path (0 nibbles → depth = 0 + 1 = 1)
@@ -283,7 +274,7 @@ func TestVerifyBranchHashes_SingletonDepth1(t *testing.T) {
 func TestVerifyBranchHashes_Storage(t *testing.T) {
 	t.Parallel()
 
-	hph := NewHexPatriciaHashed(length.Addr, nil)
+	hph := NewHexPatriciaHashed(length.Addr, nil, DefaultTrieConfig())
 
 	// Build a cell with storage data (depth >= 64 = pure storage cell).
 	c := new(cell)
@@ -322,12 +313,9 @@ func TestVerifyBranchHashes_Storage(t *testing.T) {
 	touchMap := uint16(1 << nibble)
 	afterMap := touchMap
 
-	row := [16]*cell{}
-	row[nibble] = c
-	readCell := func(nib int, skip bool) (*cell, error) {
-		return row[nib], nil
-	}
-	branchData, _, err := encoder.EncodeBranch(touchMap, afterMap, touchMap, readCell)
+	var cellData [16]cellEncodeData
+	cellData[nibble] = cellEncodeDataFromCell(c)
+	branchData, err := encoder.EncodeBranch(touchMap, afterMap, touchMap, &cellData)
 	require.NoError(t, err)
 
 	// Build branchKey for depth=65: depth-1 = 64 nibbles (hash of account address).

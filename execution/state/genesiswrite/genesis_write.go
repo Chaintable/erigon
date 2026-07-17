@@ -24,7 +24,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"math/big"
 	"runtime"
 	"slices"
 	"strings"
@@ -94,7 +93,7 @@ func CommitGenesisBlock(db kv.RwDB, genesis *types.Genesis, chainName string, di
 	return CommitGenesisBlockWithOverride(db, genesis, chainName, nil, nil, false, dirs, logger)
 }
 
-func CommitGenesisBlockWithOverride(db kv.RwDB, genesis *types.Genesis, chainName string, overrideOsakaTime, overrideAmsterdamTime *big.Int, keepStoredChainConfig bool, dirs datadir.Dirs, logger log.Logger) (*chain.Config, *types.Block, error) {
+func CommitGenesisBlockWithOverride(db kv.RwDB, genesis *types.Genesis, chainName string, overrideOsakaTime, overrideAmsterdamTime *uint64, keepStoredChainConfig bool, dirs datadir.Dirs, logger log.Logger) (*chain.Config, *types.Block, error) {
 	tx, err := db.BeginRw(context.Background())
 	if err != nil {
 		return nil, nil, err
@@ -111,20 +110,20 @@ func CommitGenesisBlockWithOverride(db kv.RwDB, genesis *types.Genesis, chainNam
 	return c, b, nil
 }
 
-func configOrDefault(g *types.Genesis, chainName string) *chain.Config {
+func configOrDefault(g *types.Genesis, chainName string, genesisHash common.Hash) *chain.Config {
 	if g != nil {
 		return g.Config
 	}
 	if chainName != "" {
 		spec, err := chainspec.ChainSpecByName(chainName)
-		if err == nil {
+		if err == nil && spec.GenesisHash == genesisHash {
 			return spec.Config
 		}
 	}
 	return chain.AllProtocolChanges
 }
 
-func WriteGenesisBlock(tx kv.RwTx, genesis *types.Genesis, chainName string, overrideOsakaTime, overrideAmsterdamTime *big.Int, keepStoredChainConfig bool, dirs datadir.Dirs, logger log.Logger) (*chain.Config, *types.Block, error) {
+func WriteGenesisBlock(tx kv.RwTx, genesis *types.Genesis, chainName string, overrideOsakaTime, overrideAmsterdamTime *uint64, keepStoredChainConfig bool, dirs datadir.Dirs, logger log.Logger) (*chain.Config, *types.Block, error) {
 	if err := rawdb.WriteGenesisIfNotExist(tx, genesis); err != nil {
 		return nil, nil, err
 	}
@@ -132,6 +131,11 @@ func WriteGenesisBlock(tx kv.RwTx, genesis *types.Genesis, chainName string, ove
 	var storedBlock *types.Block
 	if genesis != nil && genesis.Config == nil {
 		return chain.AllProtocolChanges, nil, types.ErrGenesisNoConfig
+	}
+	if genesis != nil && genesis.Config != nil {
+		if err := genesis.Config.Rules.Validate(); err != nil {
+			return nil, nil, err
+		}
 	}
 	// Just commit the new block if there is no stored genesis block.
 	storedHash, storedErr := rawdb.ReadCanonicalHash(tx, 0)
@@ -186,7 +190,7 @@ func WriteGenesisBlock(tx kv.RwTx, genesis *types.Genesis, chainName string, ove
 		}
 	}
 	// Get the existing chain configuration.
-	newCfg := configOrDefault(genesis, chainName)
+	newCfg := configOrDefault(genesis, chainName, storedHash)
 	applyOverrides(newCfg)
 	if err := newCfg.CheckConfigForkOrder(); err != nil {
 		return newCfg, nil, err
@@ -299,7 +303,11 @@ func WriteGenesisBesideState(block *types.Block, tx kv.RwTx, g *types.Genesis) e
 	if err := rawdb.WriteBlock(tx, block); err != nil {
 		return err
 	}
-	if err := rawdb.WriteTd(tx, block.Hash(), block.NumberU64(), g.Difficulty.ToBig()); err != nil {
+	var genesisTd uint256.Int
+	if g.Difficulty != nil {
+		genesisTd = *g.Difficulty
+	}
+	if err := rawdb.WriteTd(tx, block.Hash(), block.NumberU64(), genesisTd); err != nil {
 		return err
 	}
 	if err := rawdbv3.TxNums.Append(tx, 0, uint64(block.Transactions().Len()+1)); err != nil {
@@ -330,12 +338,16 @@ func GenesisToBlock(tb testing.TB, g *types.Genesis, dirs datadir.Dirs, logger l
 	ctx := context.Background()
 
 	// some users creating > 1Gb custom genesis by `erigon init`.
-	// On Windows, MDBX file-mappings are backed by the paging file for their full map size,
-	// so a 2 TB reservation immediately exhausts the pagefile when parallel goroutines open
-	// multiple databases (e.g. during test runs). On Linux/macOS the reservation is backed by
-	// sparse files with copy-on-write, so 2 TB is harmless.
-	// 1 GB is plenty for any practical genesis block; the CI pagefile minimum is 8 GB.
-	genesisMapSize := 2 * datasize.TB
+	// On Windows, MDBX file-mappings are backed by the paging file for their
+	// full map size, so a large reservation immediately exhausts the pagefile
+	// when parallel goroutines open multiple databases. On Linux/macOS the
+	// reservation is sparse, but each open env still eats from the process's
+	// finite virtual address space (~128 TB on x86-64) — enough to matter
+	// when many EngineApiTester instances are alive in one process. 16 GB
+	// keeps headroom for outsized custom genesis allocations while letting
+	// 100+ testers coexist. 1 GB on Windows because the pagefile minimum is
+	// 8 GB.
+	genesisMapSize := 16 * datasize.GB
 	if runtime.GOOS == "windows" {
 		genesisMapSize = 1 * datasize.GB
 	}
@@ -417,17 +429,17 @@ func ComputeGenesisCommitment(ctx context.Context, g *types.Genesis, tx kv.Tempo
 		if err != nil {
 			return nil, nil, err
 		}
-		err = statedb.SetCode(address, account.Code)
+		err = statedb.SetCode(address, account.Code, tracing.CodeChangeGenesis)
 		if err != nil {
 			return nil, nil, err
 		}
-		err = statedb.SetNonce(address, account.Nonce)
+		err = statedb.SetNonce(address, account.Nonce, tracing.NonceChangeGenesis)
 		if err != nil {
 			return nil, nil, err
 		}
 		var slotVal uint256.Int
 		for key, value := range account.Storage {
-			slotVal.SetBytes(value.Bytes())
+			slotVal.SetBytes(value[:])
 			err = statedb.SetState(address, accounts.InternKey(key), slotVal)
 			if err != nil {
 				return nil, nil, err
@@ -529,10 +541,12 @@ func GenesisWithoutStateToBlock(g *types.Genesis) (head *types.Header, withdrawa
 	}
 
 	if g.Config != nil && g.Config.IsAmsterdam(g.Timestamp) {
-		if g.BlockAccessListHash != nil {
-			head.BlockAccessListHash = g.BlockAccessListHash
-		} else {
-			head.BlockAccessListHash = &empty.BlockAccessListHash
+		if !g.Config.IsEIPDisabled(7928) {
+			if g.BlockAccessListHash != nil {
+				head.BlockAccessListHash = g.BlockAccessListHash
+			} else {
+				head.BlockAccessListHash = &empty.BlockAccessListHash
+			}
 		}
 		if g.SlotNumber != nil {
 			head.SlotNumber = g.SlotNumber
@@ -566,7 +580,7 @@ func sortedAllocKeys(m types.GenesisAlloc) []string {
 	keys := make([]string, len(m))
 	i := 0
 	for k := range m {
-		keys[i] = string(k.Bytes())
+		keys[i] = string(k[:])
 		i++
 	}
 	slices.Sort(keys)

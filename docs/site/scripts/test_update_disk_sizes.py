@@ -46,10 +46,6 @@ class FormatBytesTests(unittest.TestCase):
         # 500.5 MB -> rounds to 500 MB (banker's rounding)
         self.assertEqual(u.format_bytes(500_500_000), "500 MB")
 
-    def test_megabytes_promote_to_gigabytes_at_rounded_boundary(self):
-        # Avoid formatting just-below-1 GB values as "1000 MB"
-        self.assertEqual(u.format_bytes(999_900_000), "1.00 GB")
-
     def test_megabytes_small(self):
         # 50 MB
         self.assertEqual(u.format_bytes(50_000_000), "50 MB")
@@ -175,15 +171,13 @@ class ArtifactParsingTests(unittest.TestCase):
             # Run the main logic
             import sys
             old_argv = sys.argv
-            exit_code = 0
             try:
                 sys.argv = ["update-disk-sizes.py", str(artifacts_dir), str(json_path), "full"]
                 u.main()
-            except SystemExit as e:
-                exit_code = e.code
+            except SystemExit:
+                pass
             finally:
                 sys.argv = old_argv
-            self.assertEqual(exit_code, 1)
             
             # Verify JSON was NOT updated (no ci_last_updated field added)
             with open(json_path) as f:
@@ -216,15 +210,13 @@ class ArtifactParsingTests(unittest.TestCase):
             # Run the main logic
             import sys
             old_argv = sys.argv
-            exit_code = 0
             try:
                 sys.argv = ["update-disk-sizes.py", str(artifacts_dir), str(json_path), "full"]
                 u.main()
-            except SystemExit as e:
-                exit_code = e.code
+            except SystemExit:
+                pass
             finally:
                 sys.argv = old_argv
-            self.assertEqual(exit_code, 1)
             
             # Verify JSON was NOT updated (original value preserved)
             with open(json_path) as f:

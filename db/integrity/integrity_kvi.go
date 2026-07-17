@@ -105,7 +105,6 @@ func CheckKvis(ctx context.Context, tx kv.TemporalTx, domain kv.Domain, checkTyp
 	var successFps [][]fileFingerprint
 	var keyCount atomic.Uint64
 	for _, w := range works {
-		w := w
 		eg.Go(func() error {
 			keys, err := CheckKvi(ctx, w.kviPath, w.kvPath, kvCompression, sc, failFast, logger)
 			if err == nil {
@@ -186,7 +185,7 @@ func CheckKvi(ctx context.Context, kviPath string, kvPath string, kvCompression 
 
 	for range numWorkers {
 		eg.Go(func() error {
-			kviReader := kvi.GetReaderFromPool()
+			kviReader := kvi.Reader()
 			defer kviReader.Close()
 			for {
 				select {

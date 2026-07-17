@@ -26,14 +26,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"math/big"
 	"reflect"
 	"strings"
 	"sync"
 
-	"github.com/holiman/uint256"
-
 	"github.com/erigontech/erigon/execution/rlp/internal/rlpstruct"
+	"github.com/holiman/uint256"
 )
 
 //lint:ignore ST1012 EOL is not an error.
@@ -80,13 +78,7 @@ func IsInvalidRLPError(err error) bool {
 		errors.Is(err, errNotInList) ||
 		errors.Is(err, errNotAtEOL) ||
 		errors.Is(err, errUintOverflow) ||
-		errors.Is(err, errUint256Large) ||
-		// wrapStreamError produces *decodeError which doesn't implement Is()
-		strings.Contains(err.Error(), "rlp: input list has too many elements") ||
-		strings.Contains(err.Error(), "rlp: expected input string or byte") ||
-		strings.Contains(err.Error(), "rlp: expected input list") ||
-		strings.Contains(err.Error(), "rlp: non-canonical size information") ||
-		strings.Contains(err.Error(), "rlp: non-canonical integer (leading zero bytes)")
+		errors.Is(err, errUint256Large)
 }
 
 // Decoder is implemented by types that require custom RLP decoding rules or need to decode
@@ -119,12 +111,16 @@ func Decode(r io.Reader, val interface{}) error {
 // DecodeBytes parses RLP data from b into val. Please see package-level documentation for
 // the decoding rules. The input must contain exactly one value and no trailing data.
 func DecodeBytes(b []byte, val interface{}) error {
-	stream := NewStreamFromPool(b)
-	defer stream.Release()
+	r := (*sliceReader)(&b)
+
+	stream := streamPool.Get().(*Stream)
+	defer streamPool.Put(stream)
+
+	stream.Reset(r, uint64(len(b)))
 	if err := stream.Decode(val); err != nil {
 		return err
 	}
-	if stream.Remaining() > 0 {
+	if len(b) > 0 {
 		return ErrMoreThanOneValue
 	}
 	return nil
@@ -134,35 +130,40 @@ type decodeError struct {
 	msg string
 	typ reflect.Type
 	ctx []string
+	err error // original sentinel error, if any
 }
 
-func (err *decodeError) Error() string {
+func (e *decodeError) Error() string {
 	ctx := ""
-	if len(err.ctx) > 0 {
+	if len(e.ctx) > 0 {
 		ctx = ", decoding into "
-		for i := len(err.ctx) - 1; i >= 0; i-- {
-			ctx += err.ctx[i]
+		for i := len(e.ctx) - 1; i >= 0; i-- {
+			ctx += e.ctx[i]
 		}
 	}
-	return fmt.Sprintf("rlp: %s for %v%s", err.msg, err.typ, ctx)
+	return fmt.Sprintf("rlp: %s for %v%s", e.msg, e.typ, ctx)
+}
+
+func (e *decodeError) Unwrap() error {
+	return e.err
 }
 
 func wrapStreamError(err error, typ reflect.Type) error {
 	switch {
 	case errors.Is(err, ErrCanonInt):
-		return &decodeError{msg: "non-canonical integer (leading zero bytes)", typ: typ}
+		return &decodeError{msg: "non-canonical integer (leading zero bytes)", typ: typ, err: err}
 	case errors.Is(err, ErrCanonSize):
-		return &decodeError{msg: "non-canonical size information", typ: typ}
+		return &decodeError{msg: "non-canonical size information", typ: typ, err: err}
 	case errors.Is(err, ErrExpectedList):
-		return &decodeError{msg: "expected input list", typ: typ}
+		return &decodeError{msg: "expected input list", typ: typ, err: err}
 	case errors.Is(err, ErrExpectedString):
-		return &decodeError{msg: "expected input string or byte", typ: typ}
+		return &decodeError{msg: "expected input string or byte", typ: typ, err: err}
 	case errors.Is(err, errUintOverflow):
-		return &decodeError{msg: "input string too long", typ: typ}
+		return &decodeError{msg: "input string too long", typ: typ, err: err}
 	case errors.Is(err, errUint256Large):
-		return &decodeError{msg: "input string too long", typ: typ}
+		return &decodeError{msg: "input string too long", typ: typ, err: err}
 	case errors.Is(err, errNotAtEOL):
-		return &decodeError{msg: "input list has too many elements", typ: typ}
+		return &decodeError{msg: "input list has too many elements", typ: typ, err: err}
 	}
 	return err
 }
@@ -183,14 +184,17 @@ func addErrorContext(err error, ctx string) error {
 // DecodeBytesPartial parses RLP data from b into val.
 // Unlike DecodeBytes, it does not require that all bytes are consumed.
 func DecodeBytesPartial(b []byte, val any) error {
-	stream := NewStreamFromPool(b)
-	defer stream.Release()
+	r := (*sliceReader)(&b)
+
+	stream := streamPool.Get().(*Stream)
+	defer streamPool.Put(stream)
+
+	stream.Reset(r, uint64(len(b)))
 	return stream.Decode(val)
 }
 
 var (
 	decoderInterface = reflect.TypeFor[Decoder]()
-	bigInt           = reflect.TypeFor[big.Int]()
 	u256Int          = reflect.TypeFor[uint256.Int]()
 )
 
@@ -199,10 +203,6 @@ func makeDecoder(typ reflect.Type, tags rlpstruct.Tags) (dec decoder, err error)
 	switch {
 	case typ == rawValueType:
 		return decodeRawValue, nil
-	case typ.AssignableTo(reflect.PointerTo(bigInt)):
-		return decodeBigInt, nil
-	case typ.AssignableTo(bigInt):
-		return decodeBigIntNoPtr, nil
 	case typ == reflect.PointerTo(u256Int):
 		return decodeU256, nil
 	case typ == u256Int:
@@ -274,24 +274,6 @@ func decodeString(s *Stream, val reflect.Value) error {
 		return wrapStreamError(err, val.Type())
 	}
 	val.SetString(string(b))
-	return nil
-}
-
-func decodeBigIntNoPtr(s *Stream, val reflect.Value) error {
-	return decodeBigInt(s, val.Addr())
-}
-
-func decodeBigInt(s *Stream, val reflect.Value) error {
-	i := val.Interface().(*big.Int)
-	if i == nil {
-		i = new(big.Int)
-		val.Set(reflect.ValueOf(i))
-	}
-
-	err := s.decodeBigInt(i)
-	if err != nil {
-		return wrapStreamError(err, val.Type())
-	}
 	return nil
 }
 
@@ -376,7 +358,7 @@ func decodeSliceElems(s *Stream, val reflect.Value, elemdec decoder) error {
 			val.SetLen(i + 1)
 		}
 		// decode into element
-		if err := elemdec(s, val.Index(i)); errors.Is(err, EOL) {
+		if err := elemdec(s, val.Index(i)); err == EOL {
 			break
 		} else if err != nil {
 			return addErrorContext(err, fmt.Sprint("[", i, "]"))
@@ -395,7 +377,7 @@ func decodeListArray(s *Stream, val reflect.Value, elemdec decoder) error {
 	vlen := val.Len()
 	i := 0
 	for ; i < vlen; i++ {
-		if err := elemdec(s, val.Index(i)); errors.Is(err, EOL) {
+		if err := elemdec(s, val.Index(i)); err == EOL {
 			break
 		} else if err != nil {
 			return addErrorContext(err, fmt.Sprint("[", i, "]"))
@@ -467,7 +449,7 @@ func makeStructDecoder(typ reflect.Type) (decoder, error) {
 		}
 		for i, f := range fields {
 			err := f.info.decoder(s, val.Field(f.index))
-			if errors.Is(err, EOL) {
+			if err == EOL {
 				if f.optional {
 					// The field is optional, so reaching the end of the list before
 					// reaching the last field is acceptable. All remaining undecoded
@@ -634,6 +616,11 @@ type ByteReader interface {
 //
 // Stream is not safe for concurrent use.
 type Stream struct {
+	r ByteReader
+
+	// Inline storage for NewBytesStream so the slice header doesn't escape per call.
+	sliceRdr sliceReader
+
 	remaining uint64   // number of bytes remaining to be read from r
 	size      uint64   // size of value ahead
 	kinderr   error    // error from last readKind
@@ -642,9 +629,6 @@ type Stream struct {
 	kind      Kind     // kind of value ahead
 	byteval   byte     // value of single byte in type tag
 	limited   bool     // true if input limit is in effect
-
-	r  ByteReader
-	sr sliceReader // typed `r` to avoid allocation in NewStreamFromPool
 }
 
 // Remaining returns number of bytes remaining to be read.
@@ -675,31 +659,31 @@ func NewStream(r io.Reader, inputLimit uint64) *Stream {
 	return s
 }
 
-// Release returns the Stream to the pool. Must be called after NewStreamFromPool.
-func (s *Stream) Release() {
-	s.sr = nil // clear reference to input slice to avoid pinning it in the pool
-	s.r = nil
-	streamPool.Put(s)
-}
-
-// NewListStream creates a new stream that pretends to be positioned
-// at an encoded list of the given length.
-func NewListStream(r io.Reader, len uint64) *Stream {
-	s := new(Stream)
-	s.Reset(r, len)
-	s.kind = List
-	s.size = len
-	return s
-}
-
-// NewStreamFromPool returns a Stream from the pool. Call Release() when done.
-// sr is stored as a field on Stream (not a local var) so &stream.sr does not
-// escape to the heap, making this call allocation-free.
-func NewStreamFromPool(b []byte) (stream *Stream) {
+// NewStreamFromPool returns a Stream from the pool.
+func NewStreamFromPool(r io.Reader, inputLimit uint64) (stream *Stream, done func()) {
 	stream = streamPool.Get().(*Stream)
-	stream.sr = b // typed field: to avoid heap-escaping of reader interface
-	stream.Reset(&stream.sr, uint64(len(b)))
+	stream.Reset(r, inputLimit)
+	return stream, func() {
+		streamPool.Put(stream)
+	}
+}
+
+// NewBytesStream returns a pooled Stream reading from b. The caller MUST
+// return it via PutStream. Pair as:
+//
+//	stream := rlp.NewBytesStream(b)
+//	defer rlp.PutStream(stream)
+func NewBytesStream(b []byte) *Stream {
+	stream := streamPool.Get().(*Stream)
+	stream.sliceRdr = b
+	stream.Reset(&stream.sliceRdr, uint64(len(b)))
 	return stream
+}
+
+// PutStream returns a Stream to the pool.
+func PutStream(stream *Stream) {
+	stream.sliceRdr = nil // release caller's backing array
+	streamPool.Put(stream)
 }
 
 // Bytes reads an RLP string and returns its contents as a byte slice.
@@ -759,6 +743,40 @@ func (s *Stream) ReadBytes(b []byte) error {
 	}
 }
 
+// AppendBytes decodes the next RLP string and appends its contents to dst,
+// returning the extended slice. Pass dst[:0] to reuse a buffer's capacity;
+// pass nil to allocate fresh.
+func (s *Stream) AppendBytes(dst []byte) ([]byte, error) {
+	kind, size, err := s.Kind()
+	if err != nil {
+		return dst, err
+	}
+	switch kind {
+	case Byte:
+		s.kind = -1
+		return append(dst, s.byteval), nil
+	case String:
+		cur := len(dst)
+		need := cur + int(size)
+		if cap(dst) < need {
+			grown := make([]byte, need)
+			copy(grown, dst)
+			dst = grown
+		} else {
+			dst = dst[:need]
+		}
+		if err = s.readFull(dst[cur:]); err != nil {
+			return dst, err
+		}
+		if size == 1 && dst[cur] < 128 {
+			return dst, ErrCanonSize
+		}
+		return dst, nil
+	default:
+		return dst, ErrExpectedString
+	}
+}
+
 // Raw reads a raw encoded value including RLP type information.
 func (s *Stream) Raw() ([]byte, error) {
 	kind, size, err := s.Kind()
@@ -771,26 +789,17 @@ func (s *Stream) Raw() ([]byte, error) {
 	}
 	// The original header has already been read and is no longer
 	// available. Read content and put a new header in front of it.
-	start := headsize(size)
+	start := ListPrefixLen(int(size))
 	buf := make([]byte, uint64(start)+size)
 	if err := s.readFull(buf[start:]); err != nil {
 		return nil, err
 	}
 	if kind == String {
-		puthead(buf, 0x80, 0xB7, size)
+		encodePrefixToBuf(int(size), buf, EmptyStringCode, LongStringCode)
 	} else {
-		puthead(buf, 0xC0, 0xF7, size)
+		encodePrefixToBuf(int(size), buf, EmptyListCode, LongListCode)
 	}
 	return buf, nil
-}
-
-// Uint reads an RLP string of up to 8 bytes and returns its contents
-// as an unsigned integer. If the input does not contain an RLP string, the
-// returned error will be ErrExpectedString.
-//
-// Deprecated: use s.Uint64 instead.
-func (s *Stream) Uint() (uint64, error) {
-	return s.uint(64)
 }
 
 func (s *Stream) Uint64() (uint64, error) {
@@ -907,58 +916,6 @@ func (s *Stream) ListEnd() error {
 func (s *Stream) MoreDataInList() bool {
 	_, listLimit := s.listLimit()
 	return listLimit > 0
-}
-
-// BigInt decodes an arbitrary-size integer value.
-func (s *Stream) BigInt() (*big.Int, error) {
-	i := new(big.Int)
-	if err := s.decodeBigInt(i); err != nil {
-		return nil, err
-	}
-	return i, nil
-}
-
-func (s *Stream) decodeBigInt(dst *big.Int) error {
-	var buffer []byte
-	kind, size, err := s.Kind()
-	switch {
-	case err != nil:
-		return err
-	case kind == List:
-		return ErrExpectedString
-	case kind == Byte:
-		buffer = s.uintbuf[:1]
-		buffer[0] = s.byteval
-		s.kind = -1 // re-arm Kind
-	case size == 0:
-		// Avoid zero-length read.
-		s.kind = -1
-	case size <= uint64(len(s.uintbuf)):
-		// For integers smaller than s.uintbuf, allocating a buffer
-		// can be avoided.
-		buffer = s.uintbuf[:size]
-		if err := s.readFull(buffer); err != nil {
-			return err
-		}
-		// Reject inputs where single byte encoding should have been used.
-		if size == 1 && buffer[0] < 128 {
-			return ErrCanonSize
-		}
-	default:
-		// For large integers, a temporary buffer is needed.
-		buffer = make([]byte, size)
-		if err := s.readFull(buffer); err != nil {
-			return err
-		}
-	}
-
-	// Reject leading zero bytes.
-	if len(buffer) > 0 && buffer[0] == 0 {
-		return ErrCanonInt
-	}
-	// Set the integer bytes.
-	dst.SetBytes(buffer)
-	return nil
 }
 
 // ReadUint256 decodes the next value as a uint256.
@@ -1160,42 +1117,39 @@ func (s *Stream) readKind() (kind Kind, size uint64, err error) {
 	}
 	s.byteval = 0
 	switch {
-	case b < 0x80:
+	case b < SingleByteThreshold:
 		// For a single byte whose value is in the [0x00, 0x7F] range, that byte
 		// is its own RLP encoding.
 		s.byteval = b
 		return Byte, 0, nil
-	case b < 0xB8:
+	case b < LongStringCode+1:
 		// Otherwise, if a string is 0-55 bytes long, the RLP encoding consists
-		// of a single byte with value 0x80 plus the length of the string
-		// followed by the string. The range of the first byte is thus [0x80, 0xB7].
-		return String, uint64(b - 0x80), nil
-	case b < 0xC0:
+		// of a single byte with value EmptyStringCode plus the length of the string
+		// followed by the string.
+		return String, uint64(b - EmptyStringCode), nil
+	case b < EmptyListCode:
 		// If a string is more than 55 bytes long, the RLP encoding consists of a
-		// single byte with value 0xB7 plus the length of the length of the
+		// single byte with value LongStringCode plus the length of the length of the
 		// string in binary form, followed by the length of the string, followed
-		// by the string. For example, a length-1024 string would be encoded as
-		// 0xB90400 followed by the string. The range of the first byte is thus
-		// [0xB8, 0xBF].
-		size, err = s.readUint(b - 0xB7)
+		// by the string.
+		size, err = s.readUint(b - LongStringCode)
 		if err == nil && size < 56 {
 			err = ErrCanonSize
 		}
 		return String, size, err
-	case b < 0xF8:
+	case b < LongListCode+1:
 		// If the total payload of a list (i.e. the combined length of all its
 		// items) is 0-55 bytes long, the RLP encoding consists of a single byte
-		// with value 0xC0 plus the length of the list followed by the
-		// concatenation of the RLP encodings of the items. The range of the
-		// first byte is thus [0xC0, 0xF7].
-		return List, uint64(b - 0xC0), nil
+		// with value EmptyListCode plus the length of the list followed by the
+		// concatenation of the RLP encodings of the items.
+		return List, uint64(b - EmptyListCode), nil
 	default:
 		// If the total payload of a list is more than 55 bytes long, the RLP
-		// encoding consists of a single byte with value 0xF7 plus the length of
+		// encoding consists of a single byte with value LongListCode plus the length of
 		// the length of the payload in binary form, followed by the length of
 		// the payload, followed by the concatenation of the RLP encodings of
-		// the items. The range of the first byte is thus [0xF8, 0xFF].
-		size, err = s.readUint(b - 0xF7)
+		// the items.
+		size, err = s.readUint(b - LongListCode)
 		if err == nil && size < 56 {
 			err = ErrCanonSize
 		}

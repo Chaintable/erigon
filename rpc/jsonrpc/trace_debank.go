@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"math/big"
 	"strings"
 	"time"
 
@@ -240,8 +239,8 @@ func (api *TraceAPIImpl) DebankBlockRaw(ctx context.Context, blockNrOrHash rpc.B
 	}
 
 	// 如果 usedGas 不为 nil，值必须等于 headerGasUsed
-	if gasUsed.Block != header.GasUsed {
-		return nil, fmt.Errorf("usedGas mismatch: got %v, want %v", gasUsed.Block, header.GasUsed)
+	if gasUsed.BlockGasUsed() != header.GasUsed {
+		return nil, fmt.Errorf("usedGas mismatch: got %v, want %v", gasUsed.BlockGasUsed(), header.GasUsed)
 	}
 
 	// usedBlobGas 不为 nil
@@ -370,14 +369,14 @@ func CreateHistoryStateReader2(ctx context.Context, tx kv.TemporalTx, txNumsRead
 }
 
 func getFrom(txn types.Transaction) common.Address {
-	var chainId *big.Int
+	var chainId *uint256.Int
 	switch t := txn.(type) {
 	case *types.LegacyTx:
 		if t.Protected() {
-			chainId = types.DeriveChainId(&t.V).ToBig()
+			chainId = types.DeriveChainId(&t.V)
 		}
 	default:
-		chainId = txn.GetChainID().ToBig()
+		chainId = txn.GetChainID()
 	}
 
 	signer := types.LatestSignerForChainID(chainId)

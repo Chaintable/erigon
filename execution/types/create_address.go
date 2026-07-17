@@ -31,13 +31,11 @@ import (
 // DESCRIBED: docs/programmers_guide/guide.md#address---identifier-of-an-account
 func CreateAddress(a common.Address, nonce uint64) common.Address {
 	listLen := 21 + rlp.U64Len(nonce)
-	data := make([]byte, listLen+1)
-	pos := rlp.EncodeListPrefix(listLen, data)
-	av := a
-	pos += rlp.EncodeAddress(av[:], data[pos:])
-	rlp.EncodeU64(nonce, data[pos:])
-	h := crypto.HashData(data)
-	return common.Address(h[12:])
+	data := make([]byte, 1+listLen)
+	pos := rlp.EncodeListPrefixToBuf(listLen, data)
+	pos += rlp.EncodeStringToBuf(a[:], data[pos:])
+	rlp.EncodeU64ToBuf(nonce, data[pos:])
+	return common.BytesToAddress(crypto.Keccak256(data)[12:])
 }
 
 // CreateAddress2 creates an ethereum address given the address bytes, initial

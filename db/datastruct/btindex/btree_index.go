@@ -18,7 +18,6 @@ package btindex
 
 import (
 	"bufio"
-	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -32,13 +31,13 @@ import (
 
 	"github.com/c2h5oh/datasize"
 	"github.com/edsrzf/mmap-go"
-	"github.com/spaolacci/murmur3"
 
 	"github.com/erigontech/erigon/common"
 	"github.com/erigontech/erigon/common/background"
 	"github.com/erigontech/erigon/common/dbg"
 	"github.com/erigontech/erigon/common/dir"
 	"github.com/erigontech/erigon/common/log/v3"
+	"github.com/erigontech/erigon/common/murmur3"
 	"github.com/erigontech/erigon/db/datastruct/existence"
 	"github.com/erigontech/erigon/db/etl"
 	"github.com/erigontech/erigon/db/recsplit/eliasfano32"
@@ -366,15 +365,19 @@ func CreateBtreeIndexWithDecompressor(indexPath string, M uint64, decompressor *
 
 // OpenBtreeIndexAndDataFile opens btree index file and data file and returns it along with BtIndex instance
 // Mostly useful for testing
-func OpenBtreeIndexAndDataFile(indexPath, dataPath string, M uint64, compressed seg.FileCompression, trace bool) (*seg.Decompressor, *BtIndex, error) {
+func OpenBtreeIndexAndDataFile(indexPath, dataPath string, M uint64, compressed seg.FileCompression, trace bool) (_ *seg.Decompressor, _ *BtIndex, err error) {
 	d, err := seg.NewDecompressor(dataPath)
 	if err != nil {
 		return nil, nil, err
 	}
+	defer func() {
+		if err != nil {
+			d.Close()
+		}
+	}()
 	kv := seg.NewReader(d.MakeGetter(), compressed)
 	bt, err := OpenBtreeIndexWithDecompressor(indexPath, M, kv)
 	if err != nil {
-		d.Close()
 		return nil, nil, err
 	}
 	return d, bt, nil
@@ -507,7 +510,7 @@ func OpenBtreeIndexWithDecompressor(indexPath string, M uint64, kvGetter *seg.Re
 	defer kvGetter.MadvNormal().DisableReadAhead()
 
 	if len(idx.data[pos:]) == 0 {
-		idx.bplus = NewBpsTree(kvGetter, idx.ef, M, idx.dataLookup, idx.keyCmp)
+		idx.bplus = NewBpsTree(kvGetter, idx.ef, M, idx.dataLookup)
 		idx.bplus.cursorGetter = idx.newCursor
 		// fallback for files without nodes encoded
 	} else {
@@ -515,7 +518,7 @@ func OpenBtreeIndexWithDecompressor(indexPath string, M uint64, kvGetter *seg.Re
 		if err != nil {
 			return nil, err
 		}
-		idx.bplus = NewBpsTreeWithNodes(kvGetter, idx.ef, M, idx.dataLookup, idx.keyCmp, nodes)
+		idx.bplus = NewBpsTreeWithNodes(kvGetter, idx.ef, M, idx.dataLookup, nodes)
 		idx.bplus.cursorGetter = idx.newCursor
 	}
 
@@ -542,25 +545,6 @@ func (b *BtIndex) dataLookup(di uint64, g *seg.Reader) (k, v []byte, offset uint
 	}
 	v, _ = g.Next(nil)
 	return k, v, offset, nil
-}
-
-// comparing `k` with item of index `di`. using buffer `kBuf` to avoid allocations
-func (b *BtIndex) keyCmp(k []byte, di uint64, g *seg.Reader, resBuf []byte) (int, []byte, error) {
-	if di >= b.ef.Count() {
-		return 0, resBuf, fmt.Errorf("%w: keyCount=%d, but key %d requested. file: %s", ErrBtIndexLookupBounds, b.ef.Count(), di+1, b.FileName())
-	}
-
-	offset := b.ef.Get(di)
-	g.Reset(offset)
-	if !g.HasNext() {
-		return 0, resBuf, fmt.Errorf("key at %d/%d not found, file: %s", di, b.ef.Count(), b.FileName())
-	}
-
-	resBuf, _ = g.Next(resBuf)
-
-	//TODO: use `b.getter.Match` after https://github.com/erigontech/erigon/issues/7855
-	return bytes.Compare(resBuf, k), resBuf, nil
-	//return b.getter.Match(k), result, nil
 }
 
 // getter should be alive all the time of cursor usage

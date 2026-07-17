@@ -465,7 +465,7 @@ func (s txStore) PutEventTxnToBlockNum(ctx context.Context, eventTxnToBlockNum m
 
 	vBigNum := new(big.Int)
 	for k, v := range eventTxnToBlockNum {
-		err := tx.Put(kv.BorTxLookup, k.Bytes(), vBigNum.SetUint64(v).Bytes())
+		err := tx.Put(kv.BorTxLookup, k[:], vBigNum.SetUint64(v).Bytes())
 		if err != nil {
 			return err
 		}
@@ -477,7 +477,7 @@ func (s txStore) PutEventTxnToBlockNum(ctx context.Context, eventTxnToBlockNum m
 func (s txStore) EventTxnToBlockNum(ctx context.Context, borTxHash common.Hash) (uint64, bool, error) {
 	var blockNum uint64
 
-	v, err := s.tx.GetOne(kv.BorTxLookup, borTxHash.Bytes())
+	v, err := s.tx.GetOne(kv.BorTxLookup, borTxHash[:])
 	if err != nil {
 		return blockNum, false, err
 	}
@@ -786,63 +786,6 @@ func (s txStore) Unwind(ctx context.Context, blockNum uint64) error {
 	}
 
 	return UnwindEventTxnToBlockNum(tx, blockNum)
-}
-
-func UnwindEvents(tx kv.RwTx, unwindPoint uint64) error {
-	eventNumsCursor, err := tx.Cursor(kv.BorEventNums)
-	if err != nil {
-		return err
-	}
-	defer eventNumsCursor.Close()
-
-	var blockNumBuf [8]byte
-	binary.BigEndian.PutUint64(blockNumBuf[:], unwindPoint+1)
-
-	_, _, err = eventNumsCursor.Seek(blockNumBuf[:])
-	if err != nil {
-		return err
-	}
-
-	// keep last event ID of previous block with assigned events
-	_, lastEventIdToKeep, err := eventNumsCursor.Prev()
-	if err != nil {
-		return err
-	}
-
-	var firstEventIdToRemove uint64
-	if lastEventIdToKeep == nil {
-		// there are no assigned events before the unwind block, remove all items from BorEvents
-		firstEventIdToRemove = 0
-	} else {
-		firstEventIdToRemove = binary.BigEndian.Uint64(lastEventIdToKeep) + 1
-	}
-
-	from := make([]byte, 8)
-	binary.BigEndian.PutUint64(from, firstEventIdToRemove)
-	eventCursor, err := tx.RwCursor(kv.BorEvents)
-	if err != nil {
-		return err
-	}
-	defer eventCursor.Close()
-
-	var k []byte
-	var v []byte
-
-	for k, v, err = eventCursor.Seek(from); err == nil && k != nil; k, v, err = eventCursor.Next() {
-		var event EventRecordWithTime
-		if err := event.UnmarshallBytes(v); err != nil {
-			return err
-		}
-
-		if err := tx.Delete(kv.BorEventTimes, event.MarshallTimeBytes()); err != nil {
-			return err
-		}
-		if err = eventCursor.DeleteCurrent(); err != nil {
-			return err
-		}
-	}
-
-	return err
 }
 
 // UnwindBlockNumToEventID deletes data in kv.BorEventProcessedBlocks.

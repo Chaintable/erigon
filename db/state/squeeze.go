@@ -33,6 +33,7 @@ import (
 	downloadertype "github.com/erigontech/erigon/db/snaptype"
 	"github.com/erigontech/erigon/db/state/execctx"
 	"github.com/erigontech/erigon/db/state/statecfg"
+	"github.com/erigontech/erigon/execution/commitment"
 	"github.com/erigontech/erigon/execution/commitment/commitmentdb"
 	"github.com/erigontech/erigon/execution/stagedsync/stages"
 	"github.com/erigontech/erigon/execution/types"
@@ -196,15 +197,15 @@ func SqueezeCommitmentFiles(ctx context.Context, at *AggregatorRoTx, logger log.
 	defer logEvery.Stop()
 
 	for ri, r := range ranges {
-		af, err := accounts.rawLookupFileByRange(r.from, r.to)
+		af, err := accounts.lookupVisibleFileByRange(r.from, r.to)
 		if err != nil {
 			return err
 		}
-		sf, err := storage.rawLookupFileByRange(r.from, r.to)
+		sf, err := storage.lookupVisibleFileByRange(r.from, r.to)
 		if err != nil {
 			return err
 		}
-		cf, err := commitment.rawLookupFileByRange(r.from, r.to)
+		cf, err := commitment.lookupVisibleFileByRange(r.from, r.to)
 		if err != nil {
 			return err
 		}
@@ -475,7 +476,11 @@ func RebuildCommitmentFilesWithHistory(ctx context.Context, rwDb kv.TemporalRwDB
 	logEvery := time.NewTicker(20 * time.Second)
 	defer logEvery.Stop()
 
-	domains, err := execctx.NewSharedDomains(ctx, rwTx, logger)
+	useWarmupCache := !dbg.EnvBool("ERIGON_REBUILD_NO_WARMUP_CACHE", false)
+	rebuildCfg := commitment.DefaultTrieConfig()
+	rebuildCfg.Variant = execctx.PickTrieVariant()
+	rebuildCfg.EnableWarmupCache = useWarmupCache
+	domains, err := execctx.NewSharedDomains(ctx, rwTx, logger, execctx.WithTrieConfig(rebuildCfg))
 	if err != nil {
 		return nil, err
 	}
@@ -485,9 +490,6 @@ func RebuildCommitmentFilesWithHistory(ctx context.Context, rwDb kv.TemporalRwDB
 	domains.DiscardWrites(kv.CodeDomain)
 	domains.SetInMemHistoryReads(false)
 	domains.EnableParaTrieDB(rwDb)
-	domains.EnableTrieWarmup(true)
-	useWarmupCache := !dbg.EnvBool("ERIGON_REBUILD_NO_WARMUP_CACHE", false)
-	domains.EnableWarmupCache(useWarmupCache)
 
 	_, seekBlockNum, err := domains.SeekCommitment(ctx, rwTx)
 	if err != nil {
@@ -582,7 +584,10 @@ func RebuildCommitmentFilesWithHistory(ctx context.Context, rwDb kv.TemporalRwDB
 		if err != nil {
 			return err
 		}
-		domains, err = execctx.NewSharedDomains(ctx, rwTx, logger)
+		flushCfg := commitment.DefaultTrieConfig()
+		flushCfg.Variant = execctx.PickTrieVariant()
+		flushCfg.EnableWarmupCache = useWarmupCache
+		domains, err = execctx.NewSharedDomains(ctx, rwTx, logger, execctx.WithTrieConfig(flushCfg))
 		if err != nil {
 			return err
 		}
@@ -597,8 +602,6 @@ func RebuildCommitmentFilesWithHistory(ctx context.Context, rwDb kv.TemporalRwDB
 		domains.DiscardWrites(kv.CodeDomain)
 		domains.SetInMemHistoryReads(false)
 		domains.EnableParaTrieDB(rwDb)
-		domains.EnableTrieWarmup(true)
-		domains.EnableWarmupCache(useWarmupCache)
 		return nil
 	}
 
@@ -781,7 +784,9 @@ func RebuildCommitmentFilesWithHistory(ctx context.Context, rwDb kv.TemporalRwDB
 	}
 	logger.Info("[rebuild_commitment_history] squeeze starting")
 
-	a.recalcVisibleFiles(a.dirtyFilesEndTxNumMinimax())
+	a.dirtyFilesLock.Lock()
+	a.recalcVisibleFiles(nil)
+	a.dirtyFilesLock.Unlock()
 
 	// Check if account files exist - squeeze requires them for ReplaceKeysInValues
 	actx := a.BeginFilesRo()
@@ -822,6 +827,13 @@ func RebuildCommitmentFiles(ctx context.Context, rwDb kv.TemporalRwDB, txNumsRea
 	// disable hard alignment; allowing commitment and storage/account to have
 	// different visibleFiles
 	a.DisableAllDependencies()
+
+	// Disable ReplaceKeysInValues during rebuild. The merge loop after each range would
+	// otherwise shorten keys in commitment branch data, embedding file-range references
+	// (e.g. storage.0-16) that become stale once those files are merged into larger ranges
+	// (storage.0-32). The squeeze pass at the end re-enables this flag and applies the
+	// shortening in one shot when all files are finalized.
+	a.ForTestReplaceKeysInValues(kv.CommitmentDomain, false)
 
 	acRo := a.BeginFilesRo() // this tx is used to read existing domain files and closed in the end
 	defer acRo.Close()
@@ -871,6 +883,13 @@ func RebuildCommitmentFiles(ctx context.Context, rwDb kv.TemporalRwDB, txNumsRea
 
 	start := time.Now()
 
+	// Warmup stays off in this files-only rebuild path to match main; the WithHistory
+	// variant enables it explicitly. Variant is set per-iteration in the inner loop.
+	rebuildTrieCfg := commitment.DefaultTrieConfig()
+	rebuildTrieCfg.EnableTrieWarmup = false
+	rebuildTrieCfg.EnableWarmupCache = false
+	maxShardSteps := uint64(commitment.DefaultRebuildShardMaxSteps)
+
 	var totalKeysCommitted uint64
 
 	for i, r := range ranges {
@@ -899,7 +918,7 @@ func RebuildCommitmentFiles(ctx context.Context, rwDb kv.TemporalRwDB, txNumsRea
 		stepsInShard := uint64(shardTo - shardFrom)
 		keysPerStep := totalKeys / stepsInShard // how many keys in just one step?
 
-		shardStepsSize := kv.Step(min(uint64(math.Pow(2, math.Log2(float64(stepsInShard)))), 64))
+		shardStepsSize := kv.Step(min(uint64(math.Pow(2, math.Log2(float64(stepsInShard)))), maxShardSteps))
 		if uint64(shardStepsSize) != stepsInShard { // processing shard in several smaller steps
 			shardTo = shardFrom + shardStepsSize // if shard is quite big, we will process it in several steps
 		}
@@ -942,6 +961,12 @@ func RebuildCommitmentFiles(ctx context.Context, rwDb kv.TemporalRwDB, txNumsRea
 		}
 		roTx.Rollback()
 
+		concurrent := statecfg.ExperimentalConcurrentCommitment
+		trieVariant := commitment.VariantHexPatriciaTrie
+		if concurrent {
+			trieVariant = commitment.VariantConcurrentHexPatricia
+		}
+
 		for shardFrom < lastShard { // recreate this file range 1+ steps
 			nextKey := func() (ok bool, k []byte) {
 				if !keyIter.HasNext() {
@@ -965,7 +990,9 @@ func RebuildCommitmentFiles(ctx context.Context, rwDb kv.TemporalRwDB, txNumsRea
 			}
 			defer rwTx.Rollback()
 
-			domains, err := execctx.NewSharedDomains(ctx, rwTx, log.New())
+			iterTrieCfg := rebuildTrieCfg
+			iterTrieCfg.Variant = trieVariant
+			domains, err := execctx.NewSharedDomains(ctx, rwTx, log.New(), execctx.WithTrieConfig(iterTrieCfg))
 			if err != nil {
 				return nil, err
 			}
@@ -973,6 +1000,9 @@ func RebuildCommitmentFiles(ctx context.Context, rwDb kv.TemporalRwDB, txNumsRea
 			domains.SetTxNum(lastTxnumInShard - 1)
 			currentTxNum := lastTxnumInShard - 1
 			domains.GetCommitmentCtx().SetStateReader(commitmentdb.NewFilesOnlyStateReader(rwTx, lastTxnumInShard-1))
+			if concurrent {
+				domains.EnableParaTrieDB(rwDb)
+			}
 
 			rebuiltCommit, err = rebuildCommitmentShard(ctx, domains, rwTx, nextKey, &rebuiltCommitment{
 				StepFrom: shardFrom,
@@ -992,7 +1022,7 @@ func RebuildCommitmentFiles(ctx context.Context, rwDb kv.TemporalRwDB, txNumsRea
 
 			// make new file visible for all aggregator transactions
 			a.dirtyFilesLock.Lock()
-			a.recalcVisibleFiles(a.dirtyFilesEndTxNumMinimax())
+			a.recalcVisibleFiles(nil)
 			a.dirtyFilesLock.Unlock()
 			rwTx.Rollback()
 
@@ -1042,7 +1072,9 @@ func RebuildCommitmentFiles(ctx context.Context, rwDb kv.TemporalRwDB, txNumsRea
 		return latestRoot, nil
 	}
 	logger.Info("[squeeze] starting")
-	a.recalcVisibleFiles(a.dirtyFilesEndTxNumMinimax())
+	a.dirtyFilesLock.Lock()
+	a.recalcVisibleFiles(nil)
+	a.dirtyFilesLock.Unlock()
 
 	logger.Info(fmt.Sprintf("[squeeze] latest root %x", latestRoot))
 	a.ForTestReplaceKeysInValues(kv.CommitmentDomain, squeeze)
@@ -1078,7 +1110,7 @@ func rebuildCommitmentShard(ctx context.Context, sd *execctx.SharedDomains, tx k
 
 	visComFiles := tx.(kv.WithFreezeInfo).FreezeInfo().Files(kv.CommitmentDomain)
 	logger.Info(cfg.LogPrefix+" started", "totalKeys", common.PrettyCounter(cfg.Keys), "block", cfg.BlockNumber, "txn", cfg.TxnNumber,
-		"files", fmt.Sprintf("%d %v", len(visComFiles), visComFiles.Fullpaths()))
+		"files", fmt.Sprintf("%d %v", len(visComFiles), visComFiles.String()))
 
 	sf := time.Now()
 	var processed uint64
@@ -1095,6 +1127,7 @@ func rebuildCommitmentShard(ctx context.Context, sd *execctx.SharedDomains, tx k
 	if err != nil {
 		return nil, err
 	}
+
 	logger.Info(cfg.LogPrefix+" now sealing (dumping on disk)", "root", hex.EncodeToString(rh),
 		"keysInShard", common.PrettyCounter(processed), "keysInRange", common.PrettyCounter(cfg.Keys))
 

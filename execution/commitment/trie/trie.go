@@ -152,7 +152,7 @@ func merge2ShortNodes(node1, node2 *ShortNode) (bool, error) {
 	} else { // node1.Val is not a hashnode
 		// if node2.Val is not  a hashnode, node2.Val is expected to have the same type as node1.Val, otherwise if it is a hashnode no action is necessary (just ignore the hashnode)
 		if _, ok2 := node2.Val.(*HashNode); !ok2 {
-			if reflect.TypeOf(node1.Val) != reflect.TypeOf(node2.Val) { // sanity check
+			if !sameNodeType(node1.Val, node2.Val) { // sanity check
 				return false, fmt.Errorf("node1.Val and node2.Val have different types: %T != %T ", node1.Val, node2.Val)
 			} else {
 				furtherMergingNeeded = true
@@ -501,12 +501,17 @@ func (t *Trie) getPath(origNode Node, parents [][]byte, key []byte, pos int) ([]
 func (t *Trie) Update(key, value []byte) {
 	hex := nibbles.KeybytesToHex(key)
 
+	if len(value) == 0 {
+		_, t.RootNode = t.delete(t.RootNode, hex, false)
+		return
+	}
+
 	newnode := ValueNode(value)
 
 	if t.RootNode == nil {
 		t.RootNode = NewShortNode(hex, newnode)
 	} else {
-		_, t.RootNode = t.insert(t.RootNode, hex, ValueNode(value))
+		_, t.RootNode = t.insert(t.RootNode, hex, newnode)
 	}
 }
 
@@ -1287,7 +1292,10 @@ func concat(s1 []byte, s2 ...byte) []byte {
 // Root returns the root hash of the trie.
 //
 // Deprecated: use Hash instead.
-func (t *Trie) Root() []byte { return t.Hash().Bytes() }
+func (t *Trie) Root() []byte {
+	h := t.Hash()
+	return h[:]
+}
 
 // Hash returns the root hash of the trie. It does not write to the
 // database and can be used even if the trie doesn't have one.
@@ -1542,6 +1550,11 @@ func RLPDecode(encodedNodes [][]byte) (*Trie, error) {
 	// Build a map from hash -> decoded node
 	nodeMap := make(map[common.Hash]Node)
 	for _, encoded := range encodedNodes {
+		// The legacy witness carries the empty storage-trie preimage (RLP empty
+		// string, keccak256 == EmptyRoot); it is not a trie node, so skip it.
+		if len(encoded) == 1 && encoded[0] == 0x80 {
+			continue
+		}
 		hash := crypto.Keccak256Hash(encoded)
 		node, err := decodeTrieNode(encoded)
 		if err != nil {
@@ -1800,6 +1813,10 @@ func resolveHashNodes(node Node, nodeMap map[common.Hash]Node, insideStorageTree
 	default:
 		return n, nil
 	}
+}
+
+func sameNodeType(a, b Node) bool {
+	return reflect.TypeOf(a) == reflect.TypeOf(b)
 }
 
 // GetNode returns the trie node found at the given hex-nibble path,

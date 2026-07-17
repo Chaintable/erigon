@@ -23,7 +23,6 @@ import (
 	"fmt"
 	"math"
 	"time"
-	"unsafe"
 
 	"github.com/c2h5oh/datasize"
 
@@ -44,6 +43,7 @@ import (
 	"github.com/erigontech/erigon/db/state/execctx"
 	"github.com/erigontech/erigon/diagnostics/metrics"
 	"github.com/erigontech/erigon/execution/chain"
+	"github.com/erigontech/erigon/execution/exec"
 	"github.com/erigontech/erigon/execution/protocol/rules"
 	"github.com/erigontech/erigon/execution/stagedsync/stages"
 	"github.com/erigontech/erigon/execution/types"
@@ -51,7 +51,6 @@ import (
 	"github.com/erigontech/erigon/execution/vm"
 	"github.com/erigontech/erigon/node/ethconfig"
 	"github.com/erigontech/erigon/node/shards"
-	"github.com/erigontech/erigon/node/silkworm"
 )
 
 const (
@@ -60,11 +59,6 @@ const (
 	// stateStreamLimit - don't accumulate state changes if jump is bigger than this amount of blocks
 	stateStreamLimit uint64 = 1_000
 )
-
-type headerDownloader interface {
-	ReportBadHeaderPoS(badHeader, lastValidAncestor common.Hash)
-	POSSync() bool
-}
 
 type ExecuteBlockCfg struct {
 	db            kv.TemporalRwDB
@@ -77,7 +71,6 @@ type ExecuteBlockCfg struct {
 	badBlockHalt  bool
 	stateStream   bool
 	blockReader   services.FullBlockReader
-	hd            headerDownloader
 	author        accounts.Address
 	// last valid number of the stage
 
@@ -86,8 +79,8 @@ type ExecuteBlockCfg struct {
 	syncCfg   ethconfig.Sync
 	genesis   *types.Genesis
 
-	silkworm        *silkworm.Silkworm
 	experimentalBAL bool
+	readAheader     *exec.BlockReadAheader
 }
 
 func StageExecuteBlocksCfg(
@@ -103,11 +96,10 @@ func StageExecuteBlocksCfg(
 
 	dirs datadir.Dirs,
 	blockReader services.FullBlockReader,
-	hd headerDownloader,
 	genesis *types.Genesis,
 	syncCfg ethconfig.Sync,
-	silkworm *silkworm.Silkworm,
 	experimentalBAL bool,
+	readAheader *exec.BlockReadAheader,
 ) ExecuteBlockCfg {
 	if dirs.SnapDomain == "" {
 		panic("empty `dirs` variable")
@@ -125,12 +117,11 @@ func StageExecuteBlocksCfg(
 		stateStream:     stateStream,
 		badBlockHalt:    badBlockHalt,
 		blockReader:     blockReader,
-		hd:              hd,
 		genesis:         genesis,
 		historyV3:       true,
 		syncCfg:         syncCfg,
-		silkworm:        silkworm,
 		experimentalBAL: experimentalBAL,
+		readAheader:     readAheader,
 	}
 }
 
@@ -156,83 +147,6 @@ func (cfg ExecuteBlockCfg) WithAuthor(author accounts.Address) ExecuteBlockCfg {
 
 var ErrTooDeepUnwind = errors.New("too deep unwind")
 
-// findExecutedDiffsetAtHeight locates the DomainEntryDiff set that was stored
-// when the block at `currentBlock` was executed. It looks up the diffset under
-// the current canonical hash first, then falls back to every other header
-// stored at that height.
-//
-// The fallback is required when the headers stage just re-canonicalised the
-// chain to a new hash *before* this unwind reached this height: the diffset
-// was written under the previously-canonical (now sidechain) hash, but
-// br.CanonicalHash() returns the new canonical. Without the fallback the
-// diffset is silently missed, sd.unwindChangesetRaw stays nil at Flush time,
-// and AggregatorRoTx.Unwind never runs — leaving the domain (latest) tables
-// reflecting the sidechain state, which becomes a phantom for any
-// re-execution of the new canonical chain. CREATE2 against a counterfactual
-// address is the typical victim: collision with the phantom contract burns
-// the entire gas limit, surfacing as `gas used mismatch` at the next block.
-//
-// Returns (changeset, executedHash, found, err). When found is false the
-// changeset is the zero value; callers should treat that as "no diffs stored
-// at this height under any known header hash" (an edge case the surrounding
-// loop handles by continuing past the first iteration only).
-func findExecutedDiffsetAtHeight(
-	ctx context.Context,
-	rwTx kv.TemporalRwTx,
-	br services.FullBlockReader,
-	doms *execctx.SharedDomains,
-	currentBlock uint64,
-) (cs [kv.DomainLen][]kv.DomainEntryDiff, executedHash common.Hash, found bool, err error) {
-	currentHash, ok, err := br.CanonicalHash(ctx, rwTx, currentBlock)
-	if err != nil {
-		return cs, common.Hash{}, false, err
-	}
-	if !ok {
-		// No canonical hash at this height: we executed a sidechain block
-		// that never got marked canonical. Pick the only known header.
-		nonCanonicalHeaders, herr := rawdb.ReadHeadersByNumber(rwTx, currentBlock)
-		if herr != nil {
-			return cs, common.Hash{}, false, herr
-		}
-		switch {
-		case len(nonCanonicalHeaders) == 0:
-			return cs, common.Hash{}, false, fmt.Errorf("can't find diffsets for: %d", currentBlock)
-		case len(nonCanonicalHeaders) == 1:
-			currentHash = nonCanonicalHeaders[0].Hash()
-		default:
-			return cs, common.Hash{}, false, fmt.Errorf("diffsets ambiguous for: %d, have %d headers", currentBlock, len(nonCanonicalHeaders))
-		}
-	}
-	cs, ok, err = doms.GetDiffset(rwTx, currentHash, currentBlock)
-	if err != nil {
-		return cs, common.Hash{}, false, err
-	}
-	if ok {
-		return cs, currentHash, true, nil
-	}
-	// Diffset not under the (possibly newly re-canonicalised) current hash.
-	// Walk every header we have at this height; the one whose diffset is
-	// stored is the block we actually executed.
-	allHeaders, err := rawdb.ReadHeadersByNumber(rwTx, currentBlock)
-	if err != nil {
-		return cs, common.Hash{}, false, err
-	}
-	for _, h := range allHeaders {
-		hh := h.Hash()
-		if hh == currentHash {
-			continue
-		}
-		cs, ok, err = doms.GetDiffset(rwTx, hh, currentBlock)
-		if err != nil {
-			return cs, common.Hash{}, false, err
-		}
-		if ok {
-			return cs, hh, true, nil
-		}
-	}
-	return cs, common.Hash{}, false, nil
-}
-
 func unwindExec3(u *UnwindState, s *StageState, doms *execctx.SharedDomains, rwTx kv.TemporalRwTx, ctx context.Context, cfg ExecuteBlockCfg, accumulator *shards.Accumulator, logger log.Logger) (err error) {
 	br := cfg.blockReader
 	txNumsReader := br.TxnumReader()
@@ -245,16 +159,28 @@ func unwindExec3(u *UnwindState, s *StageState, doms *execctx.SharedDomains, rwT
 
 	t := time.Now()
 	var changeSet *[kv.DomainLen][]kv.DomainEntryDiff
-	// lastExecHash tracks the hash of the topmost actually-executed block in the
-	// unwound range (may differ from the current canonical hash at that height —
-	// see findExecutedDiffsetAtHeight). RevertWithDiffset needs it to surgically
-	// invalidate the state cache instead of falling back to a full clear.
-	var lastExecHash common.Hash
 	for currentBlock := u.CurrentBlockNumber; currentBlock > u.UnwindPoint; currentBlock-- {
-		currentKeys, executedHash, ok, err := findExecutedDiffsetAtHeight(ctx, rwTx, br, doms, currentBlock)
+		currentHash, ok, err := br.CanonicalHash(ctx, rwTx, currentBlock)
 		if err != nil {
 			return err
 		}
+		if !ok {
+			// we may have executed blocks which are not in the canonical chain
+			nonCanonicalHeaders, err := rawdb.ReadHeadersByNumber(rwTx, currentBlock)
+			if err != nil {
+				return err
+			}
+			switch {
+			case len(nonCanonicalHeaders) == 0:
+				return fmt.Errorf("can't find diffsets for: %d", currentBlock)
+			case len(nonCanonicalHeaders) == 1:
+				currentHash = nonCanonicalHeaders[0].Hash()
+			default:
+				return fmt.Errorf("diffsets ambiguous for: %d, have %d headers", currentBlock, len(nonCanonicalHeaders))
+			}
+		}
+		var currentKeys [kv.DomainLen][]kv.DomainEntryDiff
+		currentKeys, ok, err = doms.GetDiffset(rwTx, currentHash, currentBlock)
 		if !ok {
 			if changeSet == nil {
 				// this handles the edge case where we're traversing backwards from
@@ -265,16 +191,12 @@ func unwindExec3(u *UnwindState, s *StageState, doms *execctx.SharedDomains, rwT
 				// all previous blocks
 				continue
 			}
-			return fmt.Errorf("domains.GetDiffset(%d): not found under any known header hash", currentBlock)
+			return fmt.Errorf("domains.GetDiffset(%d, %s): not found", currentBlock, currentHash)
+		}
+		if err != nil {
+			return err
 		}
 		if changeSet == nil {
-			// First diffset found = topmost executed block in the unwound range.
-			// Capture lastExecHash here, not on the very first loop iteration:
-			// when u.CurrentBlockNumber itself has no diffset (the
-			// "has not been processed yet" edge case above), we skipped it, so
-			// taking the hash from that iteration would leave lastExecHash
-			// zero and RevertWithDiffset would degrade to a full cache clear.
-			lastExecHash = executedHash
 			changeSet = &currentKeys
 		} else {
 			for i := range currentKeys {
@@ -282,8 +204,23 @@ func unwindExec3(u *UnwindState, s *StageState, doms *execctx.SharedDomains, rwT
 			}
 		}
 	}
+	// Get the hash of the last executed block (the tip we're unwinding from)
+	// so RevertWithDiffset can detect if the cache was modified by a rolled-back tx.
+	lastExecHash, _, err := br.CanonicalHash(ctx, rwTx, u.CurrentBlockNumber)
+	if err != nil {
+		lastExecHash = common.Hash{}
+	}
 	if err := unwindExec3State(ctx, doms, rwTx, u.UnwindPoint, txNum, accumulator, changeSet, lastExecHash, logger); err != nil {
 		return fmt.Errorf("unwindExec3State(%d->%d): %w, took %s", s.BlockNumber, u.UnwindPoint, err, time.Since(t))
+	}
+	// Surgically evict keys touched by the unwound blocks from the state cache.
+	// Keys not in the diffset remain cached (they weren't modified by the unwound range).
+	if stateCache := doms.GetStateCache(); stateCache != nil && changeSet != nil {
+		unwindTargetHash, _, err := br.CanonicalHash(ctx, rwTx, u.UnwindPoint)
+		if err != nil {
+			unwindTargetHash = common.Hash{}
+		}
+		stateCache.RevertWithDiffset(changeSet, lastExecHash, unwindTargetHash)
 	}
 	if err := rawdb.DeleteNewerEpochs(rwTx, u.UnwindPoint+1); err != nil {
 		return fmt.Errorf("delete newer epochs: %w", err)
@@ -352,17 +289,6 @@ func unwindExec3State(ctx context.Context,
 	defer stateChanges.Close()
 	stateChanges.SortAndFlushInBackground(true)
 
-	// Invalidate state cache entries affected by the unwind.
-	// Pass the hash of the last executed block so RevertWithDiffset can detect
-	// if the cache was modified by a rolled-back tx (e.g. ValidatePayload).
-	if stateCache := sd.GetStateCache(); stateCache != nil {
-		unwindToHash, err := rawdb.ReadCanonicalHash(tx, blockUnwindTo)
-		if err != nil {
-			logger.Warn("failed to read canonical hash for cache update", "block", blockUnwindTo, "err", err)
-			unwindToHash = common.Hash{}
-		}
-		stateCache.RevertWithDiffset(changeset, lastExecutedBlockHash, unwindToHash)
-	}
 	if changeset != nil {
 		accountDiffs := changeset[kv.AccountsDomain]
 		for _, entry := range accountDiffs {
@@ -380,13 +306,13 @@ func unwindExec3State(ctx context.Context,
 					fmt.Printf("unwind (Block:%d,Tx:%d): del acc: %x, step: %d\n", blockUnwindTo, txUnwindTo, address, keyStep)
 				}
 			}
-			if err := stateChanges.Collect(toBytesZeroCopy(entry.Key)[:length.Addr], entry.Value); err != nil {
+			if err := stateChanges.Collect(common.ToBytesZeroCopy(entry.Key)[:length.Addr], entry.Value); err != nil {
 				return err
 			}
 		}
 		storageDiffs := changeset[kv.StorageDomain]
 		for _, kv := range storageDiffs {
-			if err := stateChanges.Collect(toBytesZeroCopy(kv.Key), kv.Value); err != nil {
+			if err := stateChanges.Collect(common.ToBytesZeroCopy(kv.Key), kv.Value); err != nil {
 				return err
 			}
 		}
@@ -417,8 +343,6 @@ func unwindExec3State(ctx context.Context,
 	sd.SetTxNum(txUnwindTo)
 	return nil
 }
-
-func toBytesZeroCopy(s string) []byte { return unsafe.Slice(unsafe.StringData(s), len(s)) }
 
 func stageProgress(tx kv.Tx, db kv.RoDB, stage stages.SyncStage) (prevStageProgress uint64, err error) {
 	if tx != nil {
@@ -468,6 +392,12 @@ func SpawnExecuteBlocksStage(s *StageState, u Unwinder, doms *execctx.SharedDoma
 
 func UnwindExecutionStage(u *UnwindState, s *StageState, doms *execctx.SharedDomains, rwTx kv.TemporalRwTx, ctx context.Context, cfg ExecuteBlockCfg, logger log.Logger) (err error) {
 	//fmt.Printf("unwind: %d -> %d\n", u.CurrentBlockNumber, u.UnwindPoint)
+
+	// Discard deferred commitment updates from the previous (failed) execution;
+	// otherwise the next ComputeCommitment flushes stale branch data. Runs on both
+	// unwind paths (the pre-refactor early return skipped it on the no-op path).
+	doms.ResetPendingUpdates()
+
 	if u.UnwindPoint < s.BlockNumber {
 		// Execution committed past the unwind point: roll the committed blocks back
 		// on disk (unwindExec3 also prunes the in-RAM overlay), and u.Done lowers the
@@ -537,6 +467,9 @@ func UnwindExecutionStage(u *UnwindState, s *StageState, doms *execctx.SharedDom
 }
 
 func PruneExecutionStage(ctx context.Context, s *PruneState, tx kv.RwTx, cfg ExecuteBlockCfg, timeout time.Duration, logger log.Logger) (err error) {
+	if dbg.NoPrune() {
+		return s.Done(tx)
+	}
 	// on chain-tip:
 	//  - can prune only between blocks (without blocking blocks processing)
 	//  - need also leave some time to prune blocks
@@ -545,16 +478,38 @@ func PruneExecutionStage(ctx context.Context, s *PruneState, tx kv.RwTx, cfg Exe
 	//  - stop prune when `tx.SpaceDirty()` is big
 	//  - and set ~500ms timeout
 	// because on slow disks - prune is slower. but for now - let's tune for nvme first, and add `tx.SpaceDirty()` check later https://github.com/erigontech/erigon/issues/11635
-	quickPruneTimeout := time.Duration(cfg.chainConfig.SecondsPerSlot()*1000/3) * time.Millisecond / 2
+	// 2026-04: tip-mode commitment-domain prune throughput exceeded the prior
+	// /2 budget. Use a base budget of one-third of a slot and extend it
+	// adaptively when there is a large prunable backlog, capped at two-thirds
+	// of a slot so FCU still has time. The proper fix is a background prune
+	// that defers to FCU when work is pending — out of scope here.
+	baseTimeout := time.Duration(cfg.chainConfig.SecondsPerSlot()*1000/3) * time.Millisecond
+	maxTimeout := time.Duration(cfg.chainConfig.SecondsPerSlot()*2000/3) * time.Millisecond
+	quickPruneTimeout := baseTimeout
+	if hasAgg, ok := cfg.db.(state.HasAgg); ok {
+		if agg, ok := hasAgg.Agg().(*state.Aggregator); ok && agg != nil {
+			// Each 100 prunable steps adds 200ms. 1000-step backlog -> +2s.
+			extra := time.Duration(agg.MaxPrunableStepsBacklog()/100) * 200 * time.Millisecond
+			quickPruneTimeout = baseTimeout + extra
+			if quickPruneTimeout > maxTimeout {
+				quickPruneTimeout = maxTimeout
+			}
+		}
+	}
 
 	if timeout > 0 && timeout > quickPruneTimeout {
 		quickPruneTimeout = timeout
 	}
 
+	// AlwaysGenerateChangesets disables this prune so the node retains
+	// changesets for unwinds deeper than MaxReorgDepth (debug / integration
+	// tool / explicit --experimental.always-generate-changesets flag).
+	// Without the guard, the flag still controls *generation* but every
+	// generated changeset is pruned 96 blocks later, defeating the point.
 	if s.ForwardProgress > cfg.syncCfg.MaxReorgDepth && !cfg.syncCfg.AlwaysGenerateChangesets {
 		// (chunkLen is 8Kb) * (1_000 chunks) = 8mb
 		// Some blocks on bor-mainnet have 400 chunks of diff = 3mb
-		var pruneDiffsLimitOnChainTip = 1_000
+		var pruneDiffsLimitOnChainTip = 200_000
 		pruneTimeout := quickPruneTimeout
 		if s.CurrentSyncCycle.IsInitialCycle {
 			pruneDiffsLimitOnChainTip = math.MaxInt

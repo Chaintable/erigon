@@ -77,6 +77,9 @@ type EthAPI interface {
 	GetLogs(ctx context.Context, crit filters.FilterCriteria) (types.RPCLogs, error)
 	GetBlockReceipts(ctx context.Context, numberOrHash rpc.BlockNumberOrHash) ([]map[string]any, error)
 
+	// Block access list related (see ./eth_block_access_list.go)
+	GetBlockAccessList(ctx context.Context, numberOrHash rpc.BlockNumberOrHash) ([]*ethapi.RPCAccountAccess, error)
+
 	// Uncle related (see ./eth_uncles.go)
 	GetUncleByBlockNumberAndIndex(ctx context.Context, blockNr rpc.BlockNumber, index hexutil.Uint) (map[string]any, error)
 	GetUncleByBlockHashAndIndex(ctx context.Context, hash common.Hash, index hexutil.Uint) (map[string]any, error)
@@ -107,10 +110,14 @@ type EthAPI interface {
 	ProtocolVersion(_ context.Context) (hexutil.Uint, error)
 	GasPrice(_ context.Context) (*hexutil.Big, error)
 	Config(ctx context.Context, timeArg *hexutil.Uint64) (*EthConfigResp, error)
+	Capabilities(ctx context.Context) (*CapabilitiesResult, error)
 
 	// Sending related (see ./eth_call.go)
 	Call(ctx context.Context, args ethapi.CallArgs, blockNrOrHash *rpc.BlockNumberOrHash, overrides *ethapi.StateOverrides, blockOverrides *ethapi.BlockOverrides) (hexutil.Bytes, error)
 	EstimateGas(ctx context.Context, argsOrNil *ethapi.CallArgs, blockNrOrHash *rpc.BlockNumberOrHash, overrides *ethapi.StateOverrides, blockOverrides *ethapi.BlockOverrides) (hexutil.Uint64, error)
+
+	// Simulation related (see ./eth_simulation.go)
+	SimulateV1(ctx context.Context, req SimulationRequest, blockParameter rpc.BlockNumberOrHash) (SimulationResult, error)
 	SendRawTransaction(ctx context.Context, encodedTx hexutil.Bytes) (common.Hash, error)
 	SendRawTransactionSync(ctx context.Context, encodedTx hexutil.Bytes, timeoutMs *uint64) (map[string]any, error)
 	SendTransaction(_ context.Context, txObject any) (common.Hash, error)
@@ -133,10 +140,11 @@ type BaseAPI struct {
 	stateCache kvcache.Cache
 	blocksLRU  *lru.Cache[common.Hash, *types.Block]
 
-	filters      *rpchelper.Filters
-	_chainConfig atomic.Pointer[chain.Config]
-	_genesis     atomic.Pointer[types.Block]
-	_pruneMode   atomic.Pointer[prune.Mode]
+	filters                   *rpchelper.Filters
+	_chainConfig              atomic.Pointer[chain.Config]
+	_genesis                  atomic.Pointer[types.Block]
+	_pruneMode                atomic.Pointer[prune.Mode]
+	_commitmentHistoryEnabled atomic.Pointer[bool]
 
 	_blockReader services.FullBlockReader
 	_txNumReader rawdbv3.TxNumsReader
@@ -175,8 +183,8 @@ func NewBaseApi(f *rpchelper.Filters, stateCache kvcache.Cache, blockReader serv
 		_txNumReader:        blockReader.TxnumReader(),
 		evmCallTimeout:      evmCallTimeout,
 		_engine:             engine,
-		receiptsGenerator:   receipts.NewGenerator(dirs, blockReader, engine, stateCache, evmCallTimeout),
-		borReceiptGenerator: receipts.NewBorGenerator(blockReader, engine, stateCache),
+		receiptsGenerator:   receipts.NewGenerator(dirs, blockReader, engine, stateCache, evmCallTimeout, f),
+		borReceiptGenerator: receipts.NewBorGenerator(blockReader, engine, stateCache, f),
 		dirs:                dirs,
 		bridgeReader:        bridgeReader,
 		blockRangeLimit:     rangeLimit,
@@ -224,7 +232,8 @@ func (api *BaseAPI) engine() rules.EngineReader {
 }
 
 func (api *BaseAPI) txnLookup(ctx context.Context, tx kv.Tx, txnHash common.Hash) (blockNum uint64, txNum uint64, ok bool, err error) {
-	return api._txnReader.TxnLookup(ctx, tx, txnHash)
+	overlayTx := api.filters.WithOverlay(tx)
+	return api._txnReader.TxnLookup(ctx, overlayTx, txnHash)
 }
 
 func (api *BaseAPI) blockByNumberWithSenders(ctx context.Context, tx kv.Tx, number uint64) (*types.Block, error) {
@@ -244,7 +253,8 @@ func (api *BaseAPI) blockByHashWithSenders(ctx context.Context, tx kv.Tx, hash c
 			return it, nil
 		}
 	}
-	number, err := api._blockReader.HeaderNumber(ctx, tx, hash)
+	overlayTx := api.filters.WithOverlay(tx)
+	number, err := api._blockReader.HeaderNumber(ctx, overlayTx, hash)
 	if err != nil {
 		return nil, err
 	}
@@ -261,7 +271,8 @@ func (api *BaseAPI) blockWithSenders(ctx context.Context, tx kv.Tx, hash common.
 			return it, nil
 		}
 	}
-	block, _, err := api._blockReader.BlockWithSenders(ctx, tx, hash, number)
+	overlayTx := api.filters.WithOverlay(tx)
+	block, _, err := api._blockReader.BlockWithSenders(ctx, overlayTx, hash, number)
 	if err != nil {
 		return nil, err
 	}
@@ -314,7 +325,8 @@ func (api *BaseAPI) headerByNumberOrHash(ctx context.Context, tx kv.Tx, blockNrO
 		}
 	}
 
-	header, err := api._blockReader.HeaderByNumber(ctx, tx, blockNum)
+	overlayTx := api.filters.WithOverlay(tx)
+	header, err := api._blockReader.HeaderByNumber(ctx, overlayTx, blockNum)
 	if err != nil {
 		return nil, false, err
 	}
@@ -333,7 +345,8 @@ func (api *BaseAPI) headerByNumber(ctx context.Context, number rpc.BlockNumber, 
 			return it.Header(), nil
 		}
 	}
-	return api._blockReader.Header(ctx, tx, h, n)
+	overlayTx := api.filters.WithOverlay(tx)
+	return api._blockReader.Header(ctx, overlayTx, h, n)
 }
 
 func (api *BaseAPI) headerByHash(ctx context.Context, hash common.Hash, tx kv.Tx) (*types.Header, error) {
@@ -359,28 +372,34 @@ func (api *BaseAPI) headerByHash(ctx context.Context, hash common.Hash, tx kv.Tx
 // history for blocks that have been pruned away giving nonce too low errors
 // etc. as red herrings
 func (api *BaseAPI) checkPruneHistory(ctx context.Context, tx kv.Tx, block uint64) error {
+	return api.checkPruneField(tx, block, func(p *prune.Mode) prune.BlockAmount { return p.History }, "history is available")
+}
+
+// checkPruneBlocks gates on block-body availability rather than state history — use for RPCs
+// that read block headers/bodies but do not require state (e.g. GetBlockByNumber, GetTransactionByHash).
+func (api *BaseAPI) checkPruneBlocks(ctx context.Context, tx kv.Tx, block uint64) error {
+	return api.checkPruneField(tx, block, func(p *prune.Mode) prune.BlockAmount { return p.Blocks }, "blocks are available")
+}
+
+func (api *BaseAPI) checkPruneField(tx kv.Tx, block uint64, field func(*prune.Mode) prune.BlockAmount, available string) error {
 	p, err := api.pruneMode(tx)
 	if err != nil {
 		return err
 	}
 	if p == nil {
-		// no prune info found
 		return nil
 	}
-	if p.History.Enabled() {
-		latest, _, _, err := rpchelper.GetBlockNumber(ctx, rpc.BlockNumberOrHashWithNumber(rpc.LatestBlockNumber), tx, api._blockReader, api.filters)
-		if err != nil {
-			return err
-		}
-		if latest <= 1 {
-			return nil
-		}
-		prunedTo := p.History.PruneTo(latest)
-		if block < prunedTo {
-			return fmt.Errorf("%w: requested block %d, history is available from block %d", state.PrunedError, block, prunedTo)
-		}
+	amount := field(p)
+	if !amount.Enabled() {
+		return nil
 	}
-
+	latest, err := rpchelper.GetLatestBlockNumber(tx)
+	if err != nil {
+		return err
+	}
+	if block < amount.PruneTo(latest) {
+		return fmt.Errorf("%w: requested block %d, %s from block %d", state.PrunedError, block, available, amount.PruneTo(latest))
+	}
 	return nil
 }
 
@@ -411,6 +430,26 @@ func (api *BaseAPI) pruneMode(tx kv.Tx) (*prune.Mode, error) {
 	api._pruneMode.Store(&mode)
 
 	return &mode, nil
+}
+
+// commitmentHistoryEnabled returns whether --prune.include-commitment-history was set at node
+// startup. The flag is written once by checkAndSetCommitmentHistoryFlag and never changed, so
+// the result is cached after the first successful read.
+// Unlike pruneMode, false is not cached when the DB key is absent: during the brief boot window
+// before checkAndSetCommitmentHistoryFlag runs the key may not exist yet, and caching false
+// would shadow a subsequent true write. Each request during that window pays one DB lookup.
+func (api *BaseAPI) commitmentHistoryEnabled(tx kv.Tx) (bool, error) {
+	if p := api._commitmentHistoryEnabled.Load(); p != nil {
+		return *p, nil
+	}
+	enabled, ok, err := rawdb.ReadDBCommitmentHistoryEnabled(tx)
+	if err != nil {
+		return false, err
+	}
+	if ok {
+		api._commitmentHistoryEnabled.Store(&enabled)
+	}
+	return enabled, nil
 }
 
 type bridgeReader interface {

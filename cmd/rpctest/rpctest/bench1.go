@@ -255,8 +255,9 @@ func Bench1(erigonURL, gethURL string, needCompare bool, fullTest bool, blockFro
 			}
 			fmt.Printf("Done blocks %d-%d, modified accounts: %d\n", prevBn, bn, len(mag.Result))
 
-			page := common.Hash{}.Bytes()
-			pageGeth := common.Hash{}.Bytes()
+			zeroHash := common.Hash{}
+			page := zeroHash[:]
+			pageGeth := zeroHash[:]
 
 			var accRangeErigon map[common.Address]state.DumpAccount
 			var accRangeGeth map[common.Address]state.DumpAccount
@@ -350,6 +351,19 @@ func vegetaWrite(enabled bool, methods []string, resultsCh chan CallResult) {
 				}
 			}
 		}
+
+		defer func() {
+			for _, routeFiles := range files {
+				for _, f := range routeFiles {
+					f.Close()
+				}
+			}
+			for _, routeFiles := range vegetaFiles {
+				for _, f := range routeFiles {
+					f.Close()
+				}
+			}
+		}()
 	}
 
 	for res := range resultsCh {

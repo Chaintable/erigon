@@ -22,6 +22,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"slices"
 	"sync"
 
 	"golang.org/x/sync/errgroup"
@@ -276,6 +277,7 @@ type PagedWriter struct {
 	keys, vals         []byte
 	kLengths, vLengths []uint32
 
+	pageBuf            []byte // reusable buffer for bytesUncompressedTo in sync path
 	compressionBuf     []byte
 	compressionEnabled bool
 
@@ -524,9 +526,9 @@ func (c *PagedWriter) bytesUncompressed() (wholePage []byte, notEmpty bool) {
 func pageHeaderTo(buf []byte, kLengths, vLengths []uint32, capacityHint int) []byte {
 	headerSize := 1 + len(kLengths)*2*4
 	if capacityHint > headerSize {
-		buf = growslice(buf, capacityHint)[:headerSize]
+		buf = slices.Grow(buf[:0], capacityHint)[:headerSize]
 	} else {
-		buf = growslice(buf, headerSize)
+		buf = slices.Grow(buf[:0], headerSize)[:headerSize]
 	}
 	buf[0] = uint8(len(kLengths))
 	lensBuf := buf[1:]
@@ -537,17 +539,13 @@ func pageHeaderTo(buf []byte, kLengths, vLengths []uint32, capacityHint int) []b
 	for i, l := range vLengths {
 		binary.BigEndian.PutUint32(lensBuf[i*4:(i+1)*4], l)
 	}
+
 	return buf
 }
 
 func (c *PagedWriter) bytes() (wholePage []byte, notEmpty bool) {
 	//TODO: alignment,compress+alignment
-	wholePage, notEmpty = c.bytesUncompressed()
-	if !notEmpty {
-		return nil, false
-	}
-	c.compressionBuf, wholePage = compress.EncodeZstdIfNeed(c.compressionBuf[:0], wholePage, c.compressionEnabled)
-	return wholePage, true
+	return c.bytesUncompressed()
 }
 
 func (c *PagedWriter) DisableFsync() {
@@ -562,15 +560,6 @@ func (c *PagedWriter) SetMetadata(metadata []byte) {
 
 type disableFsycn interface {
 	DisableFsync()
-}
-
-// growslice ensures b has the wanted length by either expanding it to its capacity
-// or allocating a new slice if b has insufficient capacity.
-func growslice(b []byte, wantLength int) []byte {
-	if cap(b) >= wantLength {
-		return b[:wantLength]
-	}
-	return make([]byte, wantLength, max(wantLength, 2*cap(b)))
 }
 
 // Global pools for page work items and results - optimized for GC

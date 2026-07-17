@@ -20,6 +20,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"math/big"
 	"os"
 	"path/filepath"
 	"strings"
@@ -35,6 +36,7 @@ import (
 	"github.com/erigontech/erigon/common/hexutil"
 	"github.com/erigontech/erigon/common/math"
 	"github.com/erigontech/erigon/db/kv"
+	"github.com/erigontech/erigon/execution/chain"
 	"github.com/erigontech/erigon/execution/execmodule/execmoduletester"
 	"github.com/erigontech/erigon/execution/protocol"
 	"github.com/erigontech/erigon/execution/protocol/misc"
@@ -45,6 +47,7 @@ import (
 	"github.com/erigontech/erigon/execution/vm"
 	"github.com/erigontech/erigon/execution/vm/evmtypes"
 	"github.com/erigontech/erigon/rpc"
+	"github.com/erigontech/erigon/rpc/ethapi"
 )
 
 func TestEmptyQuery(t *testing.T) {
@@ -430,8 +433,8 @@ func TestOeTracer(t *testing.T) {
 			require.NoError(t, err)
 			evm := vm.NewEVM(context, txContext, statedb, test.Genesis.Config, vm.Config{Tracer: tracer.Tracer().Hooks})
 
-			st := protocol.NewStateTransition(evm, msg, new(protocol.GasPool).AddGas(tx.GetGasLimit()).AddBlobGas(tx.GetBlobGas()))
-			_, err = st.TransitionDb(true /* refunds */, false /* gasBailout */)
+			st := protocol.NewTxnExecutor(evm, msg, new(protocol.GasPool).AddGas(tx.GetGasLimit()).AddBlobGas(tx.GetBlobGas()))
+			_, err = st.Execute(true /* refunds */, false /* gasBailout */)
 			require.NoError(t, err)
 
 			for _, trace := range traceResult.Trace {
@@ -461,14 +464,12 @@ func TestOeTracer(t *testing.T) {
 	}
 }
 
-func TestRawTransaction(t *testing.T) {
-	m, _, _ := rpcdaemontest.CreateTestExecModule(t)
-	api := NewTraceAPI(newBaseApiForTest(m), m.DB, &httpcfg.HttpCfg{})
-
-	// Read a transaction from block 6 and re-encode it as raw bytes.
-	var encodedTx []byte
+// rawTxFromBlock reads the first transaction from the given block number and
+// returns its binary encoding together with the sender and recipient addresses.
+func rawTxFromBlock(t *testing.T, m *execmoduletester.ExecModuleTester, blockNum uint64) (encoded []byte, from, to accounts.Address) {
+	t.Helper()
 	if err := m.DB.View(context.Background(), func(tx kv.Tx) error {
-		b, err := m.BlockReader.BlockByNumber(m.Ctx, tx, 6)
+		b, err := m.BlockReader.BlockByNumber(m.Ctx, tx, blockNum)
 		if err != nil {
 			return err
 		}
@@ -477,14 +478,177 @@ func TestRawTransaction(t *testing.T) {
 		if err = txn.MarshalBinary(&buf); err != nil {
 			return err
 		}
-		encodedTx = buf.Bytes()
+		encoded = buf.Bytes()
+		signer := types.MakeSigner(m.ChainConfig, b.NumberU64(), b.Time())
+		from, err = txn.Sender(*signer)
+		if err != nil {
+			return err
+		}
+		if toAddr := txn.GetTo(); toAddr != nil {
+			to = accounts.InternAddress(*toAddr)
+		}
 		return nil
 	}); err != nil {
 		t.Fatal(err)
 	}
+	return
+}
 
-	result, err := api.RawTransaction(context.Background(), encodedTx, []string{"trace"})
+func TestRawTransaction(t *testing.T) {
+	m, _, _ := rpcdaemontest.CreateTestExecModule(t)
+	api := NewTraceAPI(newBaseApiForTest(m), m.DB, &httpcfg.HttpCfg{})
+
+	encoded, _, _ := rawTxFromBlock(t, m, 6)
+	result, err := api.RawTransaction(context.Background(), encoded, []string{"trace"})
 	require.NoError(t, err)
 	require.NotNil(t, result)
 	require.NotEmpty(t, result.Trace)
+}
+
+func TestRawTransactionStateDiff(t *testing.T) {
+	m, _, _ := rpcdaemontest.CreateTestExecModule(t)
+	api := NewTraceAPI(newBaseApiForTest(m), m.DB, &httpcfg.HttpCfg{})
+
+	encoded, from, to := rawTxFromBlock(t, m, 6)
+
+	result, err := api.RawTransaction(context.Background(), encoded, []string{"stateDiff"})
+	require.NoError(t, err)
+	require.NotNil(t, result)
+
+	require.Empty(t, result.Trace)
+	require.Nil(t, result.VmTrace)
+
+	require.NotNil(t, result.StateDiff, "StateDiff must be populated")
+	require.NotEmpty(t, result.StateDiff, "StateDiff must contain at least one entry")
+
+	senderDiff, senderInDiff := result.StateDiff[from]
+	require.True(t, senderInDiff, "sender must appear in StateDiff")
+
+	receiverDiff, receiverInDiff := result.StateDiff[to]
+	require.True(t, receiverInDiff, "receiver must appear in StateDiff")
+
+	// Sender nonce must increment by exactly 1.
+	nonceDiff, ok := senderDiff.Nonce.(map[string]*StateDiffNonce)
+	require.True(t, ok, "sender nonce must be a change map")
+	n := nonceDiff["*"]
+	require.NotNil(t, n, "sender nonce change must be present")
+	require.Equal(t, uint64(n.From)+1, uint64(n.To), "sender nonce must increment by 1")
+
+	// Sender balance must decrease (is a change, not "=").
+	_, balanceEqual := senderDiff.Balance.(string)
+	require.False(t, balanceEqual, "sender balance must change")
+	balanceDiff, ok := senderDiff.Balance.(map[string]*StateDiffBalance)
+	require.True(t, ok, "sender balance must be a change map")
+	bd := balanceDiff["*"]
+	require.NotNil(t, bd, "sender balance change entry must be present")
+	require.Negative(t, bd.To.ToInt().Cmp(bd.From.ToInt()), "sender balance must decrease")
+
+	// Receiver balance must increase: either a new account ("+") or a change ("*" with To > From).
+	switch v := receiverDiff.Balance.(type) {
+	case map[string]*hexutil.Big:
+		val, exists := v["+"]
+		require.True(t, exists, "new receiver account balance must use '+' key")
+		require.Positive(t, val.ToInt().Sign(), "receiver initial balance must be positive")
+	case map[string]*StateDiffBalance:
+		bd2 := v["*"]
+		require.NotNil(t, bd2, "receiver balance change entry must be present")
+		require.Positive(t, bd2.To.ToInt().Cmp(bd2.From.ToInt()), "receiver balance must increase")
+	default:
+		t.Fatalf("unexpected receiver balance diff type: %T", receiverDiff.Balance)
+	}
+}
+
+func TestRawTransactionVmTrace(t *testing.T) {
+	m, _, _ := rpcdaemontest.CreateTestExecModule(t)
+	api := NewTraceAPI(newBaseApiForTest(m), m.DB, &httpcfg.HttpCfg{})
+
+	encoded, _, _ := rawTxFromBlock(t, m, 6)
+
+	result, err := api.RawTransaction(context.Background(), encoded, []string{"vmTrace"})
+	require.NoError(t, err)
+	require.NotNil(t, result)
+
+	require.NotNil(t, result.VmTrace, "VmTrace must be initialised when requested")
+	require.Empty(t, result.Trace, "Trace must be empty when not requested")
+	require.Nil(t, result.StateDiff, "StateDiff must be nil when not requested")
+}
+
+func TestRawTransactionAllTraceTypes(t *testing.T) {
+	m, _, _ := rpcdaemontest.CreateTestExecModule(t)
+	api := NewTraceAPI(newBaseApiForTest(m), m.DB, &httpcfg.HttpCfg{})
+
+	encoded, _, _ := rawTxFromBlock(t, m, 6)
+
+	result, err := api.RawTransaction(context.Background(), encoded, []string{"trace", "stateDiff", "vmTrace"})
+	require.NoError(t, err)
+	require.NotNil(t, result)
+
+	require.NotEmpty(t, result.Trace, "Trace must be populated")
+	require.NotNil(t, result.StateDiff, "StateDiff must be populated")
+	require.NotNil(t, result.VmTrace, "VmTrace must be initialised")
+}
+
+func TestParseOeTracerConfigRejectsCustomTracer(t *testing.T) {
+	tracer := "callTracer"
+	_, err := parseOeTracerConfig(&config.TraceConfig{Tracer: &tracer})
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "trace_*")
+	require.Contains(t, err.Error(), "debug_*")
+}
+
+func TestParseOeTracerConfigToleratesEmptyTracer(t *testing.T) {
+	empty := ""
+	_, err := parseOeTracerConfig(&config.TraceConfig{Tracer: &empty})
+	require.NoError(t, err)
+}
+
+func TestTraceCallRejectsCustomTracer(t *testing.T) {
+	m, _, _ := rpcdaemontest.CreateTestExecModule(t)
+	api := NewTraceAPI(newBaseApiForTest(m), m.DB, &httpcfg.HttpCfg{})
+
+	tracer := "callTracer"
+	var latest = rpc.LatestBlockNumber
+	_, err := api.Call(context.Background(), TraceCallParam{}, []string{TraceTypeTrace}, &rpc.BlockNumberOrHash{BlockNumber: &latest}, &config.TraceConfig{Tracer: &tracer})
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "trace_*")
+	require.Contains(t, err.Error(), "debug_*")
+}
+
+func TestRawTransactionInvalidType(t *testing.T) {
+	m, _, _ := rpcdaemontest.CreateTestExecModule(t)
+	api := NewTraceAPI(newBaseApiForTest(m), m.DB, &httpcfg.HttpCfg{})
+
+	encoded, _, _ := rawTxFromBlock(t, m, 6)
+
+	_, err := api.RawTransaction(context.Background(), encoded, []string{"unknown"})
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "unrecognized trace type")
+}
+
+func TestTraceCallBlockOverridesBaseFeeAffectsGasPrice(t *testing.T) {
+	if testing.Short() {
+		t.Skip("slow test")
+	}
+
+	m, bankAddr, contractAddr, _ := chainWithDeployedContractAndConfig(t, chain.AllProtocolChanges)
+	api := NewTraceAPI(newBaseApiForTest(m), m.DB, &httpcfg.HttpCfg{})
+
+	// EVM bytecode: GASPRICE (0x3a), PUSH1 0x00, MSTORE, PUSH1 0x20, PUSH1 0x00, RETURN
+	gasPriceCode := hexutil.Bytes{0x3a, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3}
+	result, err := api.Call(context.Background(), TraceCallParam{
+		From:                 &bankAddr,
+		To:                   &contractAddr,
+		MaxFeePerGas:         (*hexutil.Big)(big.NewInt(100)),
+		MaxPriorityFeePerGas: (*hexutil.Big)(big.NewInt(2)),
+	}, []string{TraceTypeTrace}, nil, &config.TraceConfig{
+		StateOverrides: &ethapi.StateOverrides{
+			accounts.InternAddress(contractAddr): {Code: &gasPriceCode},
+		},
+		BlockOverrides: &ethapi.BlockOverrides{
+			BaseFeePerGas: (*hexutil.Big)(big.NewInt(10)),
+		},
+	})
+	require.NoError(t, err)
+	// effective gas price = BaseFeePerGas(10) + MaxPriorityFeePerGas(2) = 12 = 0xc
+	require.Equal(t, "0x000000000000000000000000000000000000000000000000000000000000000c", result.Output.String())
 }

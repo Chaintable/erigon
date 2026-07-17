@@ -101,7 +101,8 @@ func BuildPipelineTransaction(tx types.Transaction, receipt *types.Receipt, from
 	if !chainConfig.IsLondon(header.Number.Uint64()) {
 		gasPrice = tx.GetFeeCap().ToBig()
 	} else {
-		gasPrice = new(big.Int).Add(header.BaseFee.ToBig(), tx.GetEffectiveGasTip(header.BaseFee).ToBig())
+		tip := tx.GetEffectiveGasTip(header.BaseFee)
+		gasPrice = new(big.Int).Add(header.BaseFee.ToBig(), tip.ToBig())
 	}
 	if gasPrice.Cmp(big.NewInt(0)) == 0 {
 		gasPrice = tx.GetFeeCap().ToBig()

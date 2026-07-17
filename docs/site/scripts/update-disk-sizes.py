@@ -25,10 +25,7 @@ def format_bytes(b: int) -> str:
         return f"{b / 1_000_000_000_000:.2f} TB"
     if b >= 1_000_000_000:
         return f"{b / 1_000_000_000:.2f} GB"
-    mb = round(b / 1_000_000)
-    if mb >= 1000:
-        return f"{b / 1_000_000_000:.2f} GB"
-    return f"{mb} MB"
+    return f"{round(b / 1_000_000)} MB"
 
 
 def main() -> None:
@@ -50,9 +47,7 @@ def main() -> None:
         data = json.load(f)
 
     updated = False
-    matched = False
     for artifact_file in sorted(artifacts_dir.glob(f"disk-usage-*-{prune_mode}.txt")):
-        matched = True
         # filename: disk-usage-<chain>-<mode>.txt  e.g. disk-usage-mainnet-full.txt
         stem = artifact_file.stem                        # disk-usage-mainnet-full
         inner = stem[len("disk-usage-"):]                # mainnet-full
@@ -79,11 +74,8 @@ def main() -> None:
         updated = True
 
     if not updated:
-        if matched:
-            print("Error: matching artifact files were found, but none could be applied")
-        else:
-            print("Error: no matching artifact files found")
-        sys.exit(1)
+        print("No updates made — no matching artifact files found")
+        return
 
     data["ci_last_updated"] = today
     with open(json_path, "w") as f:

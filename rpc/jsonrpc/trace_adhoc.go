@@ -45,6 +45,7 @@ import (
 	"github.com/erigontech/erigon/node/shards"
 	ptracer "github.com/erigontech/erigon/polygon/tracer"
 	"github.com/erigontech/erigon/rpc"
+	"github.com/erigontech/erigon/rpc/ethapi"
 	"github.com/erigontech/erigon/rpc/rpchelper"
 	"github.com/erigontech/erigon/rpc/transactions"
 )
@@ -212,13 +213,13 @@ func (args *TraceCallParam) ToMessage(globalGasCap uint64, baseFee *uint256.Int)
 				}
 			}
 			// Backfill the legacy gasPrice for EVM execution, unless we're all zeroes
-			var gasPrice uint256.Int
+			gasPrice = new(uint256.Int)
 			if !gasFeeCap.IsZero() || !gasTipCap.IsZero() {
-				gasPrice = u256.Min(u256.Add(*gasTipCap, *baseFee), *gasFeeCap)
+				*gasPrice = u256.Min(u256.Add(*gasTipCap, *baseFee), *gasFeeCap)
 			} else {
 				// This means gasFeeCap == 0, gasTipCap == 0
 				gasPrice.Set(baseFee)
-				gasFeeCap, gasTipCap = &gasPrice, &gasPrice
+				gasFeeCap, gasTipCap = gasPrice, gasPrice
 			}
 		}
 		if args.MaxFeePerBlobGas != nil {
@@ -250,6 +251,9 @@ func (args *TraceCallParam) ToMessage(globalGasCap uint64, baseFee *uint256.Int)
 }
 
 func parseOeTracerConfig(traceConfig *config.TraceConfig) (OeTracerConfig, error) {
+	if traceConfig != nil && traceConfig.Tracer != nil && *traceConfig.Tracer != "" {
+		return OeTracerConfig{}, errors.New("trace_* does not support custom tracers; use debug_* (e.g. debug_traceTransaction) for named or JS tracers")
+	}
 	if traceConfig == nil || traceConfig.TracerConfig == nil || *traceConfig.TracerConfig == nil {
 		return OeTracerConfig{}, nil
 	}
@@ -304,11 +308,11 @@ func (args *TraceCallParam) ToTransaction(globalGasCap uint64, baseFee *uint256.
 				Nonce:    msg.Nonce(),
 				GasLimit: msg.Gas(),
 				To:       args.To,
-				Value:    msg.Value(),
+				Value:    *msg.Value(),
 				Data:     msg.Data(),
 			},
-			FeeCap:     msg.FeeCap(),
-			TipCap:     msg.TipCap(),
+			FeeCap:     *msg.FeeCap(),
+			TipCap:     *msg.TipCap(),
 			AccessList: al,
 		}
 	case args.AccessList != nil:
@@ -318,10 +322,10 @@ func (args *TraceCallParam) ToTransaction(globalGasCap uint64, baseFee *uint256.
 					Nonce:    msg.Nonce(),
 					GasLimit: msg.Gas(),
 					To:       args.To,
-					Value:    msg.Value(),
+					Value:    *msg.Value(),
 					Data:     msg.Data(),
 				},
-				GasPrice: msg.GasPrice(),
+				GasPrice: *msg.GasPrice(),
 			},
 			AccessList: *args.AccessList,
 		}
@@ -331,10 +335,10 @@ func (args *TraceCallParam) ToTransaction(globalGasCap uint64, baseFee *uint256.
 				Nonce:    msg.Nonce(),
 				GasLimit: msg.Gas(),
 				To:       args.To,
-				Value:    msg.Value(),
+				Value:    *msg.Value(),
 				Data:     msg.Data(),
 			},
-			GasPrice: msg.GasPrice(),
+			GasPrice: *msg.GasPrice(),
 		}
 	}
 	return tx, nil
@@ -1087,7 +1091,7 @@ func (api *TraceAPIImpl) Call(ctx context.Context, args TraceCallParam, traceTyp
 		return nil, fmt.Errorf("block %d(%x) not found", blockNumber, hash)
 	}
 
-	err = rpchelper.CheckBlockExecuted(tx, blockNumber)
+	err = rpchelper.CheckBlockExecuted(api.filters.WithOverlay(tx), blockNumber)
 	if err != nil {
 		return nil, err
 	}
@@ -1141,7 +1145,18 @@ func (api *TraceAPIImpl) Call(ctx context.Context, args TraceCallParam, traceTyp
 	}
 
 	// Get a new instance of the EVM.
-	baseFee := header.BaseFee
+	var blockOverrides *ethapi.BlockOverrides
+	if traceConfig != nil {
+		blockOverrides = traceConfig.BlockOverrides
+	}
+	blockCtx := transactions.NewEVMBlockContext(engine, header, blockNrOrHash.RequireCanonical, tx, api._blockReader, chainConfig)
+	blockCtx.GasLimit = math.MaxUint64
+	blockCtx.MaxGasLimit = true
+	if err := blockOverrides.Override(&blockCtx); err != nil {
+		return nil, err
+	}
+
+	baseFee := &blockCtx.BaseFee
 	msg, err := args.ToMessage(api.gasCap, baseFee)
 	if err != nil {
 		return nil, err
@@ -1150,26 +1165,14 @@ func (api *TraceAPIImpl) Call(ctx context.Context, args TraceCallParam, traceTyp
 	if err != nil {
 		return nil, err
 	}
-
-	blockCtx := transactions.NewEVMBlockContext(engine, header, blockNrOrHash.RequireCanonical, tx, api._blockReader, chainConfig)
 	txCtx := protocol.NewEVMTxContext(msg)
 
-	blockCtx.GasLimit = math.MaxUint64
-	blockCtx.MaxGasLimit = true
-
 	var precompiles vm.PrecompiledContracts
-	if traceConfig != nil {
-		if traceConfig.BlockOverrides != nil {
-			if err := traceConfig.BlockOverrides.Override(&blockCtx); err != nil {
-				return nil, err
-			}
-		}
-		if traceConfig.StateOverrides != nil {
-			rules := blockCtx.Rules(chainConfig)
-			precompiles = vm.ActivePrecompiledContracts(rules)
-			if err := traceConfig.StateOverrides.Override(ibs, precompiles, rules); err != nil {
-				return nil, err
-			}
+	if traceConfig != nil && traceConfig.StateOverrides != nil {
+		rules := blockCtx.Rules(chainConfig)
+		precompiles = vm.ActivePrecompiledContracts(rules)
+		if err := traceConfig.StateOverrides.Override(ibs, precompiles, rules); err != nil {
+			return nil, err
 		}
 	}
 
@@ -1178,12 +1181,8 @@ func (api *TraceAPIImpl) Call(ctx context.Context, args TraceCallParam, traceTyp
 		evm.SetPrecompiles(precompiles)
 	}
 
-	// Wait for the context to be done and cancel the evm. Even if the
-	// EVM has finished, cancelling may be done (repeatedly)
-	go func() {
-		<-ctx.Done()
-		evm.Cancel()
-	}()
+	stop := context.AfterFunc(ctx, evm.Cancel)
+	defer stop()
 
 	gp := new(protocol.GasPool).AddGas(msg.Gas()).AddBlobGas(msg.BlobGas())
 	var execResult *evmtypes.ExecutionResult
@@ -1213,10 +1212,11 @@ func (api *TraceAPIImpl) Call(ctx context.Context, args TraceCallParam, traceTyp
 		}
 		// Create initial IntraBlockState, we will compare it with ibs (IntraBlockState after the transaction)
 		initialIbs := state.New(stateReader)
-		sd.CompareStates(initialIbs, ibs)
+		if err = sd.CompareStates(initialIbs, ibs); err != nil {
+			return nil, err
+		}
 	}
 
-	// If the timer caused an abort, return an appropriate error message
 	if evm.Cancelled() {
 		return nil, fmt.Errorf("execution aborted (timeout = %v)", api.evmCallTimeout)
 	}
@@ -1311,7 +1311,7 @@ func (api *TraceAPIImpl) CallMany(ctx context.Context, calls json.RawMessage, pa
 		}
 	}
 
-	err = rpchelper.CheckBlockExecuted(tx, blockNumber)
+	err = rpchelper.CheckBlockExecuted(api.filters.WithOverlay(tx), blockNumber)
 	if err != nil {
 		return nil, err
 	}
@@ -1792,7 +1792,7 @@ func (api *TraceAPIImpl) RawTransaction(ctx context.Context, encodedTx hexutil.B
 		return nil, fmt.Errorf("block %d(%x) not found", blockNumber, hash)
 	}
 
-	err = rpchelper.CheckBlockExecuted(dbtx, blockNumber)
+	err = rpchelper.CheckBlockExecuted(api.filters.WithOverlay(dbtx), blockNumber)
 	if err != nil {
 		return nil, err
 	}
@@ -1801,8 +1801,6 @@ func (api *TraceAPIImpl) RawTransaction(ctx context.Context, encodedTx hexutil.B
 	if err != nil {
 		return nil, err
 	}
-
-	ibs := state.New(stateReader)
 
 	var cancel context.CancelFunc
 	if api.evmCallTimeout > 0 {
@@ -1829,6 +1827,8 @@ func (api *TraceAPIImpl) RawTransaction(ctx context.Context, encodedTx hexutil.B
 	if traceTypeVmTrace {
 		traceResult.VmTrace = &VmTrace{Ops: []*VmTraceOp{}}
 	}
+
+	ibs := state.New(stateReader)
 
 	var ot OeTracer
 	ot.config, err = parseOeTracerConfig(nil)
@@ -1860,10 +1860,8 @@ func (api *TraceAPIImpl) RawTransaction(ctx context.Context, encodedTx hexutil.B
 
 	evm := vm.NewEVM(blockCtx, txCtx, ibs, chainConfig, vm.Config{Tracer: ot.Tracer().Hooks})
 
-	go func() {
-		<-ctx.Done()
-		evm.Cancel()
-	}()
+	stop := context.AfterFunc(ctx, evm.Cancel)
+	defer stop()
 
 	gp := new(protocol.GasPool).AddGas(msg.Gas()).AddBlobGas(msg.BlobGas())
 	var execResult *evmtypes.ExecutionResult
@@ -1885,6 +1883,7 @@ func (api *TraceAPIImpl) RawTransaction(ctx context.Context, encodedTx hexutil.B
 	}
 
 	traceResult.Output = common.Copy(execResult.ReturnData)
+
 	if traceTypeStateDiff {
 		sdMap := make(map[accounts.Address]*StateDiffAccount)
 		traceResult.StateDiff = sdMap
@@ -1893,7 +1892,9 @@ func (api *TraceAPIImpl) RawTransaction(ctx context.Context, encodedTx hexutil.B
 			return nil, err
 		}
 		initialIbs := state.New(stateReader)
-		sd.CompareStates(initialIbs, ibs)
+		if err = sd.CompareStates(initialIbs, ibs); err != nil {
+			return nil, err
+		}
 	}
 
 	if evm.Cancelled() {

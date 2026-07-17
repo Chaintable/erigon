@@ -175,11 +175,15 @@ func benchInitBtreeIndex(b *testing.B, params bTreeParameters, compression seg.F
 
 func Benchmark_BTree_SeekVsGetCompressedV(b *testing.B) {
 	compress := seg.CompressVals
+	keyCount := 1_000_000
+	if testing.Short() {
+		keyCount = 10_000
+	}
 	kv, bt, keys, _ := benchInitBtreeIndex(b, bTreeParameters{
 		M:         1024,
 		KeySize:   64,
 		ValueSize: 1024,
-		KeyCount:  1_000_000, // .kv file size about 550 MB
+		KeyCount:  keyCount,
 	}, compress)
 	rnd := newRnd(uint64(time.Now().UnixNano()))
 	getter := seg.NewReader(kv.MakeGetter(), compress)
@@ -217,11 +221,15 @@ func Benchmark_BTree_SeekVsGetCompressedV(b *testing.B) {
 
 func Benchmark_BTree_SeekVsGetCompressedK(b *testing.B) {
 	compress := seg.CompressKeys
+	keyCount := 1_000_000
+	if testing.Short() {
+		keyCount = 10_000
+	}
 	kv, bt, keys, _ := benchInitBtreeIndex(b, bTreeParameters{
 		M:         1024,
 		KeySize:   64,
 		ValueSize: 1024,
-		KeyCount:  1_000_000, // .kv file size about 550 MB
+		KeyCount:  keyCount,
 	}, compress)
 	rnd := newRnd(uint64(time.Now().UnixNano()))
 	getter := seg.NewReader(kv.MakeGetter(), compress)
@@ -259,11 +267,15 @@ func Benchmark_BTree_SeekVsGetCompressedK(b *testing.B) {
 
 func Benchmark_BTree_SeekVsGetCompressedKV(b *testing.B) {
 	compress := seg.CompressKeys | seg.CompressVals
+	keyCount := 1_000_000
+	if testing.Short() {
+		keyCount = 10_000
+	}
 	kv, bt, keys, _ := benchInitBtreeIndex(b, bTreeParameters{
 		M:         1024,
 		KeySize:   64,
 		ValueSize: 1024,
-		KeyCount:  1_000_000, // .kv file size about 550 MB
+		KeyCount:  keyCount,
 	}, compress)
 	rnd := newRnd(uint64(time.Now().UnixNano()))
 	getter := seg.NewReader(kv.MakeGetter(), compress)
@@ -301,11 +313,15 @@ func Benchmark_BTree_SeekVsGetCompressedKV(b *testing.B) {
 
 func Benchmark_BTree_SeekVsGetUncompressed(b *testing.B) {
 	compress := seg.CompressNone
+	keyCount := 1_000_000
+	if testing.Short() {
+		keyCount = 10_000
+	}
 	kv, bt, keys, _ := benchInitBtreeIndex(b, bTreeParameters{
 		M:         1024,
 		KeySize:   64,
 		ValueSize: 1024,
-		KeyCount:  1_000_000, // .kv file size about 550 MB
+		KeyCount:  keyCount,
 	}, compress)
 	rnd := newRnd(uint64(time.Now().UnixNano()))
 	getter := seg.NewReader(kv.MakeGetter(), compress)
@@ -343,11 +359,15 @@ func Benchmark_BTree_SeekVsGetUncompressed(b *testing.B) {
 
 func Benchmark_BTree_SeekThenNext(b *testing.B) {
 	compress := seg.CompressNone
+	keyCount := 1_000_000
+	if testing.Short() {
+		keyCount = 10_000
+	}
 	kv, bt, keys, _ := benchInitBtreeIndex(b, bTreeParameters{
 		M:         1024,
 		KeySize:   64,
 		ValueSize: 1024,
-		KeyCount:  1_000_000, // .kv file size about 550 MB
+		KeyCount:  keyCount,
 	}, compress)
 	rnd := newRnd(uint64(time.Now().UnixNano()))
 	getter := seg.NewReader(kv.MakeGetter(), compress)
@@ -490,6 +510,14 @@ func BenchmarkAggregator_BeginFilesRo_Throughput(b *testing.B) {
 }
 
 func BenchmarkDb_BeginFiles_Throughput(b *testing.B) {
+	// Skipped under -short rather than reduced: the work per iteration is a
+	// time.Sleep whose duration is the point of the benchmark. There is no
+	// meaningful smaller version — a shorter sleep measures something different.
+	// This benchmark is designed to be run manually with explicit -bench.parallel
+	// and -bench.loopv flags; it has no useful default invocation for CI.
+	if testing.Short() {
+		b.Skip("manual throughput experiment; no meaningful short form")
+	}
 	// RESULT: deteriorates after 2^21 goroutines.
 
 	/**
@@ -510,7 +538,7 @@ func BenchmarkDb_BeginFiles_Throughput(b *testing.B) {
 
 	aggStep := uint64(100_00)
 	db, _ := testDbAndAggregatorBench(b, aggStep)
-	ctx := context.Background()
+	ctx := b.Context()
 
 	b.SetParallelism(*parallel) // p * maxprocs
 	b.RunParallel(func(pb *testing.PB) {
@@ -548,7 +576,7 @@ func BenchmarkDb_BeginFiles_Throughput_IO(b *testing.B) {
 
 	aggStep := uint64(100_00)
 	db, _ := testDbAndAggregatorBench(b, aggStep)
-	ctx := context.Background()
+	ctx := b.Context()
 
 	b.SetParallelism(*parallel) // p * maxprocs
 	b.RunParallel(func(pb *testing.PB) {
@@ -598,7 +626,7 @@ func generateKV(tb testing.TB, tmp string, keySize, valueSize, keyCount int, log
 	values := make([]byte, valueSize)
 
 	dataPath := filepath.Join(tmp, fmt.Sprintf("%dk.kv", keyCount/1000))
-	comp, err := seg.NewCompressor(context.Background(), "cmp", dataPath, tmp, seg.DefaultCfg, log.LvlDebug, logger)
+	comp, err := seg.NewCompressor(tb.Context(), "cmp", dataPath, tmp, seg.DefaultCfg, log.LvlDebug, logger)
 	require.NoError(tb, err)
 
 	bufSize := 8 * datasize.KB
