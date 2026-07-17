@@ -20,7 +20,6 @@ import (
 	"context"
 	"testing"
 
-	"github.com/holiman/uint256"
 	"github.com/stretchr/testify/require"
 
 	"github.com/erigontech/erigon/common"
@@ -31,156 +30,34 @@ import (
 	"github.com/erigontech/erigon/db/kv/mdbx"
 	"github.com/erigontech/erigon/db/kv/rawdbv3"
 	"github.com/erigontech/erigon/db/kv/temporal"
-	"github.com/erigontech/erigon/db/rawdb"
 	"github.com/erigontech/erigon/db/snapshotsync/freezeblocks"
 	dbstate "github.com/erigontech/erigon/db/state"
 	"github.com/erigontech/erigon/db/state/changeset"
 	"github.com/erigontech/erigon/db/state/execctx"
+	"github.com/erigontech/erigon/execution/cache"
 	"github.com/erigontech/erigon/execution/chain/networkname"
 	"github.com/erigontech/erigon/execution/stagedsync/stages"
-	"github.com/erigontech/erigon/execution/types"
 	"github.com/erigontech/erigon/node/ethconfig"
 )
 
-// TestFindExecutedDiffsetAtHeight_FallsBackAfterCanonicalReorg is a
-// regression test for the CREATE2-collision-after-reorg bug that surfaced on
-// hoodi at block 2 789 993 (release/3.4).
-//
-// Repro of the original chain of events:
-//
-//  1. Erigon executes a sidechain block H_old at height N. Its diffset is
-//     stored under (N, H_old) in kv.ChangeSets3. H_old is briefly canonical.
-//  2. Headers stage receives the canonical chain, re-canonicalises height N
-//     to H_new. The canonical pointer flips before execution stage unwinds.
-//  3. unwindExec3 asks for the diffset under the *current* canonical hash
-//     (H_new) — but the diffset was stored under H_old.
-//
-// Before the fix, step 3 returned !ok and was silently treated as "nothing
-// to unwind" (changeSet stays nil → sd.unwindChangesetRaw stays nil → no
-// tombstones written to AccountsDomain/CodeDomain → phantom CREATE2 state
-// remains in latest-state tables). Re-executing the canonical chain over
-// the phantom triggered an EIP-684/EIP-1014 collision on the next CREATE2
-// to the same counterfactual address, consuming the entire gas limit and
-// surfacing as `gas used mismatch` at the boundary block.
-//
-// The helper findExecutedDiffsetAtHeight must now fall back from the
-// current canonical hash to the previously-applied sidechain hash.
-func TestFindExecutedDiffsetAtHeight_FallsBackAfterCanonicalReorg(t *testing.T) {
-	t.Parallel()
-
-	logger := log.New()
-	dirs := datadir.New(t.TempDir())
-	rawDb := mdbx.New(dbcfg.ChainDB, logger).InMem(t, dirs.Chaindata).MustOpen()
-	t.Cleanup(rawDb.Close)
-
-	agg, err := dbstate.NewTest(dirs).StepSize(16).Logger(logger).Open(context.Background(), rawDb)
-	require.NoError(t, err)
-	t.Cleanup(agg.Close)
-
-	db, err := temporal.New(rawDb, agg)
-	require.NoError(t, err)
-
-	// Block reader backed only by MDBX — no snapshots needed because the unwind
-	// range is at the tip, well above any frozen snapshot boundary.
-	snaps := freezeblocks.NewRoSnapshots(ethconfig.BlocksFreezing{ChainName: networkname.Mainnet}, dirs.Snap, logger)
-	t.Cleanup(snaps.Close)
-	br := freezeblocks.NewBlockReader(snaps, nil)
-
-	ctx := context.Background()
-	tx, err := db.BeginTemporalRw(ctx)
-	require.NoError(t, err)
-	defer tx.Rollback()
-
-	doms, err := execctx.NewSharedDomains(ctx, tx, logger)
-	require.NoError(t, err)
-	defer doms.Close()
-
-	const height = uint64(10)
-	hOld := makeHeader(height, common.Hash{0x01})
-	hNew := makeHeader(height, common.Hash{0x02})
-	require.NoError(t, rawdb.WriteHeader(tx, hOld))
-	require.NoError(t, rawdb.WriteHeader(tx, hNew))
-
-	// Diffset is stored under hOld — this is the block we actually executed.
-	addr := common.Address{0xde, 0xad}
-	cs := &changeset.StateChangeSet{}
-	cs.Diffs[kv.AccountsDomain].DomainUpdate(addr.Bytes(), kv.Step(0), nil /* prev=nil → []byte{} tombstone on unwind */)
-	require.NoError(t, changeset.WriteDiffSet(tx, height, hOld.Hash(), cs))
-
-	// Phase 1: hOld is canonical → direct hit under the current canonical hash.
-	require.NoError(t, rawdb.WriteCanonicalHash(tx, hOld.Hash(), height))
-	got, executed, found, err := findExecutedDiffsetAtHeight(ctx, tx, br, doms, height)
-	require.NoError(t, err)
-	require.True(t, found, "diffset must be found when canonical hash matches stored hash")
-	require.Equal(t, hOld.Hash(), executed, "executedHash must be hOld when canonical points at hOld")
-	require.NotEmpty(t, got[kv.AccountsDomain], "AccountsDomain diff list must be non-empty")
-
-	// Phase 2: headers stage re-canonicalises to hNew (which has no diffset).
-	// Before the fix the lookup returns !ok, the unwind silently no-ops and
-	// the phantom state survives. The fix must locate the diffset by walking
-	// the other header(s) at this height.
-	require.NoError(t, rawdb.WriteCanonicalHash(tx, hNew.Hash(), height))
-
-	// Document the pre-fix failure mode: a direct lookup against the now-
-	// canonical hash returns !ok, which is precisely the unwind regression.
-	_, ok, err := doms.GetDiffset(tx, hNew.Hash(), height)
-	require.NoError(t, err)
-	require.False(t, ok, "sanity: pre-fix code path (direct GetDiffset under new canonical) must miss — this is the bug")
-
-	got, executed, found, err = findExecutedDiffsetAtHeight(ctx, tx, br, doms, height)
-	require.NoError(t, err)
-	require.True(t, found, "diffset must be located via fallback after canonical flip")
-	require.Equal(t, hOld.Hash(), executed, "executedHash must remain hOld (the actually-executed block) after canonical flip")
-	require.NotEmpty(t, got[kv.AccountsDomain], "AccountsDomain diff list must survive the fallback")
-
-	// Phase 3: there is genuinely no stored diffset at this height under any
-	// known header — found must be false (no spurious matches).
-	const heightEmpty = uint64(11)
-	hEmpty := makeHeader(heightEmpty, common.Hash{0x03})
-	require.NoError(t, rawdb.WriteHeader(tx, hEmpty))
-	require.NoError(t, rawdb.WriteCanonicalHash(tx, hEmpty.Hash(), heightEmpty))
-	_, _, found, err = findExecutedDiffsetAtHeight(ctx, tx, br, doms, heightEmpty)
-	require.NoError(t, err)
-	require.False(t, found, "must report not-found when no header at this height has a stored diffset")
-}
-
-func makeHeader(num uint64, parentMarker common.Hash) *types.Header {
-	return &types.Header{
-		Number:     *uint256.NewInt(num),
-		ParentHash: parentMarker,
-		Difficulty: *uint256.NewInt(1),
-		Extra:      parentMarker.Bytes(), // make the hash distinct per `parentMarker`
-	}
-}
-
 // TestUnwindExecutionStage_PrunesUncommittedOverlayWrite is a regression test
-// for the Hoodi block-3004265 gas-used mismatch (release/3.4).
+// for the Hoodi block-3004265 gas-used mismatch (originally found on
+// release/3.4, same gap on main).
 //
-// Repro of the original chain of events:
-//
-//  1. In serial batch execution, block 3004265 tx19 does a first-time SSTORE to
-//     ca5daf64 slot0. That write lands in the in-RAM SharedDomains /
-//     TemporalMemBatch overlay (stamped with tx19's txNum) but the block then
-//     fails its post-execution gas check, so its step is never committed.
-//  2. The executor schedules UnwindTo(3004264). Because 3004265 was never
-//     committed, the committed execution-stage progress (s.BlockNumber) sits at
-//     or below the unwind point, so UnwindExecutionStage hit the
-//     `u.UnwindPoint >= s.BlockNumber` early return and skipped unwindExec3 —
-//     i.e. it never called sd.Unwind, so the overlay prune added by #20625
-//     (which only runs from unwindExec3) never executed.
-//  3. The same overlay is reused across the unwind→retry loop inside one
-//     sync.Run, so on retry the storage read returned tx19's own stale
-//     first-write (…a3a34) instead of the committed 0. The contract took the
-//     "already initialised" branch, skipped an SSTORE_SET (20000 gas), the block
-//     came up exactly 21045 gas short, and the node spun in an unwind/retry loop.
-//
-// Re-execution resumes from the committed block (SeekCommitment returns
-// s.BlockNumber; re-execution resumes at s.BlockNumber+1), so the overlay must
-// be pruned to that committed boundary (Min(s.BlockNumber+1)) — NOT to
-// unwindPoint+1. This test asserts every uncommitted write above the committed
-// progress is dropped (the failed block's, AND a block in (committedBlock,
-// unwindPoint] that is itself re-executed), while a write at/below the committed
-// progress survives (no over-pruning).
+// When a block fails its post-execution gas check mid-batch, its writes sit in
+// the in-RAM SharedDomains/TemporalMemBatch overlay but were never committed, so
+// the committed execution-stage progress (s.BlockNumber) is <= u.UnwindPoint and
+// UnwindExecutionStage takes the no-disk-rollback branch. That branch does not
+// call u.Done, so re-execution resumes from the committed block (SeekCommitment
+// returns s.BlockNumber; re-execution resumes at s.BlockNumber+1) — NOT from
+// u.UnwindPoint+1. The overlay must therefore be pruned to that committed
+// boundary (Min(s.BlockNumber+1)): every uncommitted write
+// above s.BlockNumber is dropped (the failed block's, AND a block in
+// (s.BlockNumber, u.UnwindPoint] that is itself re-executed), while a write
+// at/below the committed progress survives (no over-pruning). Otherwise the
+// retry re-reads a stale value (Hoodi: ca5daf64 slot0 kept tx19's first-write,
+// the contract took the "already initialised" branch, skipped an SSTORE_SET,
+// came up 21045 gas short, and the node spun in an unwind/retry loop).
 func TestUnwindExecutionStage_PrunesUncommittedOverlayWrite(t *testing.T) {
 	t.Parallel()
 
@@ -221,13 +98,17 @@ func TestUnwindExecutionStage_PrunesUncommittedOverlayWrite(t *testing.T) {
 	defer doms.Close()
 	doms.SetChangesetAccumulator(&changeset.StateChangeSet{})
 
+	// Enable state cache to verify it is also pruned/unwound correctly
+	stateCache := cache.NewDefaultStateCache()
+	doms.SetStateCache(stateCache)
+
 	const (
 		committedBlock = uint64(5) // execution-stage progress (last flushed block)
 		unwindPoint    = uint64(7) // = failedBlock-1; >= committedBlock => disk no-op
 		failedBlock    = uint64(8) // block whose post-exec gas check failed mid-batch
 	)
-	// Re-execution resumes from the committed progress, so the overlay must be
-	// pruned to Min(committedBlock+1) — NOT Min(unwindPoint+1).
+	// Re-execution resumes from the committed progress, so the overlay is pruned
+	// to Min(committedBlock+1) — NOT Min(unwindPoint+1).
 	boundaryTxNum, err := br.TxnumReader().Min(ctx, tx, committedBlock+1)
 	require.NoError(t, err)
 	require.Equal(t, (committedBlock+1)*perBlock, boundaryTxNum, "sanity: prune boundary == first txNum past the committed block")
@@ -235,7 +116,7 @@ func TestUnwindExecutionStage_PrunesUncommittedOverlayWrite(t *testing.T) {
 	put := func(hexAddr string, slot byte, val []byte, txNum uint64) []byte {
 		addr := common.HexToAddress(hexAddr)
 		slotHash := common.Hash{31: slot}
-		key := append(append([]byte{}, addr.Bytes()...), slotHash.Bytes()...)
+		key := append(append([]byte{}, addr[:]...), slotHash[:]...)
 		doms.SetTxNum(txNum)
 		require.NoError(t, doms.DomainPut(kv.StorageDomain, tx, key, val, txNum, nil))
 		return key
@@ -250,7 +131,8 @@ func TestUnwindExecutionStage_PrunesUncommittedOverlayWrite(t *testing.T) {
 	midVal := []byte{0x11, 0x22}
 	midKey := put("0x00000000000000000000000000000000000000bb", 0x02, midVal, unwindPoint*perBlock)
 	// staleKey: mirrors ca5daf64 slot0, first-written by the failed block's tx19.
-	staleVal := common.HexToHash("0xd7549f2a387fa81a1d5a77adc7bd3f782ac0780c460689d88e22aee6916a3a34").Bytes()
+	staleValHash := common.HexToHash("0xd7549f2a387fa81a1d5a77adc7bd3f782ac0780c460689d88e22aee6916a3a34")
+	staleVal := staleValHash[:]
 	staleKey := put("0xca5daf6473971693b760cc65d726f72c6849d615", 0x00, staleVal, failedBlock*perBlock+5)
 
 	// Sanity: all three visible through the overlay before the unwind.

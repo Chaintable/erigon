@@ -22,6 +22,7 @@ package rpc
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math/rand"
 	"net"
@@ -168,6 +169,104 @@ func TestClientBatchRequest(t *testing.T) {
 	}
 }
 
+func TestClientBatchRequest_len(t *testing.T) {
+	logger := log.New()
+	b, err := json.Marshal([]jsonrpcMessage{
+		{Version: "2.0", ID: json.RawMessage("1"), Method: "foo", Result: json.RawMessage(`"0x1"`)},
+		{Version: "2.0", ID: json.RawMessage("2"), Method: "bar", Result: json.RawMessage(`"0x2"`)},
+	})
+	if err != nil {
+		t.Fatal("failed to encode jsonrpc message:", err)
+	}
+	s := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		_, err := rw.Write(b)
+		if err != nil {
+			t.Error("failed to write response:", err)
+		}
+	}))
+	t.Cleanup(s.Close)
+
+	client, err := Dial(s.URL, logger)
+	if err != nil {
+		t.Fatal("failed to dial test server:", err)
+	}
+	defer client.Close()
+
+	t.Run("too-few", func(t *testing.T) {
+		batch := []BatchElem{
+			{Method: "foo", Result: new(json.RawMessage)},
+			{Method: "bar", Result: new(json.RawMessage)},
+			{Method: "baz", Result: new(json.RawMessage)},
+		}
+		ctx, cancelFn := context.WithTimeout(context.Background(), time.Second)
+		defer cancelFn()
+		if err := client.BatchCallContext(ctx, batch); err != nil {
+			t.Errorf("expected nil batch error but got: %v", err)
+		}
+		// The third element should have ErrMissingBatchResponse since the
+		// server only returned 2 responses for 3 requests.
+		if !errors.Is(batch[2].Error, ErrMissingBatchResponse) {
+			t.Errorf("expected ErrMissingBatchResponse for missing element but got: %v", batch[2].Error)
+		}
+	})
+
+	t.Run("too-many", func(t *testing.T) {
+		// Fresh client so the first request gets ID 1, matching the server's
+		// hardcoded response IDs.
+		c2, err := Dial(s.URL, logger)
+		if err != nil {
+			t.Fatal("failed to dial test server:", err)
+		}
+		defer c2.Close()
+
+		batch := []BatchElem{
+			{Method: "foo", Result: new(json.RawMessage)},
+		}
+		ctx, cancelFn := context.WithTimeout(context.Background(), time.Second)
+		defer cancelFn()
+		// Server returns 2 responses for 1 request; the extra response is
+		// silently ignored and the call completes without hanging.
+		if err := c2.BatchCallContext(ctx, batch); err != nil {
+			t.Errorf("expected nil batch error but got: %v", err)
+		}
+		if batch[0].Error != nil {
+			t.Errorf("expected nil element error but got: %v", batch[0].Error)
+		}
+	})
+
+	t.Run("empty", func(t *testing.T) {
+		ctx, cancelFn := context.WithTimeout(context.Background(), time.Second)
+		defer cancelFn()
+		err := client.BatchCallContext(ctx, nil)
+		if err == nil {
+			t.Fatal("expected error for empty batch but got nil")
+		}
+		var rpcErr Error
+		if !errors.As(err, &rpcErr) || rpcErr.ErrorCode() != -32600 {
+			t.Fatalf("expected invalid request error (-32600), got: %v", err)
+		}
+	})
+}
+
+func TestClientBatchRequest_emptyInproc(t *testing.T) {
+	logger := log.New()
+	server := newTestServer(logger)
+	defer server.Stop()
+	client := DialInProc(server, logger)
+	defer client.Close()
+
+	ctx, cancelFn := context.WithTimeout(context.Background(), time.Second)
+	defer cancelFn()
+	err := client.BatchCallContext(ctx, nil)
+	if err == nil {
+		t.Fatal("expected error for empty batch but got nil")
+	}
+	var rpcErr Error
+	if !errors.As(err, &rpcErr) || rpcErr.ErrorCode() != -32600 {
+		t.Fatalf("expected invalid request error (-32600), got: %v", err)
+	}
+}
+
 func TestClientNotify(t *testing.T) {
 	logger := log.New()
 	server := newTestServer(logger)
@@ -268,8 +367,9 @@ func testClientCancelSynctest(t *testing.T, logger log.Logger) {
 		}
 
 		client, hs := memHTTPTestClient(server, fl)
-		defer hs.Close()
 		defer server.Stop()
+		defer hs.Close()
+		defer client.Close()
 
 		runCancelCallers(t, client, 300*time.Millisecond)
 	})

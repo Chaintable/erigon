@@ -136,7 +136,7 @@ func (hi *HistoryRangeAsOfFiles) advanceInFiles() error {
 		}
 
 		hi.seq.Reset(top.startTxNum, idxVal)
-		txNum, ok := hi.seq.Seek(hi.startTxNum)
+		txNum, _, ok := hi.seq.Seek(hi.startTxNum)
 		if !ok {
 			continue
 		}
@@ -245,6 +245,11 @@ type HistoryRangeAsOfDB struct {
 func (hi *HistoryRangeAsOfDB) Close() {
 	if hi.valsC != nil {
 		hi.valsC.Close()
+		hi.valsC = nil
+	}
+	if hi.valsCDup != nil {
+		hi.valsCDup.Close()
+		hi.valsCDup = nil
 	}
 }
 
@@ -440,7 +445,7 @@ func (hi *HistoryChangesIterFiles) advance() error {
 		}
 
 		hi.seq.Reset(top.startTxNum, idxVal)
-		txNum, ok := hi.seq.Seek(hi.startTxNum)
+		txNum, _, ok := hi.seq.Seek(hi.startTxNum)
 		if !ok {
 			continue
 		}

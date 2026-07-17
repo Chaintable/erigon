@@ -18,6 +18,7 @@ package rpchelper
 
 import (
 	"context"
+	"runtime"
 
 	"github.com/c2h5oh/datasize"
 
@@ -35,40 +36,6 @@ import (
 	"github.com/erigontech/erigon/execution/commitment/commitmentdb"
 	"github.com/erigontech/erigon/execution/state/genesiswrite"
 )
-
-// simulateStateReader is a StateReader for eth_simulateV1 whose Clone() method mirrors
-// commitmentdb.CommitmentReplayStateReader from main: the commitment reader (temp DB) is
-// re-cloned with the new tx so warmup goroutines get their own fresh read-only transaction,
-// while the plain state reader (outer DB) is kept unchanged so non-modified accounts are
-// always read from real on-chain state, not the empty temp DB.
-type simulateStateReader struct {
-	commitmentReader commitmentdb.StateReader
-	plainStateReader commitmentdb.StateReader
-}
-
-func NewSimulateStateReader(commitmentReader, plainStateReader commitmentdb.StateReader) commitmentdb.StateReader {
-	return simulateStateReader{commitmentReader: commitmentReader, plainStateReader: plainStateReader}
-}
-
-func (r simulateStateReader) WithHistory() bool { return false }
-
-func (r simulateStateReader) CheckDataAvailable(_ kv.Domain, _ kv.Step) error { return nil }
-
-func (r simulateStateReader) Read(d kv.Domain, plainKey []byte, stepSize uint64) ([]byte, kv.Step, error) {
-	if d == kv.CommitmentDomain {
-		return r.commitmentReader.Read(d, plainKey, stepSize)
-	}
-	return r.plainStateReader.Read(d, plainKey, stepSize)
-}
-
-func (r simulateStateReader) Clone(tx kv.TemporalTx) commitmentdb.StateReader {
-	// Propagate new tx only to the commitment reader (temp DB) for warmup goroutines;
-	// keep the plain state reader on the original outer-DB tx.
-	return simulateStateReader{
-		commitmentReader: r.commitmentReader.Clone(tx),
-		plainStateReader: r.plainStateReader,
-	}
-}
 
 type CommitmentReplay struct {
 	dirs        datadir.Dirs
@@ -93,9 +60,16 @@ func (r *CommitmentReplay) ComputeCustomCommitmentFromStateHistory(
 	baseBlockNum uint64,
 	deltaComputation func(ctx context.Context, ttx kv.TemporalTx, tsd *execctx.SharedDomains) ([]byte, error),
 ) ([]byte, error) {
-	// Prepare a temporary data storage for commitment replay computation
+	// Prepare a temporary data storage for commitment replay computation.
+	// On Windows, MDBX file-mappings are backed by the paging file for their full map size,
+	// so a 2 TB reservation immediately exhausts the pagefile. On Linux/macOS the reservation
+	// is backed by sparse files with copy-on-write, so 2 TB is harmless.
+	mapSize := 2 * datasize.TB
+	if runtime.GOOS == "windows" {
+		mapSize = 1 * datasize.GB
+	}
 	db := mdbx.New(dbcfg.TemporaryDB, r.logger).
-		InMem(nil, r.dirs.Tmp).MapSize(2 * datasize.TB).GrowthStep(1 * datasize.MB).MustOpen()
+		InMem(nil, r.dirs.Tmp).MapSize(mapSize).GrowthStep(1 * datasize.MB).MustOpen()
 	defer db.Close()
 
 	erigonDBSettings, err := dbstate.ResolveErigonDBSettings(r.dirs, r.logger, false)
@@ -120,12 +94,11 @@ func (r *CommitmentReplay) ComputeCustomCommitmentFromStateHistory(
 	}
 	defer ttx.Rollback()
 
-	tsd, err := execctx.NewSharedDomains(ctx, ttx, r.logger)
+	tsd, err := execctx.NewSharedDomains(ctx, ttx, r.logger, execctx.WithoutDeferredBranchUpdates())
 	if err != nil {
 		return nil, err
 	}
 	defer tsd.Close()
-	tsd.GetCommitmentContext().SetDeferBranchUpdates(false)
 
 	// We must compute genesis commitment from scratch because there's no history for block 0
 	genesis, err := rawdb.ReadGenesis(tx)

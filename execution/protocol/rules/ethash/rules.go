@@ -118,11 +118,7 @@ func (ethash *Ethash) Author(header *types.Header) (accounts.Address, error) {
 // VerifyHeader checks whether a header conforms to the consensus rules of the
 // stock Ethereum ethash engine.
 func (ethash *Ethash) VerifyHeader(chain rules.ChainHeaderReader, header *types.Header, seal bool) error {
-	// Short circuit if the header is known, or its parent not
 	number := header.Number.Uint64()
-	if chain.GetHeader(header.Hash(), number) != nil {
-		return nil
-	}
 	if number == 0 {
 		return nil
 	}
@@ -358,6 +354,7 @@ func (ethash *Ethash) verifySeal(header *types.Header, fulldag bool) error { //n
 	}
 	// Recompute the digest and PoW values
 	number := header.Number.Uint64()
+	sealHash := ethash.SealHash(header)
 
 	var (
 		digest []byte
@@ -367,7 +364,7 @@ func (ethash *Ethash) verifySeal(header *types.Header, fulldag bool) error { //n
 	if fulldag {
 		dataset := ethash.dataset(number, true)
 		if dataset.generated() {
-			digest, result = hashimotoFull(dataset.dataset, ethash.SealHash(header).Bytes(), header.Nonce.Uint64())
+			digest, result = hashimotoFull(dataset.dataset, sealHash[:], header.Nonce.Uint64())
 
 			// Datasets are unmapped in a finalizer. Ensure that the dataset stays alive
 			// until after the call to hashimotoFull so it's not unmapped while being used.
@@ -385,7 +382,7 @@ func (ethash *Ethash) verifySeal(header *types.Header, fulldag bool) error { //n
 		if ethash.config.PowMode == ethashcfg.ModeTest {
 			size = 32 * 1024
 		}
-		digest, result = hashimotoLight(size, cache.cache, ethash.SealHash(header).Bytes(), header.Nonce.Uint64())
+		digest, result = hashimotoLight(size, cache.cache, sealHash[:], header.Nonce.Uint64())
 
 		// Caches are unmapped in a finalizer. Ensure that the cache stays alive
 		// until after the call to hashimotoLight so it's not unmapped while being used.
@@ -415,7 +412,7 @@ func (ethash *Ethash) Prepare(chain rules.ChainHeaderReader, header *types.Heade
 
 func (ethash *Ethash) Initialize(config *chain.Config, chain rules.ChainHeaderReader, header *types.Header,
 	state *state.IntraBlockState, syscall rules.SysCallCustom, logger log.Logger, tracer *tracing.Hooks) error {
-	if config.DAOForkBlock != nil && header.Number.CmpBig(config.DAOForkBlock) == 0 {
+	if config.DAOForkBlock != nil && header.Number.Uint64() == *config.DAOForkBlock {
 		if err := misc.ApplyDAOHardFork(state); err != nil {
 			return err
 		}

@@ -275,15 +275,15 @@ func (a *ProtoForkable) BeginFilesRo() *ProtoForkableTx {
 // take dirtyFiles lock before using this
 func (a *ProtoForkable) DebugBeginDirtyFilesRo() *forkableDirtyFilesRoTx {
 	var files []*FilesItem
-	a.snaps.dirtyFiles.Walk(func(items []*FilesItem) bool {
-		files = append(files, items...)
-		for _, item := range items {
-			if !item.frozen {
-				item.refcount.Add(1)
-			}
+	iter := a.snaps.dirtyFiles.Iter()
+	defer iter.Release()
+	for ok := iter.First(); ok; ok = iter.Next() {
+		item := iter.Item()
+		files = append(files, item)
+		if !item.frozen {
+			item.refcount.Add(1)
 		}
-		return true
-	})
+	}
 	return &forkableDirtyFilesRoTx{
 		p:     a,
 		files: files,
@@ -349,7 +349,7 @@ func (a *ProtoForkableTx) StatelessIdxReader(i int) *recsplit.IndexReader {
 
 	r := a.readers[i]
 	if r == nil {
-		r = a.files[i].src.index.GetReaderFromPool()
+		r = a.files[i].src.index.Reader()
 		a.readers[i] = r
 	}
 

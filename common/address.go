@@ -57,9 +57,6 @@ func IsHexAddress(s string) bool {
 	return len(s) == 2*length.Addr && hexutil.IsHex(s)
 }
 
-// Bytes gets the string representation of the underlying address.
-func (a Address) Bytes() []byte { return a[:] }
-
 // Hash converts an address to a hash by left-padding it with zeros.
 func (a Address) Hash() Hash { return BytesToHash(a[:]) }
 
@@ -144,7 +141,7 @@ func (a *Address) SetBytes(b []byte) {
 func (a Address) MarshalText() ([]byte, error) {
 	b := a[:]
 	result := make([]byte, len(b)*2+2)
-	copy(result, hexPrefix)
+	copy(result, hexutil.HexPrefix)
 	hex.Encode(result[2:], b)
 	return result, nil
 }

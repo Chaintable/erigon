@@ -25,10 +25,10 @@ import (
 	"os"
 	"path/filepath"
 	"runtime/debug"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
-	"time"
 
 	"github.com/tidwall/btree"
 
@@ -37,6 +37,7 @@ import (
 	"github.com/erigontech/erigon/common"
 	"github.com/erigontech/erigon/common/background"
 	"github.com/erigontech/erigon/common/dbg"
+	"github.com/erigontech/erigon/common/length"
 	"github.com/erigontech/erigon/common/log/v3"
 	"github.com/erigontech/erigon/db/datadir"
 	"github.com/erigontech/erigon/db/kv"
@@ -119,6 +120,17 @@ func MakeCaplinStateSnapshotsTypes(db kv.RoDB) SnapshotTypes {
 			kv.PendingConsolidationsDump:     getKvGetterForStateTable(db, kv.PendingConsolidationsDump),
 			kv.PendingPartialWithdrawalsDump: getKvGetterForStateTable(db, kv.PendingPartialWithdrawalsDump),
 			kv.PendingDepositsDump:           getKvGetterForStateTable(db, kv.PendingDepositsDump),
+			// GLOAS (EIP-7732)
+			kv.Builders:                          getKvGetterForStateTable(db, kv.Builders),
+			kv.BuildersDump:                      getKvGetterForStateTable(db, kv.BuildersDump),
+			kv.BuilderPendingWithdrawals:         getKvGetterForStateTable(db, kv.BuilderPendingWithdrawals),
+			kv.BuilderPendingWithdrawalsDump:     getKvGetterForStateTable(db, kv.BuilderPendingWithdrawalsDump),
+			kv.PayloadExpectedWithdrawals:        getKvGetterForStateTable(db, kv.PayloadExpectedWithdrawals),
+			kv.PayloadExpectedWithdrawalsDump:    getKvGetterForStateTable(db, kv.PayloadExpectedWithdrawalsDump),
+			kv.ExecutionPayloadAvailabilityTable: getKvGetterForStateTable(db, kv.ExecutionPayloadAvailabilityTable),
+			kv.BuilderPendingPaymentsTable:       getKvGetterForStateTable(db, kv.BuilderPendingPaymentsTable),
+			kv.PtcWindowTable:                    getKvGetterForStateTable(db, kv.PtcWindowTable),
+			kv.LatestExecutionPayloadBidTable:    getKvGetterForStateTable(db, kv.LatestExecutionPayloadBidTable),
 		},
 		Compression: map[string]bool{},
 	}
@@ -251,6 +263,25 @@ func (s *CaplinStateSnapshots) SegFileNames(from, to uint64) []string {
 
 func (s *CaplinStateSnapshots) BlocksAvailable() uint64 {
 	return min(s.segmentsMax.Load(), s.idxMax.Load())
+}
+
+func (s *CaplinStateSnapshots) coveredRangesForType(name string) []Range {
+	s.visibleLock.RLock()
+	defer s.visibleLock.RUnlock()
+
+	v, ok := s.visible.Load(name)
+	if !ok {
+		return nil
+	}
+	segs, ok := v.([]*VisibleSegment)
+	if !ok {
+		return nil
+	}
+	ranges := make([]Range, 0, len(segs))
+	for _, seg := range segs {
+		ranges = append(ranges, seg.Range)
+	}
+	return ranges
 }
 
 func (s *CaplinStateSnapshots) Close() {
@@ -430,6 +461,9 @@ func (s *CaplinStateSnapshots) recalcVisibleFiles() {
 				if !isIndexed(sn) {
 					continue
 				}
+				if n := len(newVisibleSegments); n > 0 && sn.isSubSetOf(newVisibleSegments[n-1].src) {
+					continue
+				}
 				for len(newVisibleSegments) > 0 && newVisibleSegments[len(newVisibleSegments)-1].src.isSubSetOf(sn) {
 					newVisibleSegments[len(newVisibleSegments)-1].src = nil
 					newVisibleSegments = newVisibleSegments[:len(newVisibleSegments)-1]
@@ -452,6 +486,58 @@ func (s *CaplinStateSnapshots) recalcVisibleFiles() {
 		s.visible.Store(k, getNewVisibleSegments(s.dirty[k.(string)]))
 		return true
 	})
+}
+
+// RemoveOverlaps deletes state segment files that are fully covered by a larger
+// indexed segment of the same type, so the on-disk publishable check stops flagging
+// them as overlapping. Offline maintenance only: it munmaps and unlinks files, so no
+// CaplinStateView may be open concurrently.
+func (s *CaplinStateSnapshots) RemoveOverlaps() error {
+	if s == nil {
+		return nil
+	}
+	s.dirtySegmentsLock.Lock()
+
+	var toRemove []*DirtySegment
+	for _, dirtySegments := range s.dirty {
+		var indexed []*DirtySegment
+		dirtySegments.Walk(func(segments []*DirtySegment) bool {
+			for _, sn := range segments {
+				if isIndexed(sn) {
+					indexed = append(indexed, sn)
+				}
+			}
+			return true
+		})
+
+		var rm []*DirtySegment
+		dirtySegments.Walk(func(segments []*DirtySegment) bool {
+			for _, sn := range segments {
+				for _, sup := range indexed {
+					if sn != sup && sn.isSubSetOf(sup) {
+						rm = append(rm, sn)
+						break
+					}
+				}
+			}
+			return true
+		})
+
+		for _, sn := range rm {
+			dirtySegments.Delete(sn)
+		}
+		toRemove = append(toRemove, rm...)
+	}
+
+	s.dirtySegmentsLock.Unlock()
+
+	s.recalcVisibleFiles()
+
+	for _, sn := range toRemove {
+		s.logger.Info("[caplin-state] removing overlapped segment", "file", sn.FileName())
+		sn.closeAndRemoveFiles()
+	}
+	return nil
 }
 
 func (s *CaplinStateSnapshots) idxAvailability() uint64 {
@@ -601,6 +687,11 @@ func (v *CaplinStateView) VisibleSegment(slot uint64, tbl string) (*VisibleSegme
 	return nil, false
 }
 
+// errIncompleteStateRange signals that a mandatory-dense state table (block/state
+// roots) has a missing entry in the range being dumped, so the range must not be
+// frozen yet.
+var errIncompleteStateRange = errors.New("state range not fully reconstructed")
+
 func dumpCaplinState(ctx context.Context, snapName string, kvGetter KeyValueGetter, fromSlot uint64, toSlot, blocksPerFile uint64, salt uint32, dirs datadir.Dirs, workers int, lvl log.Lvl, logger log.Logger, compress bool) error {
 	tmpDir, snapDir := dirs.Tmp, dirs.SnapCaplin
 
@@ -620,12 +711,25 @@ func dumpCaplinState(ctx context.Context, snapName string, kvGetter KeyValueGett
 	}
 	defer sn.Close()
 
+	// block_roots/state_roots are written every slot; an empty entry means the DB
+	// range isn't fully reconstructed. Freezing it writes a blank word that then
+	// permanently shadows the DB (snapshots take read precedence), so refuse.
+	mustBeDense := snapName == kv.BlockRoot || snapName == kv.StateRoot
+
 	// Generate .seg file, which is just the list of beacon blocks.
 	for i := fromSlot; i < toSlot; i++ {
 		// read root.
 		_, dump, err := kvGetter(i)
 		if err != nil {
 			return err
+		}
+		if mustBeDense && len(dump) != length.Hash {
+			// An empty entry is a not-yet-reconstructed slot (retry later); a
+			// non-empty entry of the wrong length is corruption (surface it).
+			if len(dump) != 0 {
+				return fmt.Errorf("%s slot %d: corrupt root, %d bytes (want %d)", snapName, i, len(dump), length.Hash)
+			}
+			return fmt.Errorf("%w: %s slot %d", errIncompleteStateRange, snapName, i)
 		}
 		if i%20_000 == 0 {
 			logger.Log(lvl, "Dumping "+snapName, "progress", i)
@@ -648,9 +752,6 @@ func dumpCaplinState(ctx context.Context, snapName string, kvGetter KeyValueGett
 	}
 	// Generate .idx file, which is the slot => offset mapping.
 	p := &background.Progress{}
-
-	// Ugly hack to wait for fsync
-	time.Sleep(15 * time.Second)
 
 	return simpleIdx(ctx, f, salt, tmpDir, p, lvl, logger)
 }
@@ -682,20 +783,69 @@ func simpleIdx(ctx context.Context, sn snaptype.FileInfo, salt uint32, tmpDir st
 	return nil
 }
 
-func (s *CaplinStateSnapshots) DumpCaplinState(ctx context.Context, fromSlot, toSlot, blocksPerFile uint64, salt uint32, dirs datadir.Dirs, workers int, lvl log.Lvl, logger log.Logger) error {
-	fromSlot = (fromSlot / blocksPerFile) * blocksPerFile
+type caplinStateDumpJob struct {
+	name     string
+	from, to uint64
+}
+
+// missingRanges returns the sub-ranges of [0, toSlot) not covered by `covered`
+// (the type's existing segment ranges, sorted by `from`).
+func missingRanges(covered []Range, toSlot uint64) []Range {
+	var missing []Range
+	var cur uint64
+	for _, r := range covered {
+		if r.from > cur {
+			gapEnd := min(r.from, toSlot)
+			missing = append(missing, Range{from: cur, to: gapEnd})
+		}
+		cur = max(cur, r.to)
+		if cur >= toSlot {
+			return missing
+		}
+	}
+	if cur < toSlot {
+		missing = append(missing, Range{from: cur, to: toSlot})
+	}
+	return missing
+}
+
+// planStateDump schedules only the ranges each type is missing within
+// [0, toSlot), starting every full file at a gap boundary so it fills holes and
+// the trailing tail without overlapping an existing segment.
+func planStateDump(coverage map[string][]Range, toSlot, blocksPerFile uint64) []caplinStateDumpJob {
 	toSlot = (toSlot / blocksPerFile) * blocksPerFile
-	for snapName, kvGetter := range s.snapshotTypes.KeyValueGetters {
-		for i := fromSlot; i < toSlot; i += blocksPerFile {
-			if toSlot-i < blocksPerFile {
-				break
+
+	names := make([]string, 0, len(coverage))
+	for name := range coverage {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	jobs := make([]caplinStateDumpJob, 0)
+	for _, name := range names {
+		for _, gap := range missingRanges(coverage[name], toSlot) {
+			for i := gap.from; i+blocksPerFile <= gap.to; i += blocksPerFile {
+				jobs = append(jobs, caplinStateDumpJob{name: name, from: i, to: i + blocksPerFile})
 			}
-			// keep beaconblocks here but whatever....
-			to := i + blocksPerFile
-			logger.Log(lvl, "Dumping "+snapName, "from", i, "to", to)
-			if err := dumpCaplinState(ctx, snapName, kvGetter, i, to, blocksPerFile, salt, dirs, workers, lvl, logger, s.snapshotTypes.Compression[snapName]); err != nil {
-				return err
+		}
+	}
+	return jobs
+}
+
+func (s *CaplinStateSnapshots) DumpCaplinState(ctx context.Context, toSlot, blocksPerFile uint64, salt uint32, dirs datadir.Dirs, workers int, lvl log.Lvl, logger log.Logger) error {
+	coverage := make(map[string][]Range, len(s.snapshotTypes.KeyValueGetters))
+	for name := range s.snapshotTypes.KeyValueGetters {
+		coverage[name] = s.coveredRangesForType(name)
+	}
+
+	for _, job := range planStateDump(coverage, toSlot, blocksPerFile) {
+		logger.Log(lvl, "Dumping "+job.name, "from", job.from, "to", job.to)
+		if err := dumpCaplinState(ctx, job.name, s.snapshotTypes.KeyValueGetters[job.name], job.from, job.to, blocksPerFile, salt, dirs, workers, lvl, logger, s.snapshotTypes.Compression[job.name]); err != nil {
+			if errors.Is(err, errIncompleteStateRange) {
+				logger.Warn("[Caplin] skipping incomplete state range, will retry after reconstruction", "type", job.name, "from", job.from, "to", job.to, "err", err)
+				continue
 			}
+			return err
 		}
 	}
 	return nil

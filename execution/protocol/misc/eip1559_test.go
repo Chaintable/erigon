@@ -20,7 +20,6 @@
 package misc
 
 import (
-	"math/big"
 	"testing"
 
 	"github.com/holiman/uint256"
@@ -32,17 +31,17 @@ import (
 	"github.com/erigontech/erigon/execution/types"
 )
 
-// copyConfig does a _shallow_ copy of a given config. Safe to set new values, but
-// do not use e.g. SetInt() on the numbers. For testing only
 func copyConfig(original *chain.Config) *chain.Config {
 	var copy chain.Config
-	copier.Copy(&copy, original)
+	if err := copier.CopyWithOption(&copy, original, copier.Option{DeepCopy: true}); err != nil {
+		panic(err)
+	}
 	return &copy
 }
 
 func config() *chain.Config {
-	config := copyConfig(chain.TestChainConfig)
-	config.LondonBlock = big.NewInt(5)
+	config := copyConfig(chain.AllProtocolChanges)
+	config.LondonBlock = common.NewUint64(5)
 	return config
 }
 

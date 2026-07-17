@@ -31,6 +31,7 @@ import (
 
 	"github.com/erigontech/erigon/cl/clparams"
 	"github.com/erigontech/erigon/cl/gossip"
+	"github.com/erigontech/erigon/cl/p2p"
 	"github.com/erigontech/erigon/common/log/v3"
 	"github.com/erigontech/erigon/p2p/enode"
 	"github.com/erigontech/erigon/p2p/enr"
@@ -120,12 +121,12 @@ func (s *Sentinel) findPeersForSubnets(subnets []subnetSearchState) {
 		checked++
 		node := filteredIterator.Node()
 
-		// Skip private IPs
-		if node.IP().IsPrivate() {
+		// Skip private IPs unless local discovery is enabled
+		if !s.cfg.P2PConfig.LocalDiscovery && node.IP().IsPrivate() {
 			continue
 		}
 
-		peerInfo, _, err := convertToAddrInfo(node)
+		peerInfo, _, err := p2p.ConvertToAddrInfo(node)
 		if err != nil {
 			continue
 		}
@@ -144,8 +145,11 @@ func (s *Sentinel) findPeersForSubnets(subnets []subnetSearchState) {
 		s.pidToEnr.Store(peerInfo.ID, node)
 		s.pidToEnodeId.Store(peerInfo.ID, node.ID())
 
-		// Try to connect
-		if err := s.ConnectWithPeer(ctx, *peerInfo, nil); err != nil {
+		// Try to connect (serialize via shared semaphore to avoid peerstore race, see #19603)
+		if err := s.connectSem.Acquire(ctx, 1); err != nil {
+			break
+		}
+		if err := s.ConnectWithPeer(ctx, *peerInfo, s.connectSem); err != nil {
 			log.Trace("[Sentinel] Subnet search: failed to connect", "peer", peerInfo.ID, "err", err)
 			continue
 		}
@@ -452,7 +456,10 @@ func (s *Sentinel) connectWithAllPeers(multiAddrs []multiaddr.Multiaddr) error {
 	}
 	for _, peerInfo := range addrInfos {
 		go func(peerInfo peer.AddrInfo) {
-			if err := s.ConnectWithPeer(s.ctx, peerInfo, nil); err != nil {
+			if err := s.connectSem.Acquire(s.ctx, 1); err != nil {
+				return
+			}
+			if err := s.ConnectWithPeer(s.ctx, peerInfo, s.connectSem); err != nil {
 				log.Debug("[Sentinel] Could not connect with peer", "err", err)
 			} else {
 				log.Debug("[Sentinel] Connected with peer", "peer", peerInfo.ID)
@@ -488,11 +495,8 @@ func (s *Sentinel) listenForPeers() {
 	if s.cfg.NoDiscovery {
 		return
 	}
-	multiAddresses := convertToMultiAddr(enodes)
+	multiAddresses := p2p.ConvertToMultiAddr(enodes)
 	s.stickToPeers(multiAddresses)
-
-	// limit the number of goroutines opening connection with peers
-	sem := semaphore.NewWeighted(int64(goRoutinesOpeningPeerConnections))
 
 	iterator := s.listener.RandomNodes()
 	defer iterator.Close()
@@ -514,19 +518,19 @@ func (s *Sentinel) listenForPeers() {
 			continue
 		}
 
-		peerInfo, _, err := convertToAddrInfo(node)
+		peerInfo, _, err := p2p.ConvertToAddrInfo(node)
 		if err != nil {
 			log.Error("[Sentinel] Could not convert to peer info", "err", err)
 			continue
 		}
 		s.pidToEnr.Store(peerInfo.ID, node)
 		s.pidToEnodeId.Store(peerInfo.ID, node.ID())
-		// Skip Peer if IP was private.
-		if node.IP().IsPrivate() {
+		// Skip Peer if IP was private, unless local discovery is enabled.
+		if !s.cfg.P2PConfig.LocalDiscovery && node.IP().IsPrivate() {
 			continue
 		}
 
-		if err := sem.Acquire(s.ctx, 1); err != nil {
+		if err := s.connectSem.Acquire(s.ctx, 1); err != nil {
 			if errors.Is(err, context.Canceled) {
 				break
 			}
@@ -535,7 +539,7 @@ func (s *Sentinel) listenForPeers() {
 		}
 
 		go func() {
-			if err := s.ConnectWithPeer(s.ctx, *peerInfo, sem); err != nil {
+			if err := s.ConnectWithPeer(s.ctx, *peerInfo, s.connectSem); err != nil {
 				log.Trace("[Sentinel] Could not connect with peer", "err", err)
 			}
 		}()
@@ -575,14 +579,23 @@ func (s *Sentinel) onConnection(_ network.Network, conn network.Conn) {
 
 		valid, err := s.handshaker.ValidatePeer(peerId)
 		if err != nil {
-			log.Trace("[Sentinel] Failed to validate peer", "peer", peerId, "err", err)
+			// Handshake transport error (stream reset, timeout, etc.) — keep the peer.
+			// The peer may still work for gossip even if status exchange failed.
+			log.Debug("[Sentinel] Handshake transport error (keeping connection)", "peer", peerId, "err", err)
 		}
 
-		if !valid {
-			log.Trace("[Sentinel] Handshake failed, disconnecting peer", "peer", peerId)
+		if !valid && err == nil {
+			// Handshake succeeded but fork digest mismatched — peer is on a different fork.
+			// Must disconnect to avoid receiving incompatible blocks.
+			log.Debug("[Sentinel] Fork mismatch, disconnecting peer", "peer", peerId)
 			s.p2p.Host().Peerstore().RemovePeer(peerId)
 			s.p2p.Host().Network().ClosePeer(peerId)
 			s.peers.RemovePeer(peerId)
+			return
+		}
+
+		if !valid {
+			// Handshake had a transport error AND returned invalid — keep anyway.
 			s.peers.RecordHandshakeFailure(peerId)
 		} else {
 			// we were able to succesfully connect, so add this peer to our pool

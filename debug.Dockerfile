@@ -4,11 +4,11 @@ FROM docker.io/library/golang:1.25-alpine3.20 AS builder
 RUN apk --no-cache add build-base linux-headers git bash ca-certificates libstdc++
 
 WORKDIR /app
-ADD go.mod go.mod
-ADD go.sum go.sum
+COPY go.mod go.mod
+COPY go.sum go.sum
 
 RUN go mod download
-ADD . .
+COPY . .
 
 RUN --mount=type=cache,target=/root/.cache \
     --mount=type=cache,target=/tmp/go-build \
@@ -20,10 +20,10 @@ FROM docker.io/library/golang:1.25-alpine3.20 AS tools-builder
 RUN apk --no-cache add build-base linux-headers git bash ca-certificates libstdc++
 WORKDIR /app
 
-ADD Makefile Makefile
-ADD tools.go tools.go
-ADD go.mod go.mod
-ADD go.sum go.sum
+COPY Makefile Makefile
+COPY tools.go tools.go
+COPY go.mod go.mod
+COPY go.sum go.sum
 
 RUN mkdir -p /app/build/bin
 
@@ -58,7 +58,6 @@ COPY --from=builder /app/build/bin/rpcdaemon /usr/local/bin/rpcdaemon
 COPY --from=builder /app/build/bin/rpctest /usr/local/bin/rpctest
 COPY --from=builder /app/build/bin/sentinel /usr/local/bin/sentinel
 COPY --from=builder /app/build/bin/sentry /usr/local/bin/sentry
-COPY --from=builder /app/build/bin/state /usr/local/bin/state
 COPY --from=builder /app/build/bin/txpool /usr/local/bin/txpool
 
 

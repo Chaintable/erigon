@@ -39,12 +39,12 @@ import (
 	"github.com/erigontech/erigon/common"
 	"github.com/erigontech/erigon/common/crypto"
 	"github.com/erigontech/erigon/common/dbg"
+	"github.com/erigontech/erigon/common/event"
 	"github.com/erigontech/erigon/common/log/v3"
 	"github.com/erigontech/erigon/common/mclock"
 	"github.com/erigontech/erigon/p2p/discover"
 	"github.com/erigontech/erigon/p2p/enode"
 	"github.com/erigontech/erigon/p2p/enr"
-	"github.com/erigontech/erigon/p2p/event"
 	"github.com/erigontech/erigon/p2p/nat"
 	"github.com/erigontech/erigon/p2p/netutil"
 )
@@ -223,6 +223,11 @@ func (srv *Server) LocalNode() *enode.LocalNode {
 	return srv.localnode
 }
 
+// DiscV5 returns the UDPv5 discovery protocol instance, or nil if not running.
+func (srv *Server) DiscV5() *discover.UDPv5 {
+	return srv.discv5
+}
+
 // Peers returns all connected peers.
 func (srv *Server) Peers() []*Peer {
 	var ps []*Peer
@@ -363,12 +368,19 @@ func (s *sharedUDPConn) Close() error {
 
 // Start starts running the server.
 // Servers can not be re-used after stopping.
-func (srv *Server) Start(ctx context.Context, logger log.Logger) error {
+func (srv *Server) Start(ctx context.Context, logger log.Logger) (err error) {
 	if srv.running.Load() {
 		return errors.New("server already running")
 	}
 	srv.lock.Lock()
 	defer srv.lock.Unlock()
+
+	srv.running.Store(true)
+	defer func() {
+		if err != nil {
+			srv.running.Store(false)
+		}
+	}()
 
 	srv.logger = logger
 	if srv.clock == nil {
@@ -414,8 +426,8 @@ func (srv *Server) Start(ctx context.Context, logger log.Logger) error {
 	}
 	srv.logger.Info("Setup P2P discovery", "v4", srv.discv4 != nil, "v5", srv.discv5 != nil)
 	srv.setupDialScheduler()
+	srv.startListenLoop(srv.quitCtx)
 
-	srv.running.Store(true)
 	srv.loopWG.Add(1)
 	go srv.run()
 	return nil
@@ -461,6 +473,22 @@ func (srv *Server) setupLocalNode() error {
 		ip, _ := srv.NAT.ExternalIP()
 		srv.localnode.SetStaticIP(ip)
 		srv.updateLocalNodeStaticAddrCache()
+	case nat.STUN:
+		// STUN-discovered IPs can change while running, so keep re-resolving.
+		tracker := &externalIPTracker{
+			nat: srv.NAT,
+			set: func(ip net.IP) {
+				srv.localnode.SetStaticIP(ip)
+				srv.updateLocalNodeStaticAddrCache()
+			},
+			logger: srv.logger,
+		}
+		srv.loopWG.Add(1)
+		go func() {
+			defer dbg.LogPanic()
+			defer srv.loopWG.Done()
+			tracker.run(srv.quit, externalIPRefreshInterval)
+		}()
 	default:
 		// Ask the router about the IP. This takes a while and blocks startup,
 		// do it in the background.
@@ -657,14 +685,19 @@ func (srv *Server) setupListening(ctx context.Context) error {
 			}()
 		}
 	}
+	return nil
+}
 
+func (srv *Server) startListenLoop(ctx context.Context) {
+	if srv.listener == nil {
+		return
+	}
 	srv.loopWG.Add(1)
 	go func() {
 		defer dbg.LogPanic()
 		defer srv.loopWG.Done()
 		srv.listenLoop(ctx)
 	}()
-	return nil
 }
 
 // doPeerOp runs fn on the main loop.
@@ -737,6 +770,11 @@ running:
 				// Ensure that the trusted flag is set before checking against MaxPeers.
 				c.flags |= trustedConn
 			}
+			if c.flags&inboundConn != 0 {
+				// Once the peer ID is known, suppress outbound dials to the same node
+				// until this inbound setup completes or fails.
+				srv.dialsched.inboundPending(c.node.ID())
+			}
 			c.cont <- nil
 
 		case c := <-srv.checkpointAddPeer:
@@ -766,7 +804,7 @@ running:
 			}
 		case <-logTimer.C:
 			vals := []any{"protocol", srv.Config.Protocols[0].Version, "peers", len(peers), "trusted", len(trusted), "inbound", inboundCount}
-			//vals = append(vals, srv.listErrors()...)
+			vals = append(vals, srv.listAndResetErrors()...)
 			srv.logger.Debug("[p2p] Server", vals...)
 		}
 	}
@@ -815,8 +853,6 @@ func (srv *Server) postHandshakeChecks(peers map[enode.ID]*Peer, inboundCount in
 // inbound connections.
 func (srv *Server) listenLoop(ctx context.Context) {
 	srv.logger.Trace("TCP listener up", "addr", srv.listener.Addr())
-
-	srv.resetErrors()
 
 	// The slots limit accepts of new connections.
 	slots := semaphore.NewWeighted(int64(srv.MaxPendingPeers))
@@ -910,6 +946,11 @@ func (srv *Server) checkInboundConn(fd net.Conn, remoteIP netip.Addr) error {
 // or the handshakes have failed.
 func (srv *Server) SetupConn(fd net.Conn, flags connFlag, dialDest *enode.Node) error {
 	c := &conn{fd: fd, flags: flags, cont: make(chan error)}
+	defer func() {
+		if c.is(inboundConn) && c.node != nil {
+			srv.dialsched.inboundCompleted(c.node.ID())
+		}
+	}()
 	if dialDest == nil {
 		c.transport = srv.newTransport(fd, nil)
 	} else {
@@ -951,7 +992,24 @@ func (srv *Server) setupConn(c *conn, flags connFlag, dialDest *enode.Node) erro
 	if dialDest != nil {
 		c.node = dialDest
 	} else {
-		c.node = nodeFromConn(remotePubkey, c.fd)
+		// Inbound connection: there's no dial-time enode, so by default
+		// nodeFromConn fabricates a stub from pubkey + remote addr. That
+		// stub is missing any ENR entries the remote advertises. If the
+		// remote is a configured static peer we already hold its full
+		// enode, so prefer that — keeps custom ENR entries intact across
+		// inbound handshakes without requiring discv5 / discovery v5
+		// ENR resolution. Pure-discovery deployments (no static peers)
+		// keep the stub fallback.
+		c.node = nil
+		if srv.dialsched != nil {
+			id := enode.PubkeyToIDV4(remotePubkey)
+			if static := srv.dialsched.lookupStatic(id); static != nil {
+				c.node = static
+			}
+		}
+		if c.node == nil {
+			c.node = nodeFromConn(remotePubkey, c.fd)
+		}
 	}
 	clog := srv.logger.New("id", c.node.ID(), "addr", c.fd.RemoteAddr(), "conn", c.flags)
 	err = srv.checkpoint(c, srv.checkpointPostHandshake)
@@ -1123,13 +1181,7 @@ func (srv *Server) addError(err error) {
 	srv.errors[cleanError(err.Error())]++
 }
 
-func (srv *Server) resetErrors() {
-	srv.errorsMu.Lock()
-	srv.errors = map[string]uint{}
-	srv.errorsMu.Unlock()
-}
-
-func (srv *Server) listErrors() []any {
+func (srv *Server) listAndResetErrors() []any {
 	srv.errorsMu.Lock()
 	defer srv.errorsMu.Unlock()
 
@@ -1137,6 +1189,7 @@ func (srv *Server) listErrors() []any {
 	for err, count := range srv.errors {
 		list = append(list, err, count)
 	}
+	clear(srv.errors)
 	return list
 }
 
@@ -1148,6 +1201,12 @@ func cleanError(err string) string {
 		return "closed by remote"
 	case strings.HasSuffix(err, "connection reset by peer"):
 		return "closed by remote"
+	case strings.Contains(err, "broken pipe"):
+		return "broken pipe"
+	case strings.Contains(err, "connection refused"):
+		return "connection refused"
+	case strings.Contains(err, "no route to host"):
+		return "no route to host"
 	default:
 		return err
 	}

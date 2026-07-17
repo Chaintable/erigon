@@ -20,6 +20,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -41,7 +42,6 @@ import (
 
 	"github.com/erigontech/erigon/cl/clparams"
 	"github.com/erigontech/erigon/cmd/caplin/caplin1"
-	"github.com/erigontech/erigon/cmd/hack/tool/fromdb"
 	"github.com/erigontech/erigon/cmd/utils"
 	"github.com/erigontech/erigon/common"
 	"github.com/erigontech/erigon/common/dbg"
@@ -56,6 +56,7 @@ import (
 	"github.com/erigontech/erigon/db/downloader"
 	"github.com/erigontech/erigon/db/downloader/webseeds"
 	"github.com/erigontech/erigon/db/etl"
+	"github.com/erigontech/erigon/db/fromdb"
 	"github.com/erigontech/erigon/db/integrity"
 	"github.com/erigontech/erigon/db/kv"
 	"github.com/erigontech/erigon/db/kv/dbcfg"
@@ -138,6 +139,22 @@ var snapshotCommand = cli.Command{
 			Usage: "List all files with their words count",
 			Flags: joinFlags([]cli.Flag{
 				&utils.DataDirFlag,
+			}),
+		},
+		{
+			Name:  "du",
+			Usage: "Report snapshot disk usage by category with estimated sizes per node type",
+			Action: func(c *cli.Context) error {
+				dirs := datadir.Open(c.String(utils.DataDirFlag.Name))
+				if _, err := os.Stat(dirs.DataDir); os.IsNotExist(err) {
+					return fmt.Errorf("datadir does not exist: %s", dirs.DataDir)
+				}
+				return doDU(c, dirs)
+			},
+			Flags: joinFlags([]cli.Flag{
+				&utils.DataDirFlag,
+				&cli.BoolFlag{Name: "json", Usage: "Output in JSON format"},
+				&cli.BoolFlag{Name: "v", Aliases: []string{"verbose"}, Usage: "Show per-domain/per-type subcategory breakdown"},
 			}),
 		},
 		{
@@ -311,6 +328,16 @@ var snapshotCommand = cli.Command{
 			),
 		},
 		{
+			Name:    "rm-blocks",
+			Aliases: []string{"rm-block-snapshots", "rm-block-segments"},
+			Usage:   "Remove the latest block snapshot files (headers/bodies/transactions and their indexes) from <datadir>/snapshots",
+			Action:  doRmBlockSnapshots,
+			Flags: joinFlags([]cli.Flag{
+				&utils.DataDirFlag,
+				&cli.BoolFlag{Name: "dry-run"},
+			}),
+		},
+		{
 			Name: "rollback-snapshots-to-block",
 			Description: "Rollback the node back to a given block by deleting chaindata and all corresponding " +
 				"snapshots that contain data related to the given block and blocks after it. It deletes block " +
@@ -436,10 +463,51 @@ var snapshotCommand = cli.Command{
 			Description: "verify block state roots against commitment history snapshots for a given [from,to) block range (no block re-execution)",
 			Flags: joinFlags([]cli.Flag{
 				&utils.DataDirFlag,
-				&cli.Uint64Flag{Name: "from", Usage: "block number from which to start verifying", Required: true},
+				&cli.Uint64Flag{Name: "from", Usage: "block number from which to start verifying (default: 0)"},
 				&cli.Uint64Flag{Name: "to", Usage: "block number up to which to verify (exclusive); defaults to latest block with state"},
 				&cli.Int64Flag{Name: "seed", Usage: "random seed for block sampling (auto-generated if not set)"},
 				&cli.Float64Flag{Name: "sample", Usage: "fraction of blocks to check via pseudo-random sampling (0.0-1.0)", Value: 1.0},
+			}),
+		},
+		{
+			Name: "check-rcache-root-at-blk",
+			Action: func(cliCtx *cli.Context) error {
+				logger := log.Root()
+				err := doCheckRCacheRootAtBlk(cliCtx, logger)
+				if err != nil {
+					log.Error("[check-rcache-root-at-blk] failure", "err", err)
+					return err
+				}
+				log.Info("[check-rcache-root-at-blk] success")
+				return nil
+			},
+			Description: "verify the receipt root at a given block by reconstructing receipts from RCache and comparing against the block header",
+			Flags: joinFlags([]cli.Flag{
+				&utils.DataDirFlag,
+				&cli.Uint64Flag{Name: "block", Usage: "block number to verify", Required: true},
+				&cli.BoolFlag{Name: "failFast", Value: true, Usage: "stop on first mismatch (otherwise log and continue)"},
+			}),
+		},
+		{
+			Name: "check-rcache-root-at-blk-range",
+			Action: func(cliCtx *cli.Context) error {
+				logger := log.Root()
+				err := doCheckRCacheRootAtBlkRange(cliCtx, logger)
+				if err != nil {
+					log.Error("[check-rcache-root-at-blk-range] failure", "err", err)
+					return err
+				}
+				log.Info("[check-rcache-root-at-blk-range] success")
+				return nil
+			},
+			Description: "verify receipt roots against RCache for a given [from,to) block range with optional sampling",
+			Flags: joinFlags([]cli.Flag{
+				&utils.DataDirFlag,
+				&cli.Uint64Flag{Name: "from", Usage: "block number from which to start verifying (default: 0)"},
+				&cli.Uint64Flag{Name: "to", Usage: "block number up to which to verify (exclusive); defaults to RCache domain tip"},
+				&cli.Int64Flag{Name: "seed", Usage: "random seed for block sampling (auto-generated if not set)"},
+				&cli.Float64Flag{Name: "sample", Usage: "fraction of blocks to check via pseudo-random sampling (0.0-1.0)", Value: 1.0},
+				&cli.BoolFlag{Name: "failFast", Value: true, Usage: "stop on first mismatch (otherwise log and continue)"},
 			}),
 		},
 		{
@@ -616,7 +684,7 @@ func checkCommitmentFileHasRoot(filePath string) (hasState, broken bool, label s
 		}
 		defer idx.Close()
 
-		rd := idx.GetReaderFromPool()
+		rd := idx.Reader()
 		defer rd.Close()
 		if rd.Empty() {
 			log.Warn("[dbg] allow files deletion because accessor broken", "accessor", idx.FileName())
@@ -1025,6 +1093,218 @@ func doRmStateSnapshots(cliCtx *cli.Context) error {
 	})
 }
 
+type DeleteBlockSnapshotsArgs struct {
+	Dirs                   datadir.Dirs
+	PromptUserBeforeDelete bool
+	DryRun                 bool
+}
+
+// promptRemoveFiles displays a "remove N files (~size)?" prompt and returns
+// true if the user confirmed deletion (1), false if they chose to exit (4).
+// On scan error or EOF the user is treated as having declined.
+func promptRemoveFiles(count, totalBytes uint64) bool {
+AllowPruneSteps:
+	fmt.Printf("\nremove %d files (~%s)?\n1) RemoveFile\n4) Exit\n (pick number): ",
+		count, common.ByteCount(totalBytes))
+	var ans uint8
+	if _, err := fmt.Scanf("%d\n", &ans); err != nil {
+		fmt.Printf("err: %v\n", err)
+		return false
+	}
+	switch ans {
+	case 1:
+		return true
+	case 4:
+		return false
+	default:
+		fmt.Printf("invalid input: %d; Just a number 1 or 4 expected.\n", ans)
+		goto AllowPruneSteps
+	}
+}
+
+// DeleteBlockSnapshots removes the latest (highest-From) block snapshot range
+// from dirs.Snap. It walks .seg / .idx files, parses them with snaptype.ParseFileName
+// (which already understands composite type strings like "transactions-to-block"),
+// then deletes the matching primary files, any companion .torrent / .torrent<suffix>
+// partials, and unconditionally sweeps .tmp artifacts in dirs.Snap.
+func DeleteBlockSnapshots(args DeleteBlockSnapshotsArgs) error {
+	dirs := args.Dirs
+
+	filePaths, err := dir2.ListFiles(dirs.Snap)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			fmt.Printf("snapshot directory does not exist: %s\n", dirs.Snap)
+			return nil
+		}
+		return err
+	}
+
+	allFiles := make([]snaptype.FileInfo, 0, len(filePaths))
+	var maxFrom uint64
+	for _, p := range filePaths {
+		_, name := filepath.Split(p)
+		ext := filepath.Ext(name)
+		// Only consider primary block snapshot artifacts. Companion .torrent /
+		// .torrent<suffix> files are handled below via glob; .tmp files are
+		// swept unconditionally at the end.
+		if ext != ".seg" && ext != ".idx" {
+			continue
+		}
+		res, isStateFile, ok := snaptype.ParseFileName(dirs.Snap, name)
+		if !ok || isStateFile {
+			continue
+		}
+		// Skip salt-* files which ParseFileName also accepts.
+		if res.TypeString == "salt" {
+			continue
+		}
+		allFiles = append(allFiles, res)
+		if res.From > maxFrom {
+			maxFrom = res.From
+		}
+	}
+
+	if len(allFiles) == 0 {
+		fmt.Printf("no block snapshot files found in %s\n", dirs.Snap)
+		return sweepTmpFilesInSnapDir(dirs.Snap, args.DryRun)
+	}
+
+	toRemove := make([]snaptype.FileInfo, 0)
+	var maxTo, removeSize uint64
+	for _, f := range allFiles {
+		if f.From != maxFrom {
+			continue
+		}
+		toRemove = append(toRemove, f)
+		if f.To > maxTo {
+			maxTo = f.To
+		}
+		info, err := os.Stat(f.Path)
+		if err != nil {
+			fmt.Printf("warn: stat %s: %v\n", f.Path, err)
+			continue
+		}
+		removeSize += uint64(info.Size())
+	}
+
+	// Sort by (From desc, To desc, name asc) for display: newest ranges first.
+	sort.Slice(allFiles, func(i, j int) bool {
+		if allFiles[i].From != allFiles[j].From {
+			return allFiles[i].From > allFiles[j].From
+		}
+		if allFiles[i].To != allFiles[j].To {
+			return allFiles[i].To > allFiles[j].To
+		}
+		return allFiles[i].Name() < allFiles[j].Name()
+	})
+
+	fmt.Printf("\nDatadir: %s\n", dirs.DataDir)
+	fmt.Printf("Latest block range: [%d, %d)\n\n", maxFrom, maxTo)
+
+	// Show files at the latest From plus a bit of older context for orientation.
+	shown := 0
+	const contextLines = 12
+	for _, f := range allFiles {
+		atMax := f.From == maxFrom
+		if !atMax && shown >= contextLines {
+			break
+		}
+		var sizeStr string
+		if info, err := os.Stat(f.Path); err == nil {
+			sizeStr = common.ByteCount(uint64(info.Size()))
+		} else {
+			sizeStr = "unknown"
+		}
+		action := "KEEP  "
+		if atMax {
+			action = "REMOVE"
+		}
+		fmt.Printf("  %s %s  (%s)\n", action, f.Name(), sizeStr)
+		shown++
+	}
+
+	if args.PromptUserBeforeDelete {
+		if !promptRemoveFiles(uint64(len(toRemove)), removeSize) {
+			return nil
+		}
+	}
+
+	var removed uint64
+	for _, f := range toRemove {
+		// Catch both ".torrent" and partial ".torrent<suffix>" companions
+		// (see snaptype.IsTorrentPartial).
+		torrentArtifacts, err := filepath.Glob(f.Path + ".torrent*")
+		if err != nil {
+			return err
+		}
+		if args.DryRun {
+			fmt.Printf("[dry-run] rm %s\n", f.Path)
+			for _, t := range torrentArtifacts {
+				fmt.Printf("[dry-run] rm %s\n", t)
+			}
+			continue
+		}
+		if err := dir2.RemoveFile(f.Path); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return err
+		}
+		for _, t := range torrentArtifacts {
+			if err := dir2.RemoveFile(t); err != nil && !errors.Is(err, fs.ErrNotExist) {
+				return err
+			}
+		}
+		removed++
+	}
+	if args.DryRun {
+		fmt.Printf("[dry-run] would remove %d block snapshot files (~%s)\n", len(toRemove), common.ByteCount(removeSize))
+	} else {
+		fmt.Printf("removed %d block snapshot files\n", removed)
+	}
+
+	return sweepTmpFilesInSnapDir(dirs.Snap, args.DryRun)
+}
+
+// sweepTmpFilesInSnapDir removes (or, in dry-run mode, lists) all .tmp artifacts
+// in the given snapshot directory. Mirrors the unconditional sweep that
+// DeleteStateSnapshots performs across state snapshot directories.
+func sweepTmpFilesInSnapDir(snapDir string, dryRun bool) error {
+	tmpFiles, err := snaptype.TmpFiles(snapDir)
+	if err != nil {
+		return err
+	}
+	if len(tmpFiles) == 0 {
+		return nil
+	}
+	for _, tf := range tmpFiles {
+		if dryRun {
+			fmt.Printf("[dry-run] rm %s\n", tf)
+			continue
+		}
+		if err := dir2.RemoveFile(tf); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return err
+		}
+	}
+	if dryRun {
+		fmt.Printf("[dry-run] would remove %d .tmp files\n", len(tmpFiles))
+	} else {
+		fmt.Printf("removed %d .tmp files\n", len(tmpFiles))
+	}
+	return nil
+}
+
+func doRmBlockSnapshots(cliCtx *cli.Context) error {
+	dirs, l, err := datadir.New(cliCtx.String(utils.DataDirFlag.Name)).MustFlock()
+	if err != nil {
+		return err
+	}
+	defer l.Unlock()
+
+	return DeleteBlockSnapshots(DeleteBlockSnapshotsArgs{
+		Dirs:                   dirs,
+		PromptUserBeforeDelete: true,
+		DryRun:                 cliCtx.Bool("dry-run"),
+	})
+}
+
 func doRollbackSnapshotsToBlock(ctx context.Context, blockNum uint64, prompt bool, dataDir string, logger log.Logger) error {
 	dirs, l, err := datadir.New(dataDir).MustFlock()
 	if err != nil {
@@ -1199,7 +1479,7 @@ func doDebugKey(cliCtx *cli.Context) error {
 	if err := view.IntegrityKey(domain, key); err != nil {
 		return err
 	}
-	if err := view.IntegirtyInvertedIndexKey(domain, key); err != nil {
+	if err := view.IntegrityInvertedIndexKey(domain, key); err != nil {
 		return err
 	}
 	return nil
@@ -1367,6 +1647,8 @@ func doIntegrity(cliCtx *cli.Context) error {
 			return integrity.CheckReceiptsNoDups(ctx, sc, db, blockReader, failFast)
 		case integrity.RCacheNoDups:
 			return integrity.CheckRCacheNoDups(ctx, sc, db, blockReader, failFast)
+		case integrity.ReceiptRootIntegrity:
+			return integrity.CheckReceiptRootIntegrity(ctx, sc, db, blockReader, chainConfig, failFast, logger)
 		case integrity.CommitmentRoot:
 			return integrity.CheckCommitmentRoot(ctx, db, blockReader, failFast, logger)
 		case integrity.CommitmentKvi:
@@ -1388,7 +1670,7 @@ func doIntegrity(cliCtx *cli.Context) error {
 				logger.Info("[integrity] StateRootVerifyByHistory skipped because commitment history is not enabled on this datadir")
 				return nil
 			}
-			to, err := stateProgress(ctx, db, blockReader.TxnumReader())
+			to, err := stateFilesProgress(ctx, db, blockReader.TxnumReader())
 			if err != nil {
 				return err
 			}
@@ -1451,36 +1733,49 @@ func doIntegrity(cliCtx *cli.Context) error {
 	return nil
 }
 
-// stateProgress returns the latest block number covered by state snapshots,
-// derived from the aggregator's EndTxNumMinimax. This may differ from the block
-// files progress — block snapshots and state snapshots advance independently.
-// Use this as the upper bound for state-history integrity commands.
-func stateProgress(ctx context.Context, db kv.TemporalRoDB, txNumsReader rawdbv3.TxNumsReader) (uint64, error) {
-	agg := db.(state.HasAgg).Agg().(*state.Aggregator)
-	aggMax := agg.EndTxNumMinimax()
-	if aggMax == 0 {
-		return 0, nil
-	}
-	roTx, err := db.BeginRo(ctx)
+// stateFilesProgress returns the latest block fully covered by state-history files.
+// Commitment-history checks reconstruct from files only, so they must not run past file coverage.
+func stateFilesProgress(ctx context.Context, db kv.TemporalRoDB, txNumsReader rawdbv3.TxNumsReader) (uint64, error) {
+	roTx, err := db.BeginTemporalRo(ctx)
 	if err != nil {
 		return 0, err
 	}
 	defer roTx.Rollback()
-	blockNum, _, err := txNumsReader.FindBlockNum(ctx, roTx, aggMax)
+	aggMax := state.AggTx(roTx).EndTxNumNoCommitment()
+	if aggMax == 0 {
+		return 0, nil
+	}
+	blockNum, err := findBlockNumByTxNum(ctx, roTx, txNumsReader, aggMax)
 	if err != nil {
 		return 0, err
 	}
-	// FindBlockNum returns the first block whose maxTxNum >= aggMax, but that
-	// block may not be fully covered by state (maxTxNum+1 > aggMax). Back up
-	// to the last block that is fully covered.
-	maxTxNum, err := txNumsReader.Max(ctx, roTx, blockNum)
-	if err != nil {
-		return 0, err
-	}
-	if maxTxNum+1 > aggMax && blockNum > 0 {
-		blockNum--
+	if blockNum > 0 {
+		blockNum-- // FindBlockNum returns the block *containing* aggMax, but the per-block check needs the entire block covered
 	}
 	return blockNum, nil
+}
+
+func findBlockNumByTxNum(ctx context.Context, tx kv.Tx, txNumsReader rawdbv3.TxNumsReader, txNum uint64) (uint64, error) {
+	blockNum, ok, err := txNumsReader.FindBlockNum(ctx, tx, txNum)
+	if err != nil {
+		return 0, fmt.Errorf("find block num for tx num %d: %w", txNum, err)
+	}
+	if ok {
+		return blockNum, nil
+	}
+
+	firstBlockNum, firstTxNum, err := txNumsReader.First(tx)
+	if err != nil {
+		return 0, fmt.Errorf("find block num for tx num %d: not found; read txnum index lower bound: %w", txNum, err)
+	}
+	lastBlockNum, lastTxNum, err := txNumsReader.Last(tx)
+	if err != nil {
+		return 0, fmt.Errorf("find block num for tx num %d: not found; read txnum index upper bound: %w", txNum, err)
+	}
+	return 0, fmt.Errorf(
+		"find block num for tx num %d: not found (txnum index bounds: first block=%d txnum=%d, last block=%d txnum=%d)",
+		txNum, firstBlockNum, firstTxNum, lastBlockNum, lastTxNum,
+	)
 }
 
 func doCheckCommitmentHistAtBlk(cliCtx *cli.Context, logger log.Logger) error {
@@ -1533,7 +1828,7 @@ func doCheckStateRootByHistory(cliCtx *cli.Context, logger log.Logger) error {
 	from := cliCtx.Uint64("from")
 	to := cliCtx.Uint64("to")
 	if !cliCtx.IsSet("to") {
-		latestBlock, err := stateProgress(ctx, db, blockReader.TxnumReader())
+		latestBlock, err := stateFilesProgress(ctx, db, blockReader.TxnumReader())
 		if err != nil {
 			return err
 		}
@@ -1555,13 +1850,99 @@ func doCheckStateRootByHistory(cliCtx *cli.Context, logger log.Logger) error {
 	return integrity.CheckCommitmentHistAtBlkRange(ctx, sc, db, blockReader, from, to, logger)
 }
 
+func doCheckRCacheRootAtBlk(cliCtx *cli.Context, logger log.Logger) error {
+	ctx := cliCtx.Context
+	dirs := datadir.New(cliCtx.String(utils.DataDirFlag.Name))
+	chainDB := dbCfg(dbcfg.ChainDB, dirs.Chaindata).MustOpen()
+	defer chainDB.Close()
+	chainConfig := fromdb.ChainConfig(chainDB)
+	cfg := ethconfig.NewSnapCfg(false /*keepBlocks*/, true /*produceE2*/, true /*produceE3*/, chainConfig.ChainName)
+	res, clean, err := openSnaps(ctx, cfg, dirs, chainDB, logger)
+	if err != nil {
+		return err
+	}
+	defer clean()
+	blockRetire, agg := res.BlockRetire, res.Aggregator
+	defer blockRetire.MadvNormal().DisableReadAhead()
+	defer agg.MadvNormal().DisableReadAhead()
+	db, err := temporal.New(chainDB, agg)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	blockReader, _ := blockRetire.IO()
+	blockNum := cliCtx.Uint64("block")
+	failFast := cliCtx.Bool("failFast")
+	if err := integrity.CheckRCacheRootAtBlk(ctx, db, blockReader, chainConfig, blockNum, failFast, logger); err != nil {
+		return fmt.Errorf("checkRCacheRootAtBlk: %d, %w", blockNum, err)
+	}
+	return nil
+}
+
+func doCheckRCacheRootAtBlkRange(cliCtx *cli.Context, logger log.Logger) error {
+	ctx := cliCtx.Context
+	dirs := datadir.New(cliCtx.String(utils.DataDirFlag.Name))
+	chainDB := dbCfg(dbcfg.ChainDB, dirs.Chaindata).MustOpen()
+	defer chainDB.Close()
+	chainConfig := fromdb.ChainConfig(chainDB)
+	cfg := ethconfig.NewSnapCfg(false /*keepBlocks*/, true /*produceE2*/, true /*produceE3*/, chainConfig.ChainName)
+	res, clean, err := openSnaps(ctx, cfg, dirs, chainDB, logger)
+	if err != nil {
+		return err
+	}
+	defer clean()
+	blockRetire, agg := res.BlockRetire, res.Aggregator
+	defer blockRetire.MadvNormal().DisableReadAhead()
+	defer agg.MadvNormal().DisableReadAhead()
+	db, err := temporal.New(chainDB, agg)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	blockReader, _ := blockRetire.IO()
+
+	from := cliCtx.Uint64("from")
+	to := cliCtx.Uint64("to")
+	if !cliCtx.IsSet("to") {
+		tx, err := db.BeginTemporalRo(ctx)
+		if err != nil {
+			return err
+		}
+		defer tx.Rollback()
+		rcacheDomainProgress := tx.Debug().DomainProgress(kv.RCacheDomain)
+		rcacheTip, ok, err := blockReader.TxnumReader().FindBlockNum(ctx, tx, rcacheDomainProgress)
+		tx.Rollback()
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return fmt.Errorf("findBlockNum(%d) not found", rcacheDomainProgress)
+		}
+		to = rcacheTip + 1 // exclusive upper bound
+		logger.Info("[check-rcache-root-at-blk-range] auto-detected --to", "to", to)
+	}
+	var seed int64
+	if cliCtx.IsSet("seed") {
+		seed = cliCtx.Int64("seed")
+	} else {
+		seed = time.Now().UnixNano()
+	}
+	sampleRatio := cliCtx.Float64("sample")
+	sc, err := integrity.NewSamplerCfg(seed, sampleRatio)
+	if err != nil {
+		return err
+	}
+	failFast := cliCtx.Bool("failFast")
+	logger.Info("[check-rcache-root-at-blk-range] sampling config", "seed", sc.Seed, "sampleRatio", sc.SampleRatio)
+	return integrity.CheckRCacheRootAtBlkRange(ctx, sc, db, blockReader, chainConfig, from, to, failFast, logger)
+}
+
 func doVerifyState(cliCtx *cli.Context, logger log.Logger) error {
 	ctx := cliCtx.Context
 	dirs := datadir.New(cliCtx.String(utils.DataDirFlag.Name))
 
 	// Open MDBX without Accede so it creates the DB if needed (memState-only setups have no chaindata).
-	const ThreadsLimit = 9_000
-	limiterB := semaphore.NewWeighted(ThreadsLimit)
+	limiterB := semaphore.NewWeighted(threadsLimit)
 	chainDB := mdbx.New(dbcfg.ChainDB, logger).Path(dirs.Chaindata).RoTxsLimiter(limiterB).MustOpen()
 	defer chainDB.Close()
 
@@ -1582,8 +1963,7 @@ func doVerifyHistory(cliCtx *cli.Context, logger log.Logger) error {
 	ctx := cliCtx.Context
 	dirs := datadir.New(cliCtx.String(utils.DataDirFlag.Name))
 
-	const ThreadsLimit = 9_000
-	limiterB := semaphore.NewWeighted(ThreadsLimit)
+	limiterB := semaphore.NewWeighted(threadsLimit)
 	chainDB := mdbx.New(dbcfg.ChainDB, logger).Path(dirs.Chaindata).RoTxsLimiter(limiterB).MustOpen()
 	defer chainDB.Close()
 
@@ -1701,7 +2081,6 @@ func checkIfCaplinSnapshotsPublishable(dirs datadir.Dirs, emptyOk bool) error {
 	}
 
 	to := int64(-1)
-	somethingPresent, somethingEmpty := false, false
 	for table := range stateSnapTypes.KeyValueGetters {
 		uto, empty, err := CheckFilesForSchema(caplinSchema.GetState(table), CheckFilesParams{
 			checkLastFileTo: to,
@@ -1710,14 +2089,9 @@ func checkIfCaplinSnapshotsPublishable(dirs datadir.Dirs, emptyOk bool) error {
 		if err != nil {
 			return err
 		}
-		somethingPresent = somethingPresent || !empty
-		somethingEmpty = somethingEmpty || empty
-
-		to = int64(uto)
-	}
-
-	if somethingEmpty && somethingPresent {
-		return fmt.Errorf("some state snapshot files are empty while others are present")
+		if !empty {
+			to = int64(uto)
+		}
 	}
 
 	return nil
@@ -1902,6 +2276,9 @@ func checkStateSnapshotFiles(dirs datadir.Dirs, persistReceiptCache, commitmentH
 		if info.IsDir() {
 			return nil
 		}
+		if filepath.Ext(info.Name()) == ".tmp" {
+			return nil
+		}
 
 		res, _, ok := snaptype.ParseFileName(dirs.SnapDomain, info.Name())
 		if !ok {
@@ -2005,6 +2382,9 @@ func checkStateSnapshotFiles(dirs datadir.Dirs, persistReceiptCache, commitmentH
 			return err
 		}
 		if info.IsDir() {
+			return nil
+		}
+		if filepath.Ext(info.Name()) == ".tmp" {
 			return nil
 		}
 
@@ -2633,8 +3013,7 @@ func openSnaps(ctx context.Context, cfg ethconfig.BlocksFreezing, dirs datadir.D
 		ac := res.Aggregator.BeginFilesRo()
 		defer ac.Close()
 		stats.LogStats(ac, tx, logger, func(endTxNumMinimax uint64) (uint64, error) {
-			histBlockNumProgress, _, err := blockReader.TxnumReader().FindBlockNum(ctx, tx, endTxNumMinimax)
-			return histBlockNumProgress, err
+			return findBlockNumByTxNum(ctx, tx, blockReader.TxnumReader(), endTxNumMinimax)
 		})
 		return nil
 	})
@@ -2945,7 +3324,7 @@ func doRetireCommand(cliCtx *cli.Context, dirs datadir.Dirs) error {
 	cfg := ethconfig.NewSnapCfg(false, true, true, chainConfig.ChainName)
 
 	res, clean, err := openSnaps(ctx, cfg, dirs, db, logger)
-	caplinSnaps, br, agg := res.CaplinSnaps, res.BlockRetire, res.Aggregator
+	caplinSnaps, caplinStateSnaps, br, agg := res.CaplinSnaps, res.CaplinStateSnaps, res.BlockRetire, res.Aggregator
 	if err != nil {
 		return err
 	}
@@ -2954,32 +3333,14 @@ func doRetireCommand(cliCtx *cli.Context, dirs datadir.Dirs) error {
 	defer br.MadvNormal().DisableReadAhead()
 	defer agg.MadvNormal().DisableReadAhead()
 
-	if cliCtx.IsSet(utils.ErigondbDomainStepsInFrozenFileFlag.Name) {
-		s := cliCtx.String(utils.ErigondbDomainStepsInFrozenFileFlag.Name)
-		var v uint64
-		if strings.EqualFold(s, "inf") {
-			v = config3.UnboundedDomainMerge
-		} else {
-			parsed, perr := strconv.ParseUint(s, 10, 64)
-			if perr != nil || parsed == 0 {
-				return fmt.Errorf("invalid --%s value %q: must be a positive integer or \"Inf\"",
-					utils.ErigondbDomainStepsInFrozenFileFlag.Name, s)
-			}
-			v = parsed
-		}
-		stepsStr := "Inf"
-		if v != config3.UnboundedDomainMerge {
-			stepsStr = fmt.Sprintf("%d", v)
-		}
-		logger.Info("domain merge cap overridden", "steps_in_frozen_file", stepsStr)
-		agg.SetErigondbDomainStepsInFrozenFile(v)
+	if err := agg.SetDomainStepsInFrozenFile(cliCtx.String(utils.ErigondbDomainStepsInFrozenFileFlag.Name)); err != nil {
+		return err
 	}
 
 	blockSnapBuildSema := semaphore.NewWeighted(int64(runtime.NumCPU()))
 	agg.SetSnapshotBuildSema(blockSnapBuildSema)
 
 	blockReader, _ := br.IO()
-	agg.SetFrozenBlocksProvider(blockReader)
 
 	agg.PresetOfflineMerge()
 	agg.PeriodicalyPrintProcessSet(ctx)
@@ -3011,6 +3372,10 @@ func doRetireCommand(cliCtx *cli.Context, dirs datadir.Dirs) error {
 	}
 
 	if err := br.RemoveOverlaps(nil); err != nil {
+		return err
+	}
+
+	if err := caplinStateSnaps.RemoveOverlaps(); err != nil {
 		return err
 	}
 
@@ -3167,8 +3532,7 @@ func doCompareIdx(cliCtx *cli.Context) error {
 }
 
 func dbCfg(label kv.Label, path string) mdbx.MdbxOpts {
-	const ThreadsLimit = 9_000
-	limiterB := semaphore.NewWeighted(ThreadsLimit)
+	limiterB := semaphore.NewWeighted(threadsLimit)
 	return mdbx.New(label, log.New()).Path(path).
 		RoTxsLimiter(limiterB).
 		Accede(true) // integration tool: open db without creation and without blocking erigon
@@ -3186,4 +3550,643 @@ func openAgg(ctx context.Context, dirs datadir.Dirs, chainDB kv.RwDB, logger log
 		panic(err)
 	}
 	return agg
+}
+
+// ── du (disk usage) helpers ─────────────────────────────────────────────
+
+// duCategory constants for file classification.
+const (
+	duCatDomains    = "domains"
+	duCatHistory    = "history"
+	duCatInvIdx     = "inverted indices"
+	duCatAccessors  = "accessors"
+	duCatBlocks     = "block segments"
+	duCatCaplin     = "caplin"
+	duCatCommitHist = "commitment hist"
+	duCatRcache     = "rcache"
+	duCatForkable   = "forkable"
+	duCatOther      = "other"
+)
+
+// threadsLimit is the weight of the MDBX RoTxsLimiter used by integration
+// tooling: large enough to never back-pressure interactive commands.
+const threadsLimit = 9_000
+
+// duFileInfo holds metadata for a single snapshot file.
+type duFileInfo struct {
+	Path        string
+	Name        string
+	Size        int64
+	Category    string
+	Subcategory string // e.g. "accounts", "storage", "headers", "transactions"
+	From        uint64
+	To          uint64
+	IsState     bool // true for state files (history/idx/domain/accessor), false for block segments
+}
+
+// duClassifyFile maps a directory base name and file name to a duCategory.
+// dir is the immediate parent directory name (e.g. "domain", "history", "idx", "accessor", "caplin").
+func duClassifyFile(dir, name string) string {
+	lname := strings.ToLower(name)
+	ldir := strings.ToLower(dir)
+
+	// rcache files live in domain/, history/, or idx/
+	if strings.Contains(lname, "rcache") {
+		return duCatRcache
+	}
+
+	// commitment history/idx files
+	if (ldir == "history" || ldir == "idx") && strings.Contains(lname, "commitment") {
+		return duCatCommitHist
+	}
+
+	switch ldir {
+	case "domain":
+		// All domain/ files (including accessors like .kvi, .kvei, .bt) are classified
+		// as domains because domain files are never pruned by the snapshot pruning logic.
+		return duCatDomains
+	case "history":
+		return duCatHistory
+	case "idx":
+		return duCatInvIdx
+	case "accessor":
+		return duCatAccessors
+	case "caplin":
+		return duCatCaplin
+	case "forkable":
+		return duCatForkable
+	}
+
+	// Files directly under snapshots/ — only known segment extensions are block segments.
+	switch {
+	case strings.HasSuffix(lname, ".seg"), strings.HasSuffix(lname, ".idx"), strings.HasSuffix(lname, ".dat"):
+		return duCatBlocks
+	default:
+		return duCatOther
+	}
+}
+
+// duWalkSnapshots walks all snapshot subdirectories and collects file metadata.
+func duWalkSnapshots(dirs datadir.Dirs) ([]duFileInfo, error) {
+	// Directories to scan and whether they contain state files.
+	type scanDir struct {
+		path    string
+		isState bool
+	}
+	scanDirs := []scanDir{
+		{dirs.SnapDomain, true},
+		{dirs.SnapHistory, true},
+		{dirs.SnapIdx, true},
+		{dirs.SnapAccessors, true},
+		{dirs.SnapCaplin, false},
+		{dirs.SnapForkable, false},
+		{dirs.Snap, false}, // top-level snapshots/ for block segments
+	}
+
+	var files []duFileInfo
+
+	for _, sd := range scanDirs {
+		entries, err := os.ReadDir(sd.path)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return nil, fmt.Errorf("reading %s: %w", sd.path, err)
+		}
+
+		dirBase := filepath.Base(sd.path)
+
+		for _, e := range entries {
+			if e.IsDir() {
+				continue
+			}
+			info, err := e.Info()
+			if err != nil {
+				continue
+			}
+
+			fi := duFileInfo{
+				Path:     filepath.Join(sd.path, e.Name()),
+				Name:     e.Name(),
+				Size:     info.Size(),
+				Category: duClassifyFile(dirBase, e.Name()),
+				IsState:  sd.isState,
+			}
+
+			// Parse range and type from filename using the versioned parser.
+			parsed, _, ok := snaptype.ParseFileName(sd.path, e.Name())
+			if ok {
+				fi.From = parsed.From
+				fi.To = parsed.To
+				fi.Subcategory = parsed.TypeString
+			}
+
+			files = append(files, fi)
+		}
+	}
+
+	return files, nil
+}
+
+// duEstimate holds estimated disk usage for a particular node type (archive/full/minimal).
+type duEstimate struct {
+	Mode        string `json:"mode"`
+	TotalBytes  int64  `json:"total_bytes"`
+	Delta       int64  `json:"delta"`
+	BlocksDesc  string `json:"blocks_desc"`
+	HistoryDesc string `json:"history_desc"`
+}
+
+// duIsReceiptRelated returns true for files whose pruning follows receipt
+// rules rather than general history rules: rcache, logaddrs, logtopics.
+func duIsReceiptRelated(f duFileInfo) bool {
+	lname := strings.ToLower(f.Name)
+	return f.Category == duCatRcache ||
+		strings.Contains(lname, "logaddrs") || strings.Contains(lname, "logtopics")
+}
+
+// duIsRcacheDomainFile returns true for rcache files in the domain/ directory.
+// Domain files are never pruned by the snapshot pruning logic.
+func duIsRcacheDomainFile(f duFileInfo) bool {
+	// Normalize path separators to handle both Unix and Windows paths in tests and production.
+	normalized := filepath.ToSlash(f.Path)
+	return f.Category == duCatRcache && strings.Contains(normalized, "/domain/")
+}
+
+// duComputeEstimates computes estimated sizes for archive/full/blocks/minimal
+// modes by summing files that survive each mode's pruning rules.
+// maxBlock is the highest block number across all block segment files.
+// maxStep is the highest step number across all state files.
+func duComputeEstimates(files []duFileInfo, maxBlock, maxStep uint64) []duEstimate {
+	fullPruneDistance := uint64(config3.DefaultPruneDistance)
+	minimalPruneDistance := uint64(config3.MinimalPruneDistance)
+
+	// State files use step ranges, not block ranges. Convert each block-based
+	// prune distance to step units using the observed blocks-per-step ratio.
+	// Single division avoids compounding integer truncation.
+	stepDistance := func(blockDistance uint64) uint64 {
+		if maxStep == 0 || maxBlock == 0 {
+			return 0
+		}
+		return blockDistance * maxStep / maxBlock
+	}
+	fullStepPruneDistance := stepDistance(fullPruneDistance)
+	minimalStepPruneDistance := stepDistance(minimalPruneDistance)
+
+	// isStateHistoryPruned returns true when a state-history file's range is
+	// entirely below the step cutoff implied by `windowSteps`.
+	isStateHistoryPruned := func(f duFileInfo, windowSteps uint64) bool {
+		return windowSteps > 0 && f.To > 0 && maxStep > windowSteps && f.To <= maxStep-windowSteps
+	}
+	// isTxSegmentPruned returns true when a transactions block segment lies
+	// entirely below the block cutoff implied by `windowBlocks`.
+	isTxSegmentPruned := func(f duFileInfo, windowBlocks uint64) bool {
+		if f.Category != duCatBlocks || f.IsState {
+			return false
+		}
+		if !strings.Contains(strings.ToLower(f.Name), "transactions") {
+			return false
+		}
+		return f.To > 0 && maxBlock > windowBlocks && f.To <= maxBlock-windowBlocks
+	}
+	// isStateHistoryCategory matches the snapshot categories the pruner
+	// applies the state-history step cutoff to.
+	isStateHistoryCategory := func(f duFileInfo) bool {
+		return f.Category == duCatHistory || f.Category == duCatInvIdx || f.Category == duCatAccessors
+	}
+
+	var archiveTotal, fullTotal, blocksTotal, minimalTotal int64
+
+	for _, f := range files {
+		archiveTotal += f.Size
+
+		// commitHist is archive-only across non-archive modes — pre-shared
+		// gate so we don't repeat it in each mode block below.
+		nonArchiveBase := f.Category != duCatCommitHist
+
+		// Full mode: prunes state history, inverted indices, accessors,
+		// receipt-related state, and transaction block segments older than
+		// fullPruneDistance.
+		includeInFull := nonArchiveBase
+		if includeInFull && isStateHistoryCategory(f) && f.IsState &&
+			!duIsReceiptRelated(f) && isStateHistoryPruned(f, fullStepPruneDistance) {
+			includeInFull = false
+		}
+		if includeInFull && isTxSegmentPruned(f, fullPruneDistance) {
+			includeInFull = false
+		}
+		// Receipt-related state files (rcache hist/idx, logaddrs, logtopics)
+		// follow the block-distance prune cutoff (same formula as state
+		// history). Domain rcache files are never pruned.
+		if includeInFull && duIsReceiptRelated(f) && !duIsRcacheDomainFile(f) && f.IsState {
+			if isStateHistoryPruned(f, fullStepPruneDistance) {
+				includeInFull = false
+			}
+		}
+		if includeInFull {
+			fullTotal += f.Size
+		}
+
+		// Blocks mode: keeps all transaction segments (and all receipts —
+		// blocksRetentionCutoff returns 0 for KeepAllBlocksPruneMode, so the
+		// receipts filter is a no-op) but prunes state history at the same
+		// finite History distance as full (DefaultPruneDistance).
+		includeInBlocks := nonArchiveBase
+		if includeInBlocks && isStateHistoryCategory(f) && f.IsState &&
+			!duIsReceiptRelated(f) && isStateHistoryPruned(f, fullStepPruneDistance) {
+			includeInBlocks = false
+		}
+		if includeInBlocks {
+			blocksTotal += f.Size
+		}
+
+		// Minimal mode: same shape as full but with the smaller
+		// MinimalPruneDistance, so it prunes strictly more.
+		includeInMinimal := includeInFull
+		if includeInMinimal && isStateHistoryCategory(f) && f.IsState &&
+			!duIsReceiptRelated(f) && isStateHistoryPruned(f, minimalStepPruneDistance) {
+			includeInMinimal = false
+		}
+		if includeInMinimal && isTxSegmentPruned(f, minimalPruneDistance) {
+			includeInMinimal = false
+		}
+		if includeInMinimal && duIsReceiptRelated(f) && !duIsRcacheDomainFile(f) && f.IsState {
+			if isStateHistoryPruned(f, minimalStepPruneDistance) {
+				includeInMinimal = false
+			}
+		}
+		if includeInMinimal {
+			minimalTotal += f.Size
+		}
+	}
+
+	fullDesc := fmt.Sprintf("last %s", duFormatNumber(fullPruneDistance))
+	minimalDesc := fmt.Sprintf("last %s", duFormatNumber(minimalPruneDistance))
+	return []duEstimate{
+		{Mode: "archive", TotalBytes: archiveTotal, Delta: 0, BlocksDesc: "all blocks", HistoryDesc: "all history"},
+		{Mode: "full", TotalBytes: fullTotal, Delta: fullTotal - archiveTotal, BlocksDesc: fullDesc, HistoryDesc: fullDesc},
+		{Mode: "blocks", TotalBytes: blocksTotal, Delta: blocksTotal - archiveTotal, BlocksDesc: "all blocks", HistoryDesc: fullDesc},
+		{Mode: "minimal", TotalBytes: minimalTotal, Delta: minimalTotal - archiveTotal, BlocksDesc: minimalDesc, HistoryDesc: minimalDesc},
+	}
+}
+
+// duDetectNodeType infers the current node mode from which files are present.
+// Archive nodes retain all state history from step 0; non-archive modes have
+// pruned it, so old state history files are absent. Among non-archive modes:
+//   - Blocks mode keeps all transaction segments (from genesis) but prunes
+//     state history. Detected by the presence of a tx segment with From=0
+//     on a chain past DefaultPruneDistance, where full would have pruned it.
+//   - Full prunes both state history and transaction segments older than
+//     DefaultPruneDistance.
+//   - Minimal does the same but at the smaller MinimalPruneDistance, so it
+//     keeps a narrower recent window than full.
+//
+// On chains between MinimalPruneDistance and DefaultPruneDistance, full and
+// blocks look identical on disk (full has not yet pruned tx); the detector
+// defaults the ambiguous case to full, the more common mode.
+func duDetectNodeType(files []duFileInfo) string {
+	hasOldStateHistory := false
+	hasGenesisTxSegment := false
+	var maxBlock, maxStep uint64
+
+	fullPruneDistance := uint64(config3.DefaultPruneDistance)
+	minimalPruneDistance := uint64(config3.MinimalPruneDistance)
+
+	for _, f := range files {
+		// Track max ranges for pruning cutoff calculations.
+		if f.IsState && f.To > maxStep {
+			maxStep = f.To
+		}
+		if f.Category == duCatBlocks && !f.IsState {
+			if f.To > maxBlock {
+				maxBlock = f.To
+			}
+			if f.From == 0 && strings.Contains(strings.ToLower(f.Name), "transactions") {
+				hasGenesisTxSegment = true
+			}
+		}
+		// Regular state history files (not commitment hist, not rcache) starting
+		// at step 0 indicate archive mode — only archive keeps all history.
+		if f.Category == duCatHistory && f.From == 0 && f.To > 0 {
+			hasOldStateHistory = true
+		}
+	}
+
+	// Archive: keeps all state history from step 0. Use the LARGER (full's)
+	// step prune distance as the maturity threshold — a chain too young for
+	// full to have pruned isn't evidence of archive mode.
+	var fullStepPruneDistance uint64
+	if maxStep > 0 && maxBlock > 0 {
+		fullStepPruneDistance = fullPruneDistance * maxStep / maxBlock
+	}
+	if hasOldStateHistory && (fullStepPruneDistance == 0 || maxStep > fullStepPruneDistance) {
+		return "archive"
+	}
+
+	// Blocks mode: tx segments from genesis are present and the chain is past
+	// the point where full would have pruned them. Gate on fullPruneDistance —
+	// below that, full hasn't started pruning tx yet and a genesis tx segment
+	// is not evidence of blocks mode.
+	if hasGenesisTxSegment && maxBlock > fullPruneDistance {
+		return "blocks"
+	}
+
+	// Distinguish full from minimal by looking for transaction segments that
+	// minimal would have pruned but full would have kept — i.e., segments
+	// below (maxBlock - minimalPruneDistance). Presence of such segments
+	// indicates full mode.
+	if maxBlock > minimalPruneDistance {
+		for _, f := range files {
+			if f.Category == duCatBlocks && !f.IsState && strings.Contains(strings.ToLower(f.Name), "transactions") &&
+				f.To > 0 && f.To <= maxBlock-minimalPruneDistance {
+				return "full"
+			}
+		}
+	}
+
+	return "minimal"
+}
+
+// duCategoryStat holds aggregated size and file count for one category.
+type duCategoryStat struct {
+	Bytes int64 `json:"bytes"`
+	Files int   `json:"files"`
+}
+
+// duResult aggregates all output data for the du command.
+type duResult struct {
+	Chain           string                               `json:"chain"`
+	ConfiguredMode  string                               `json:"configured_mode,omitempty"` // from DB; empty when DB unavailable
+	DetectedMode    string                               `json:"detected_mode"`
+	BlockRange      [2]uint64                            `json:"block_range"`
+	StepRange       [2]uint64                            `json:"step_range"`
+	TotalBytes      int64                                `json:"total_bytes"`
+	TotalFiles      int                                  `json:"total_files"`
+	Categories      map[string]duCategoryStat            `json:"categories"`
+	Subcategories   map[string]map[string]duCategoryStat `json:"subcategories,omitempty"` // category → subcategory → stat
+	OtherExtensions []string                             `json:"other_extensions,omitempty"`
+	Estimates       []duEstimate                         `json:"estimates"`
+}
+
+// duAggregateCategories computes per-category byte totals and file counts.
+func duAggregateCategories(files []duFileInfo) map[string]duCategoryStat {
+	cats := make(map[string]duCategoryStat)
+	for _, f := range files {
+		s := cats[f.Category]
+		s.Bytes += f.Size
+		s.Files++
+		cats[f.Category] = s
+	}
+	return cats
+}
+
+// duAggregateSubcategories computes per-subcategory stats within each category.
+func duAggregateSubcategories(files []duFileInfo) map[string]map[string]duCategoryStat {
+	result := make(map[string]map[string]duCategoryStat)
+	for _, f := range files {
+		if f.Subcategory == "" {
+			continue
+		}
+		subs, ok := result[f.Category]
+		if !ok {
+			subs = make(map[string]duCategoryStat)
+			result[f.Category] = subs
+		}
+		s := subs[f.Subcategory]
+		s.Bytes += f.Size
+		s.Files++
+		subs[f.Subcategory] = s
+	}
+	return result
+}
+
+// duOtherExtensions returns a sorted list of unique file extensions in the "other" category.
+func duOtherExtensions(files []duFileInfo) []string {
+	exts := make(map[string]struct{})
+	for _, f := range files {
+		if f.Category != duCatOther {
+			continue
+		}
+		ext := filepath.Ext(f.Name)
+		if ext == "" {
+			ext = f.Name // no extension — use full name
+		}
+		exts[ext] = struct{}{}
+	}
+	result := make([]string, 0, len(exts))
+	for ext := range exts {
+		result = append(result, ext)
+	}
+	sort.Strings(result)
+	return result
+}
+
+// duFormatSize formats bytes into a human-readable string (e.g., "420.3GB").
+// Wraps common.ByteCount with support for negative values (deltas).
+func duFormatSize(b int64) string {
+	if b < 0 {
+		return "-" + common.ByteCount(uint64(-b))
+	}
+	return common.ByteCount(uint64(b))
+}
+
+// duFormatNumber formats an integer with comma separators (e.g., 21500000 → "21,500,000").
+func duFormatNumber(n uint64) string {
+	s := strconv.FormatUint(n, 10)
+	if len(s) <= 3 {
+		return s
+	}
+	var buf strings.Builder
+	rem := len(s) % 3
+	if rem > 0 {
+		buf.WriteString(s[:rem])
+	}
+	for i := rem; i < len(s); i += 3 {
+		if buf.Len() > 0 {
+			buf.WriteByte('.')
+		}
+		buf.WriteString(s[i : i+3])
+	}
+	return buf.String()
+}
+
+// duFormatHuman writes the human-readable du output to w.
+func duFormatHuman(w io.Writer, result duResult, verbose bool) {
+	// Header line: show configured mode from DB when available, always show detected.
+	modeStr := result.DetectedMode + " (detected)"
+	if result.ConfiguredMode != "" {
+		modeStr = result.ConfiguredMode
+		if result.ConfiguredMode != result.DetectedMode {
+			modeStr += fmt.Sprintf(" (files look like %s)", result.DetectedMode)
+		}
+	}
+	fmt.Fprintf(w, "\n%s | %s | blocks 0–%s | steps 0–%s\n",
+		result.Chain, modeStr,
+		duFormatNumber(result.BlockRange[1]),
+		duFormatNumber(result.StepRange[1]))
+	fmt.Fprintf(w, "total: %s (%d files)\n\n", duFormatSize(result.TotalBytes), result.TotalFiles)
+
+	// Breakdown table sorted by size descending.
+	type catEntry struct {
+		name string
+		stat duCategoryStat
+	}
+	entries := make([]catEntry, 0, len(result.Categories))
+	for cat, stat := range result.Categories {
+		entries = append(entries, catEntry{cat, stat})
+	}
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].stat.Bytes != entries[j].stat.Bytes {
+			return entries[i].stat.Bytes > entries[j].stat.Bytes
+		}
+		return entries[i].name < entries[j].name
+	})
+
+	fmt.Fprintln(w, "── Breakdown ──────────────────────────────────────────────────")
+	for _, e := range entries {
+		pct := float64(0)
+		if result.TotalBytes > 0 {
+			pct = float64(e.stat.Bytes) / float64(result.TotalBytes) * 100
+		}
+		fmt.Fprintf(w, "  %-20s %10s %9.1f%%  %5d files\n",
+			e.name, duFormatSize(e.stat.Bytes), pct, e.stat.Files)
+
+		// Show "other" extensions on next line.
+		if e.name == duCatOther && len(result.OtherExtensions) > 0 {
+			fmt.Fprintf(w, "    extensions: %s\n", strings.Join(result.OtherExtensions, ", "))
+		}
+
+		// Verbose: show subcategory breakdown within each category.
+		if verbose {
+			if subs, ok := result.Subcategories[e.name]; ok && len(subs) > 1 {
+				subEntries := make([]catEntry, 0, len(subs))
+				for sub, stat := range subs {
+					subEntries = append(subEntries, catEntry{sub, stat})
+				}
+				sort.Slice(subEntries, func(i, j int) bool {
+					if subEntries[i].stat.Bytes != subEntries[j].stat.Bytes {
+						return subEntries[i].stat.Bytes > subEntries[j].stat.Bytes
+					}
+					return subEntries[i].name < subEntries[j].name
+				})
+				for j, sub := range subEntries {
+					subPct := float64(0)
+					if e.stat.Bytes > 0 {
+						subPct = float64(sub.stat.Bytes) / float64(e.stat.Bytes) * 100
+					}
+					prefix := "  ├─"
+					if j == len(subEntries)-1 {
+						prefix = "  └─"
+					}
+					displayName := sub.name
+					if displayName == "transactions-to-block" {
+						displayName = "txn2block"
+					}
+					fmt.Fprintf(w, "%s %-16s %10s %9.1f%%  %5d files\n",
+						prefix, displayName, duFormatSize(sub.stat.Bytes), subPct, sub.stat.Files)
+				}
+				fmt.Fprintln(w)
+			}
+		}
+	}
+
+	// Estimates table.
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "── Estimated Size by Node Type ────────────────────────────────")
+	for _, est := range result.Estimates {
+		deltaStr := "—"
+		if est.Delta != 0 {
+			deltaStr = duFormatSize(est.Delta)
+		}
+		fmt.Fprintf(w, "  %-13s %10s %10s    %-15s %s\n",
+			est.Mode, duFormatSize(est.TotalBytes), deltaStr,
+			est.BlocksDesc, est.HistoryDesc)
+	}
+}
+
+// duFormatJSON writes the du result as JSON to w.
+func duFormatJSON(w io.Writer, result duResult) error {
+	enc := json.NewEncoder(w)
+	enc.SetIndent("", "  ")
+	return enc.Encode(result)
+}
+
+// doDU implements the "erigon seg du" subcommand.
+func doDU(cliCtx *cli.Context, dirs datadir.Dirs) error {
+	// Resolve chain name and configured prune mode from chaindata (best-effort).
+	// Use recover because both MustOpen and fromdb.ChainConfig can panic
+	// (e.g., DB locked by running node, corrupted/empty chaindata).
+	chainName := "unknown"
+	var configuredMode string // empty when DB is unavailable
+	if _, err := os.Stat(dirs.Chaindata); err == nil {
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					log.Warn("could not read chaindata", "err", r)
+				}
+			}()
+			chainDB := dbCfg(dbcfg.ChainDB, dirs.Chaindata).MustOpen()
+			defer chainDB.Close()
+			cc := fromdb.ChainConfig(chainDB)
+			if cc != nil && cc.ChainName != "" {
+				chainName = cc.ChainName
+			}
+			pm := fromdb.PruneMode(chainDB)
+			configuredMode = pm.String()
+		}()
+	}
+
+	// Walk snapshot files.
+	files, err := duWalkSnapshots(dirs)
+	if err != nil {
+		return fmt.Errorf("walking snapshots: %w", err)
+	}
+
+	// Compute ranges.
+	var maxBlock, maxStep uint64
+	for _, f := range files {
+		if f.IsState {
+			if f.To > maxStep {
+				maxStep = f.To
+			}
+		} else if f.Category == duCatBlocks {
+			if f.To > maxBlock {
+				maxBlock = f.To
+			}
+		}
+	}
+
+	// Build result.
+	cats := duAggregateCategories(files)
+	estimates := duComputeEstimates(files, maxBlock, maxStep)
+
+	var totalBytes int64
+	var totalFiles int
+	for _, s := range cats {
+		totalBytes += s.Bytes
+		totalFiles += s.Files
+	}
+
+	result := duResult{
+		Chain:           chainName,
+		ConfiguredMode:  configuredMode,
+		DetectedMode:    duDetectNodeType(files),
+		BlockRange:      [2]uint64{0, maxBlock},
+		StepRange:       [2]uint64{0, maxStep},
+		TotalBytes:      totalBytes,
+		TotalFiles:      totalFiles,
+		Categories:      cats,
+		Subcategories:   duAggregateSubcategories(files),
+		OtherExtensions: duOtherExtensions(files),
+		Estimates:       estimates,
+	}
+
+	verbose := cliCtx.Bool("v")
+
+	// Output.
+	if cliCtx.Bool("json") {
+		return duFormatJSON(os.Stdout, result)
+	}
+	duFormatHuman(os.Stdout, result, verbose)
+	return nil
 }

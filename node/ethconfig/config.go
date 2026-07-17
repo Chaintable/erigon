@@ -40,7 +40,6 @@ import (
 	"github.com/erigontech/erigon/db/kv/prune"
 	"github.com/erigontech/erigon/execution/builder/buildercfg"
 	"github.com/erigontech/erigon/execution/chain"
-	chainspec "github.com/erigontech/erigon/execution/chain/spec"
 	"github.com/erigontech/erigon/execution/protocol/rules/ethash/ethashcfg"
 	"github.com/erigontech/erigon/execution/types"
 	"github.com/erigontech/erigon/rpc/gasprice/gaspricecfg"
@@ -116,6 +115,7 @@ var Defaults = Config{
 	FcuBackgroundPrune:  true,
 	FcuBackgroundCommit: false, // to enable, we need to 1) have rawdb API go via execctx and 2) revive Coherent cache for rpcdaemon
 	ExperimentalBAL:     false,
+	WarmupKzgCtxOnInit:  true,
 }
 
 const DefaultChainDBPageSize = 16 * datasize.KB
@@ -151,9 +151,17 @@ type BlocksFreezing struct {
 	ProduceE2         bool // produce new block files
 	ProduceE3         bool // produce new state files
 	NoDownloader      bool // possible to use snapshots without calling Downloader
+	P2PManifest       bool // discover snapshot manifest from P2P peers instead of centralized preverified.toml
 	DisableDownloadE3 bool // disable download state snapshots
 	DownloaderAddr    string
 	ChainName         string
+	// ChainTomlURL, when non-empty, overrides the default R2/GitHub fetch of
+	// the preverified chain.toml with a direct HTTP GET to this URL. Local
+	// preverified.toml in the datadir still takes precedence.
+	ChainTomlURL string
+	// ManifestReady is closed when P2P manifest discovery completes.
+	// Set by the backend when P2PManifest is enabled. Nil otherwise.
+	ManifestReady <-chan struct{}
 }
 
 func (s BlocksFreezing) String() string {
@@ -216,8 +224,7 @@ type Config struct {
 	// Ethash options
 	Ethash ethashcfg.Config
 
-	Clique chainspec.ConsensusSnapshotConfig
-	Aura   chain.AuRaConfig
+	Aura chain.AuRaConfig
 
 	// Transaction pool options
 	TxPool  txpoolcfg.Config
@@ -247,25 +254,11 @@ type Config struct {
 	// Consensus layer
 	InternalCL bool
 
-	OverrideOsakaTime     *big.Int `toml:",omitempty"`
-	OverrideAmsterdamTime *big.Int `toml:",omitempty"`
+	OverrideOsakaTime     *uint64 `toml:",omitempty"`
+	OverrideAmsterdamTime *uint64 `toml:",omitempty"`
 
 	// Whether to avoid overriding chain config already stored in the DB
 	KeepStoredChainConfig bool
-
-	// Embedded Silkworm support
-	SilkwormExecution            bool
-	SilkwormRpcDaemon            bool
-	SilkwormSentry               bool
-	SilkwormVerbosity            string
-	SilkwormNumContexts          uint32
-	SilkwormRpcLogEnabled        bool
-	SilkwormRpcLogDirPath        string
-	SilkwormRpcLogMaxFileSize    uint16
-	SilkwormRpcLogMaxFiles       uint16
-	SilkwormRpcLogDumpResponse   bool
-	SilkwormRpcNumWorkers        uint32
-	SilkwormRpcJsonCompatibility bool
 
 	// PoS Single Slot finality
 	PolygonPosSingleSlotFinality        bool
@@ -286,6 +279,12 @@ type Config struct {
 	// config3.UnboundedDomainMerge disables the cap; any other positive value is used
 	// directly as the cap in steps.
 	ErigondbDomainStepsInFrozenFile *uint64 `toml:",omitempty"`
+
+	// WarmupKzgCtxOnInit, when true, eagerly initialises the KZG trusted setup
+	// in the background on startup so the first block doesn't pay the ~2s init
+	// cost. Tests that don't need the trusted setup loaded leave this false
+	// to avoid the extra work.
+	WarmupKzgCtxOnInit bool
 }
 
 type Sync struct {
@@ -300,10 +299,11 @@ type Sync struct {
 	LoopBlockLimit             uint
 	ParallelStateFlushing      bool
 
-	ChaosMonkey              bool
-	AlwaysGenerateChangesets bool
-	MaxReorgDepth            uint64
-	KeepExecutionProofs      bool
-	PersistReceiptsCacheV2   bool
-	SnapshotDownloadToBlock  uint64 // exclusive [0,toBlock)
+	ChaosMonkey                      bool
+	AlwaysGenerateChangesets         bool
+	MaxReorgDepth                    uint64
+	KeepExecutionProofs              bool
+	ExperimentalConcurrentCommitment bool
+	PersistReceiptsCacheV2           bool
+	SnapshotDownloadToBlock          uint64 // exclusive [0,toBlock)
 }

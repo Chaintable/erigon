@@ -35,6 +35,7 @@ import (
 	"github.com/erigontech/erigon/execution/state"
 	tracersConfig "github.com/erigontech/erigon/execution/tracing/tracers/config"
 	"github.com/erigontech/erigon/execution/types/accounts"
+	"github.com/erigontech/erigon/node/gointerfaces/remoteproto"
 	"github.com/erigontech/erigon/rpc"
 	"github.com/erigontech/erigon/rpc/ethapi"
 	"github.com/erigontech/erigon/rpc/jsonstream"
@@ -65,6 +66,8 @@ type PrivateDebugAPI interface {
 	GetRawReceipts(ctx context.Context, blockNrOrHash rpc.BlockNumberOrHash) ([]hexutil.Bytes, error)
 	GetBadBlocks(ctx context.Context) ([]map[string]any, error)
 	GetRawTransaction(ctx context.Context, hash common.Hash) (hexutil.Bytes, error)
+	ExecutionWitness(ctx context.Context, blockNrOrHash rpc.BlockNumberOrHash, mode *string) (*ExecutionWitnessResult, error)
+	SetHead(ctx context.Context, number hexutil.Uint64) error
 	FreeOSMemory()
 	SetGCPercent(v int) int
 	SetMemoryLimit(limit int64) int64
@@ -76,27 +79,61 @@ type PrivateDebugAPI interface {
 type DebugAPIImpl struct {
 	*BaseAPI
 	db                kv.TemporalRoDB
+	ethBackend        rpchelper.ApiBackend
 	GasCap            uint64
 	gethCompatibility bool // Geth-compatible storage iteration order for debug_storageRangeAt
 }
 
 // NewPrivateDebugAPI returns PrivateDebugAPIImpl instance
-func NewPrivateDebugAPI(base *BaseAPI, db kv.TemporalRoDB, gascap uint64, gethCompatibility bool) *DebugAPIImpl {
+func NewPrivateDebugAPI(base *BaseAPI, db kv.TemporalRoDB, ethBackend rpchelper.ApiBackend, gascap uint64, gethCompatibility bool) *DebugAPIImpl {
 	return &DebugAPIImpl{
 		BaseAPI:           base,
 		db:                db,
+		ethBackend:        ethBackend,
 		GasCap:            gascap,
 		gethCompatibility: gethCompatibility,
 	}
 }
 
-// storageRangeAt implements debug_storageRangeAt. Returns information about a range of storage locations (if any) for the given address.
+// SetHead implements debug_setHead. Rewinds the local chain to the specified block number.
+func (api *DebugAPIImpl) SetHead(ctx context.Context, number hexutil.Uint64) error {
+	blockNum := number.Uint64()
+
+	tx, err := api.db.BeginTemporalRo(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	currentHead, err := rpchelper.GetLatestBlockNumber(tx)
+	if err != nil {
+		return err
+	}
+	if blockNum > currentHead {
+		return fmt.Errorf("block number %d is in the future: current head is %d", blockNum, currentHead)
+	}
+
+	if err := api.BaseAPI.checkPruneHistory(ctx, tx, blockNum); err != nil {
+		return err
+	}
+
+	tx.Rollback() // release read tx before the backend opens write tx
+
+	_, err = api.ethBackend.SetHead(ctx, &remoteproto.SetHeadRequest{BlockNumber: blockNum})
+	return err
+}
+
+// StorageRangeAt implements debug_storageRangeAt. Returns information about a range of storage locations (if any) for the given address.
 func (api *DebugAPIImpl) StorageRangeAt(ctx context.Context, blockHash common.Hash, txIndex uint64, contractAddress common.Address, keyStart hexutil.Bytes, maxResult int) (StorageRangeResult, error) {
 	tx, err := api.db.BeginTemporalRo(ctx)
 	if err != nil {
 		return StorageRangeResult{}, err
 	}
 	defer tx.Rollback()
+
+	if maxResult < 0 {
+		maxResult = 0
+	}
 
 	blockNrOrHash := rpc.BlockNumberOrHashWithHash(blockHash, true)
 	blockNumber, _, _, err := rpchelper.GetCanonicalBlockNumber(ctx, blockNrOrHash, tx, api._blockReader, api.filters)
@@ -121,13 +158,20 @@ func (api *DebugAPIImpl) StorageRangeAt(ctx context.Context, blockHash common.Ha
 	return storageRangeAt(tx, contractAddress, keyStart, fromTxNum, maxResult, api.gethCompatibility)
 }
 
-// AccountRange implements debug_accountRange. Returns a range of accounts involved in the given block rangeb
+// AccountRange implements debug_accountRange. Returns a paginated list of all accounts present in the state at the given block.
 // To ensure compatibility, we've temporarily added support for the start parameter in two formats:
 // - string (e.g., "0x..."), which is used by Geth and other APIs (i.e debug_storageRangeAt).
 // - []byte, which was used in Erigon.
 // Deprecation of []byte format: The []byte format is now deprecated and will be removed in a future release.
 //
 // New optional parameter incompletes: This parameter has been added for compatibility with Geth. It is currently not supported when set to true(as its functionality is specific to the Geth protocol).
+//
+// Note: Geth returns all accounts at the given block starting from `start`, where `start` is a
+// keccak256(address) hash. Geth can seek directly to that position in the Merkle Patricia Trie
+// since the trie is natively indexed by keccak256. In Erigon, accounts are stored by raw address
+// (flat storage), so to match Geth's behaviour we would need to compute keccak256 for every account
+// in order to find the one matching `start` — which is too expensive for production use.
+// As a result, Erigon treats `start` as a raw address and iteration order differs from Geth.
 func (api *DebugAPIImpl) AccountRange(ctx context.Context, blockNrOrHash rpc.BlockNumberOrHash, start any, maxResults int, excludeCode, excludeStorage bool, optional_incompletes *bool) (state.IteratorDump, error) {
 	var startBytes []byte
 
@@ -226,7 +270,7 @@ func (api *DebugAPIImpl) AccountRange(ctx context.Context, blockNrOrHash rpc.Blo
 		return state.IteratorDump{}, err
 	}
 	if header != nil {
-		res.Root = header.Root.String()
+		res.Root = fmt.Sprintf("%x", header.Root)
 	}
 
 	return res, nil
@@ -275,38 +319,16 @@ func (api *DebugAPIImpl) GetModifiedAccountsByNumber(ctx context.Context, startN
 
 	// Two params: Geth compares state at startNum vs endNum → blocks (startNum, endNum].
 	endNum := uint64(endNumber.Int64()) // forces negative numbers to fail (too large)
-	// Allow endNum == latestBlock+1 for compatibility: callers may pass latest+1 to mean
-	// "up to and including the latest block" (mirrors old half-open [startNum, endNum) semantics).
-	if endNum > latestBlock+1 {
+	if endNum > latestBlock {
 		return nil, fmt.Errorf("end block (%d) is later than the latest block (%d)", endNum, latestBlock)
 	}
-	originalEndNum := endNum
-	if endNum > latestBlock {
-		// Clamp to latestBlock so downstream txNum lookups succeed.
-		endNum = latestBlock
-	}
 	if startNum >= endNum {
-		// Special case: caller passed startNum+1 as endNum (e.g. startNum=latestBlock,
-		// endNum=latestBlock+1). After clamping, startNum == endNum. Treat as single-block.
-		if startNum == endNum && originalEndNum > latestBlock {
-			if err = api.BaseAPI.checkPruneHistory(ctx, tx, startNum); err != nil {
-				return nil, err
-			}
-			startTxNum, err := api._txNumReader.Min(ctx, tx, startNum)
-			if err != nil {
-				return nil, err
-			}
-			endTxNum, err := api._txNumReader.Max(ctx, tx, startNum)
-			if err != nil {
-				return nil, err
-			}
-			return getModifiedAccounts(tx, startTxNum, endTxNum+1)
-		}
 		return nil, fmt.Errorf("start block (%d) must be less than end block (%d)", startNum, endNum)
 	}
 
 	// Checking startNum+1 is sufficient under sequential-pruning semantics: if block N is
-	// available, all blocks > N are too.
+	// available, all blocks > N are too. If pruning semantics ever change this would need
+	// to also check endNum.
 	if err = api.BaseAPI.checkPruneHistory(ctx, tx, startNum+1); err != nil {
 		return nil, err
 	}
@@ -343,9 +365,28 @@ func (api *DebugAPIImpl) GetModifiedAccountsByNumber(ctx context.Context, startN
 //
 // # Filters applied to match Geth output exactly
 //
-//  1. Precompiles touched but not changed: bytes.Equal(preVal, postVal) → skip.
-//  2. Self-destructed accounts (postVal empty): record in deletedAddrs, skip from result.
-//  3. Storage slots of deleted accounts: skipped via deletedAddrs.
+//  1. Precompiles touched but not changed (e.g. 0x0000…0004 SHA256):
+//     AccountsDomain records a "touch" but balance/nonce/code did not change.
+//     Filter: bytes.Equal(preVal, postVal) → skip.
+//
+//  2. Self-destructed accounts (SELFDESTRUCT / EIP-161 zeroing):
+//     Geth walks the NEW state trie; destroyed accounts are absent from it and are
+//     never emitted. In Erigon, AccountsDomain records the deletion as postVal == empty.
+//     Filter: len(postVal) == 0 → record in deletedAddrs, skip from result.
+//
+//  3. Storage slots of deleted accounts:
+//     After SELFDESTRUCT all storage is cleared. Those slot entries appear in StorageDomain
+//     history but the owning account no longer exists. We skip them via deletedAddrs.
+//     No extra GetAsOf(Account) is needed: a destroyed account cannot run code, so it
+//     cannot produce new StorageDomain entries. The only re-use case (CREATE2 at the same
+//     address) causes an AccountsDomain entry (code hash changes) → address lands in `saw`
+//     and is skipped by the "already in result" fast-path.
+//
+// # Two-pass approach
+//
+//  1. AccountsDomain pass: collect modified accounts; build deletedAddrs for SELFDESTRUCT'd ones.
+//  2. StorageDomain pass: add any address with a net storage change that is not already included
+//     and not deleted. Filters are applied cheapest-first to minimise GetAsOf I/O calls.
 func getModifiedAccounts(tx kv.TemporalTx, startTxNum, endTxNum uint64) ([]common.Address, error) {
 	saw := make(map[common.Address]struct{})
 	var result []common.Address
@@ -360,6 +401,13 @@ func getModifiedAccounts(tx kv.TemporalTx, startTxNum, endTxNum uint64) ([]commo
 	}
 
 	// Pass 1 – AccountsDomain.
+	// HistoryRange returns one entry per unique key: (key, value_before_first_change_in_range).
+	// Because the first change's pre-value equals the state at startTxNum-1 (no intervening
+	// change), this IS the pre-range value. GetAsOf(key, endTxNum) gives the post-range value.
+	// Comparing the two detects net changes regardless of intermediate modifications.
+	//   • preVal == postVal  → no net change (e.g. precompile touched but not modified): skip.
+	//   • len(postVal) == 0  → account deleted (SELFDESTRUCT / EIP-161): record in deletedAddrs.
+	// Geth compares two state roots by trie walk, so deleted accounts never appear in its output.
 	deletedAddrs := make(map[common.Address]struct{})
 	accIt, err := tx.HistoryRange(kv.AccountsDomain, int(startTxNum), int(endTxNum), order.Asc, kv.Unlim)
 	if err != nil {
@@ -371,6 +419,8 @@ func getModifiedAccounts(tx kv.TemporalTx, startTxNum, endTxNum uint64) ([]commo
 		if err != nil {
 			return nil, err
 		}
+		// ok==false (key not found at endTxNum) yields postVal==nil, so len(postVal)==0.
+		// That correctly maps to "deleted" — a key absent from the end state was removed.
 		postVal, _, err := tx.GetAsOf(kv.AccountsDomain, k, endTxNum)
 		if err != nil {
 			return nil, err
@@ -386,6 +436,19 @@ func getModifiedAccounts(tx kv.TemporalTx, startTxNum, endTxNum uint64) ([]commo
 	}
 
 	// Pass 2 – StorageDomain (key = address 20B + slot 32B).
+	// In Geth, every storage write changes storageRoot in the account record, so storage-only
+	// modified contracts appear automatically in the trie diff. In Erigon's flat model we must
+	// check StorageDomain separately.
+	//
+	// Filters (in cheapest-first order to minimise GetAsOf calls):
+	//   1. Already in result → skip immediately (no I/O).
+	//   2. In deletedAddrs  → skip immediately (no I/O).
+	//   3. GetAsOf(Storage) to detect net no-change slots (the only remaining I/O per slot).
+	//
+	// We do NOT need GetAsOf(Account) here: a destroyed account cannot execute code, so it
+	// cannot produce storage history entries. The only exception — CREATE2 re-deployment at
+	// the same address — causes an AccountsDomain entry (code hash changes) and thus the
+	// address would already be in `saw` (filter 1).
 	storIt, err := tx.HistoryRange(kv.StorageDomain, int(startTxNum), int(endTxNum), order.Asc, kv.Unlim)
 	if err != nil {
 		return nil, err
@@ -467,6 +530,9 @@ func (api *DebugAPIImpl) GetModifiedAccountsByHash(ctx context.Context, startHas
 		return nil, fmt.Errorf("start block (%d) must be less than end block (%d)", startNum, endNum)
 	}
 
+	// Checking startNum+1 is sufficient under sequential-pruning semantics: if block N is
+	// available, all blocks > N are too. If pruning semantics ever change this would need
+	// to also check endNum.
 	if err = api.BaseAPI.checkPruneHistory(ctx, tx, startNum+1); err != nil {
 		return nil, err
 	}
@@ -696,8 +762,8 @@ func (api *DebugAPIImpl) GetBadBlocks(ctx context.Context) ([]map[string]any, er
 		}
 		results = append(results, map[string]any{
 			"hash":  block.Hash(),
-			"block": blockRlp,
-			"rlp":   blockJson,
+			"block": blockJson,
+			"rlp":   blockRlp,
 		})
 	}
 

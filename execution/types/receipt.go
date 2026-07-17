@@ -232,7 +232,7 @@ func (r *Receipt) decodePayload(s *rlp.Stream) error {
 		return fmt.Errorf("read PostStateOrStatus: %w", err)
 	}
 	r.setStatus(b)
-	if r.CumulativeGasUsed, err = s.Uint(); err != nil {
+	if r.CumulativeGasUsed, err = s.Uint64(); err != nil {
 		return fmt.Errorf("read CumulativeGasUsed: %w", err)
 	}
 	if err = s.ReadBytes(r.Bloom[:]); err != nil {
@@ -254,15 +254,12 @@ func (r *Receipt) decodePayload(s *rlp.Stream) error {
 		if _, err = s.List(); err != nil {
 			return fmt.Errorf("open Topics: %w", err)
 		}
-		for b, err = s.Bytes(); err == nil; b, err = s.Bytes() {
-			log.Topics = append(log.Topics, common.Hash{})
-			if len(b) != 32 {
-				return fmt.Errorf("wrong size for Topic: %d", len(b))
+		for s.MoreDataInList() {
+			var topic common.Hash
+			if err = s.ReadBytes(topic[:]); err != nil {
+				return fmt.Errorf("read Topic: %w", err)
 			}
-			copy(log.Topics[len(log.Topics)-1][:], b)
-		}
-		if !errors.Is(err, rlp.EOL) {
-			return fmt.Errorf("read Topic: %w", err)
+			log.Topics = append(log.Topics, topic)
 		}
 		// end of Topics list
 		if err = s.ListEnd(); err != nil {
@@ -306,7 +303,10 @@ func (r *Receipt) DecodeRLP(s *rlp.Stream) error {
 		// EIP-2718 typed txn receipt. Read the envelope as raw bytes,
 		// then decode from them using a fresh stream.
 		if size == 0 {
-			return rlp.EOL
+			// Empty string is not a valid typed receipt. Return a real error
+			// rather than rlp.EOL: as a slice element EOL would be read as
+			// end-of-list and silently drop the receipt.
+			return errShortTypedReceipt
 		}
 		b := make([]byte, size)
 		if err = s.ReadBytes(b); err != nil {
@@ -315,8 +315,7 @@ func (r *Receipt) DecodeRLP(s *rlp.Stream) error {
 		r.Type = b[0]
 		switch r.Type {
 		case AccessListTxType, DynamicFeeTxType, BlobTxType, SetCodeTxType:
-			inner := rlp.NewStreamFromPool(b[1:])
-			defer inner.Release()
+			inner := rlp.NewStream(bytes.NewReader(b[1:]), uint64(len(b)-1))
 			if err := r.decodePayload(inner); err != nil {
 				return err
 			}
@@ -492,7 +491,7 @@ func (rs Receipts) AssertLogIndex(blockNum uint64) {
 		return
 	}
 	logIndex := 0
-	seen := make(map[uint]struct{}, 16)
+	seen := make(map[hexutil.Uint]struct{}, 16)
 	for _, r := range rs {
 		// ensure valid field
 		if logIndex != int(r.FirstLogIndexWithinBlock) {
@@ -569,11 +568,11 @@ func (r *Receipt) DeriveFieldsV3ForSingleReceipt(txnIdx int, blockHash common.Ha
 
 	// The derived log fields can simply be set from the block and transaction
 	for j := 0; j < len(r.Logs); j++ {
-		r.Logs[j].BlockNumber = blockNum
+		r.Logs[j].BlockNumber = hexutil.Uint64(blockNum)
 		r.Logs[j].BlockHash = blockHash
 		r.Logs[j].TxHash = r.TxHash
-		r.Logs[j].TxIndex = uint(txnIdx)
-		r.Logs[j].Index = uint(logIndex)
+		r.Logs[j].TxIndex = hexutil.Uint(txnIdx)
+		r.Logs[j].Index = hexutil.Uint(logIndex)
 		logIndex++
 	}
 	return nil
@@ -590,11 +589,11 @@ func (r *Receipt) DeriveFieldsV4ForCachedReceipt(blockHash common.Hash, blockNum
 
 	// The derived log fields can simply be set from the block and transaction
 	for j := 0; j < len(r.Logs); j++ {
-		r.Logs[j].BlockNumber = blockNum
+		r.Logs[j].BlockNumber = hexutil.Uint64(blockNum)
 		r.Logs[j].BlockHash = r.BlockHash
 		r.Logs[j].TxHash = r.TxHash
-		r.Logs[j].TxIndex = r.TransactionIndex
-		r.Logs[j].Index = uint(logIndex)
+		r.Logs[j].TxIndex = hexutil.Uint(r.TransactionIndex)
+		r.Logs[j].Index = hexutil.Uint(logIndex)
 		logIndex++
 	}
 	if calcBloom {

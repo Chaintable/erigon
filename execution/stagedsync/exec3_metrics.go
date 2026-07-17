@@ -99,7 +99,6 @@ var (
 
 	mxCommitmentTransactions            = metrics.NewGauge(`commit_txns`)
 	mxCommitmentBlocks                  = metrics.NewGauge("commit_blocks")
-	mxCommitmentMGasSec                 = metrics.NewGauge(`commit_mgas_sec`)
 	mxCommitmentBlockDuration           = metrics.NewGauge("commit_block_dur")
 	mxCommitmentReadRate                = metrics.NewGauge("commit_read_rate")
 	mxCommitmentAccountReadRate         = metrics.NewGauge("commit_account_read_rate")
@@ -209,7 +208,7 @@ func resetCommitmentGauges(ctx context.Context) {
 		commitResetTask.Timer = time.NewTimer(resetDelay)
 		commitResetTask.ctx = ctx
 		commitResetTask.gauges = []metrics.Gauge{
-			mxCommitmentTransactions, mxCommitmentBlocks, mxCommitmentMGasSec, mxCommitmentBlockDuration,
+			mxCommitmentTransactions, mxCommitmentBlocks, mxCommitmentBlockDuration,
 		}
 		commitResetTask.run(ctx)
 	}
@@ -257,7 +256,9 @@ func updateExecDomainMetrics(metrics *changeset.DomainMetrics, prevMetrics *chan
 	defer metrics.RUnlock()
 
 	if prevMetrics == nil {
-		prevMetrics = &changeset.DomainMetrics{}
+		prevMetrics = &changeset.DomainMetrics{
+			Domains: map[kv.Domain]*changeset.DomainIOMetrics{},
+		}
 	}
 
 	seconds := interval.Seconds()
@@ -288,10 +289,10 @@ func updateExecDomainMetrics(metrics *changeset.DomainMetrics, prevMetrics *chan
 
 	prevMetrics.DomainIOMetrics = metrics.DomainIOMetrics
 
-	if accountMetrics := metrics.Domains[kv.AccountsDomain]; accountMetrics != nil {
+	if accountMetrics, ok := metrics.Domains[kv.AccountsDomain]; ok {
 		var prevAccountMetrics changeset.DomainIOMetrics
 
-		if prev := prevMetrics.Domains[kv.AccountsDomain]; prev != nil {
+		if prev, ok := prevMetrics.Domains[kv.AccountsDomain]; ok {
 			prevAccountMetrics = *prev
 		}
 
@@ -325,10 +326,10 @@ func updateExecDomainMetrics(metrics *changeset.DomainMetrics, prevMetrics *chan
 		prevMetrics.Domains[kv.AccountsDomain] = &prevAccountMetrics
 	}
 
-	if storageMetrics := metrics.Domains[kv.StorageDomain]; storageMetrics != nil {
+	if storageMetrics, ok := metrics.Domains[kv.StorageDomain]; ok {
 		var prevStorageMetrics changeset.DomainIOMetrics
 
-		if prev := prevMetrics.Domains[kv.StorageDomain]; prev != nil {
+		if prev, ok := prevMetrics.Domains[kv.StorageDomain]; ok {
 			prevStorageMetrics = *prev
 		}
 
@@ -362,10 +363,10 @@ func updateExecDomainMetrics(metrics *changeset.DomainMetrics, prevMetrics *chan
 		prevMetrics.Domains[kv.StorageDomain] = &prevStorageMetrics
 	}
 
-	if codeMetrics := metrics.Domains[kv.CodeDomain]; codeMetrics != nil && executing {
+	if codeMetrics, ok := metrics.Domains[kv.CodeDomain]; ok && executing {
 		var prevCodeMetrics changeset.DomainIOMetrics
 
-		if prev := prevMetrics.Domains[kv.CodeDomain]; prev != nil {
+		if prev, ok := prevMetrics.Domains[kv.CodeDomain]; ok {
 			prevCodeMetrics = *prev
 		}
 
@@ -397,10 +398,10 @@ func updateExecDomainMetrics(metrics *changeset.DomainMetrics, prevMetrics *chan
 		prevMetrics.Domains[kv.CodeDomain] = &prevCodeMetrics
 	}
 
-	if commitmentMetrics := metrics.Domains[kv.CommitmentDomain]; commitmentMetrics != nil && !executing {
+	if commitmentMetrics, ok := metrics.Domains[kv.CommitmentDomain]; !executing && ok {
 		var prevCommitmentMetrics changeset.DomainIOMetrics
 
-		if prev := prevMetrics.Domains[kv.CommitmentDomain]; prev != nil {
+		if prev, ok := prevMetrics.Domains[kv.CommitmentDomain]; ok {
 			prevCommitmentMetrics = *prev
 		}
 
@@ -453,11 +454,6 @@ func NewProgress(initialBlockNum, initialTxNum, commitThreshold uint64, updateMe
 }
 
 type Progress struct {
-	// mu protects all prev* fields accessed concurrently from the commit-logger
-	// goroutine (func1.2 inside parallelExecutor.exec) and the outer exec()
-	// function after pe.wait() returns. The commit-logger goroutine may still
-	// be running when the outer exec calls LogCommitments for the final summary.
-	mu                             sync.Mutex
 	initialTime                    time.Time
 	initialTxNum                   uint64
 	initialBlockNum                uint64
@@ -486,7 +482,7 @@ type Progress struct {
 	prevCommitTime                 time.Time
 	prevCommittedBlockNum          uint64
 	prevCommittedTxNum             uint64
-	prevCommittedGas               int64
+	prevCommitLogGas               int64
 	prevCommitmentKeyCount         uint64
 	prevCommitmentAccountKeyCount  uint64
 	prevCommitmentStorageKeyCount  uint64
@@ -502,7 +498,7 @@ type Progress struct {
 
 type executor interface {
 	LogExecution()
-	LogCommitments(commitStart time.Time, committedBlocks uint64, committedTransactions uint64, committedGas uint64, stepsInDb float64, lastProgress commitment.CommitProgress)
+	LogCommitments(committedTransactions uint64, stepsInDb float64, lastProgress commitment.CommitProgress)
 	LogComplete(stepsInDb float64)
 }
 
@@ -727,10 +723,7 @@ func (p *Progress) LogExecution(rs *state.StateV3, ex executor) {
 	}
 }
 
-func (p *Progress) LogCommitments(rs *state.StateV3, ex executor, commitStart time.Time, stepsInDb float64, lastProgress commitment.CommitProgress) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
+func (p *Progress) LogCommitments(rs *state.StateV3, ex executor, stepsInDb float64, lastProgress commitment.CommitProgress) {
 	var te *txExecutor
 	var suffix string
 
@@ -744,14 +737,11 @@ func (p *Progress) LogCommitments(rs *state.StateV3, ex executor, commitStart ti
 		suffix = " serial"
 	}
 
-	if p.prevCommitTime.Before(commitStart) {
-		p.prevCommitTime = commitStart
-	}
-
 	currentTime := time.Now()
 	interval := currentTime.Sub(p.prevCommitTime)
 
-	committedGasSec := uint64(float64(te.committedGas.Load()-p.prevCommittedGas) / interval.Seconds())
+	executedGas := te.executedGas.Load()
+	gasSec := uint64(float64(executedGas-p.prevCommitLogGas) / interval.Seconds())
 	var committedTxSec uint64
 	if te.lastCommittedTxNum.Load() > p.prevCommittedTxNum {
 		committedTxSec = uint64(float64(te.lastCommittedTxNum.Load()-p.prevCommittedTxNum) / interval.Seconds())
@@ -772,6 +762,12 @@ func (p *Progress) LogCommitments(rs *state.StateV3, ex executor, commitStart ti
 	storageReadCount := lastProgress.Metrics.LoadStorage
 	branchReadCount := lastProgress.Metrics.LoadBranch
 	branchWriteCount := lastProgress.Metrics.UpdateBranch
+	cacheBranchHits := lastProgress.Metrics.CacheBranch
+	cacheAccountHits := lastProgress.Metrics.CacheAccount
+	cacheStorageHits := lastProgress.Metrics.CacheStorage
+	missBranchCount := lastProgress.Metrics.MissBranch
+	missAccountCount := lastProgress.Metrics.MissAccount
+	missStorageCount := lastProgress.Metrics.MissStorage
 	lastProgress.Metrics.RUnlock()
 
 	curKeyCount := int64(keyCount - p.prevCommitmentKeyCount)
@@ -798,19 +794,23 @@ func (p *Progress) LogCommitments(rs *state.StateV3, ex executor, commitStart ti
 	mxCommitmentBrancgWriteRate.SetUint64(curBranchWriteRate)
 
 	mxCommitmentTransactions.Set(float64(committedTxSec))
-	mxCommitmentMGasSec.Set(float64(committedGasSec / 1e6))
+	mxCommitmentBlocks.Set(float64(committedDiffBlocks))
 	mxCommitmentBlockDuration.Set(float64(commitedBlockDur))
+
+	totalCacheHits := cacheBranchHits + cacheAccountHits + cacheStorageHits
+	totalCacheMisses := missBranchCount + missAccountCount + missStorageCount
 
 	rs.Domains().Metrics().RLock()
 	commitVals := []any{
 		"bdur", common.Round(commitedBlockDur, 0),
 		"progress", fmt.Sprintf("%s/%s", common.PrettyCounter(lastProgress.KeyIndex), common.PrettyCounter(lastProgress.UpdateCount)),
 		"buf", common.ByteCount(uint64(rs.Domains().Metrics().CachePutSize + rs.Domains().Metrics().CacheGetSize)),
+		"chit", common.PrettyCounter(totalCacheHits), "cmiss", common.PrettyCounter(totalCacheMisses),
 	}
 	rs.Domains().Metrics().RUnlock()
 
 	p.log("committed", suffix, te, rs, interval, te.lastCommittedBlockNum.Load(), committedDiffBlocks,
-		te.lastCommittedTxNum.Load()-p.prevCommittedTxNum, committedTxSec, committedGasSec, 0, stepsInDb, commitVals)
+		te.lastCommittedTxNum.Load()-p.prevCommittedTxNum, committedTxSec, gasSec, 0, stepsInDb, commitVals)
 
 	p.prevDomainMetrics = updateExecDomainMetrics(te.doms.Metrics(), p.prevDomainMetrics, interval, false)
 
@@ -818,7 +818,7 @@ func (p *Progress) LogCommitments(rs *state.StateV3, ex executor, commitStart ti
 
 	if te.lastCommittedTxNum.Load() > 0 {
 		p.prevCommittedTxNum = te.lastCommittedTxNum.Load()
-		p.prevCommittedGas = te.committedGas.Load()
+		p.prevCommitLogGas = executedGas
 		p.prevCommittedBlockNum = te.lastCommittedBlockNum.Load()
 	}
 }
@@ -916,7 +916,6 @@ func (p *Progress) log(mode string, suffix string, te *txExecutor, rs *state.Sta
 		"alloc", common.ByteCount(m.Alloc),
 		"sys", common.ByteCount(m.Sys),
 		"isForkValidation", te.isForkValidation,
-		"isBlockProduction", te.isBlockProduction,
 		"isApplyingBlocks", te.isApplyingBlocks,
 	}...)
 

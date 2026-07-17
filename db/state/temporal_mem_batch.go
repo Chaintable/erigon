@@ -25,7 +25,6 @@ import (
 	"sort"
 	"strings"
 	"sync"
-	"unsafe"
 
 	btree2 "github.com/tidwall/btree"
 
@@ -35,9 +34,17 @@ import (
 	"github.com/erigontech/erigon/db/state/changeset"
 )
 
+type iodir int
+
+const (
+	get iodir = iota
+	put
+)
+
 type dataWithTxNum struct {
 	data  []byte
 	txNum uint64
+	dir   iodir
 }
 
 // TemporalMemBatch - temporal read-write interface - which storing updates in RAM. Don't forget to call `.Flush()`
@@ -65,7 +72,13 @@ type TemporalMemBatch struct {
 	pastForkableWriters map[kv.ForkableId][]kv.BufferedWriter
 
 	currentChangesAccumulator *changeset.StateChangeSet
-	pastChangesAccumulator    map[string]*changeset.StateChangeSet
+	// pastChangesAccumulator is read by the parallel commitment calculator
+	// goroutine (via SharedDomains.GetChangesetByBlockNum) while the exec
+	// loop writes to it (via SavePastChangesetAccumulator). pastChangesLock
+	// serializes those accesses so map-iteration during GetChangesetByBlockNum
+	// doesn't race with map-write during SavePastChangesetAccumulator.
+	pastChangesLock        sync.RWMutex
+	pastChangesAccumulator map[string]*changeset.StateChangeSet
 
 	unwindToTxNum uint64
 	// unwindChangeset is keyed by the pre-step portion of each entry's Key
@@ -114,15 +127,16 @@ func NewTemporalMemBatch(tx kv.TemporalTx, ioMetrics any) *TemporalMemBatch {
 }
 
 func (sd *TemporalMemBatch) SetInMemHistoryReads(v bool) { sd.inMemHistoryReads = v }
+func (sd *TemporalMemBatch) InMemHistoryReads() bool     { return sd.inMemHistoryReads }
 
 func (sd *TemporalMemBatch) DomainPut(domain kv.Domain, k string, v []byte, txNum uint64, preval []byte) error {
 	sd.putLatest(domain, k, v, txNum)
-	return sd.putHistory(domain, toBytesZeroCopy(k), v, txNum, preval)
+	return sd.putHistory(domain, common.ToBytesZeroCopy(k), v, txNum, preval)
 }
 
 func (sd *TemporalMemBatch) DomainDel(domain kv.Domain, k string, txNum uint64, preval []byte) error {
 	sd.putLatest(domain, k, nil, txNum)
-	return sd.putHistory(domain, toBytesZeroCopy(k), nil, txNum, preval)
+	return sd.putHistory(domain, common.ToBytesZeroCopy(k), nil, txNum, preval)
 }
 
 func (sd *TemporalMemBatch) putHistory(domain kv.Domain, k, v []byte, txNum uint64, preval []byte) error {
@@ -143,7 +157,7 @@ func (sd *TemporalMemBatch) putLatest(domain kv.Domain, key string, val []byte, 
 		sd.metrics.CachePutSize += putKeySize + putValueSize
 		sd.metrics.CachePutKeySize += putKeySize
 		sd.metrics.CachePutValueSize += putValueSize
-		if dm := sd.metrics.Domains[domain]; dm != nil {
+		if dm, ok := sd.metrics.Domains[domain]; ok {
 			dm.CachePutCount++
 			dm.CachePutSize += putKeySize + putValueSize
 			dm.CachePutKeySize += putKeySize
@@ -209,35 +223,43 @@ func (sd *TemporalMemBatch) GetLatest(domain kv.Domain, key []byte) (v []byte, s
 // The caller must already hold latestStateLock (either RLock or Lock),
 // e.g. from within an IteratePrefix callback.
 func (sd *TemporalMemBatch) getLatest(domain kv.Domain, key []byte) (v []byte, step kv.Step, ok bool) {
-	keyS := toStringZeroCopy(key)
+	var unwoundLatest = func(domain kv.Domain, key string) (v []byte, step kv.Step, ok bool) {
+		if sd.unwindChangeset != nil {
+			if values := sd.unwindChangeset[domain]; values != nil {
+				if value, ok := values[key]; ok {
+					keyStep := kv.Step(^binary.BigEndian.Uint64([]byte(value.Key[len(value.Key)-8:])))
 
+					if value.Value == nil {
+						// Different step: the entry at this step was deleted, key doesn't exist here
+						return nil, keyStep, false
+					}
+					// Same step: restore this value
+					return value.Value, keyStep, true
+				}
+			}
+		}
+
+		return nil, 0, false
+	}
+
+	keyS := common.ToStringZeroCopy(key)
 	var dataWithTxNums []dataWithTxNum
 	if domain == kv.StorageDomain {
 		dataWithTxNums, ok = sd.storage.Get(keyS)
-	} else {
-		dataWithTxNums, ok = sd.domains[domain][keyS]
-	}
-	if ok {
-		d := dataWithTxNums[len(dataWithTxNums)-1]
-		return d.data, kv.Step(d.txNum / sd.stepSize), true
+		if !ok {
+			return unwoundLatest(domain, keyS)
+		}
+		dataWithTxNum := dataWithTxNums[len(dataWithTxNums)-1]
+		return dataWithTxNum.data, kv.Step(dataWithTxNum.txNum / sd.stepSize), ok
+
 	}
 
-	// Fast path: no unwind in progress (common case)
-	if sd.unwindChangeset == nil {
-		return nil, 0, false
+	dataWithTxNums, ok = sd.domains[domain][keyS]
+	if !ok {
+		return unwoundLatest(domain, keyS)
 	}
-	if values := sd.unwindChangeset[domain]; values != nil {
-		if value, ok2 := values[keyS]; ok2 {
-			keyStep := kv.Step(^binary.BigEndian.Uint64([]byte(value.Key[len(value.Key)-8:])))
-			if value.Value == nil {
-				// Different step: the entry at this step was deleted, key doesn't exist here
-				return nil, keyStep, false
-			}
-			// Same step: restore this value
-			return value.Value, keyStep, true
-		}
-	}
-	return nil, 0, false
+	dataWithTxNum := dataWithTxNums[len(dataWithTxNums)-1]
+	return dataWithTxNum.data, kv.Step(dataWithTxNum.txNum / sd.stepSize), ok
 }
 
 func (sd *TemporalMemBatch) GetAsOf(domain kv.Domain, key []byte, ts uint64) (v []byte, ok bool, err error) {
@@ -247,31 +269,59 @@ func (sd *TemporalMemBatch) GetAsOf(domain kv.Domain, key []byte, ts uint64) (v 
 	sd.latestStateLock.RLock()
 	defer sd.latestStateLock.RUnlock()
 
-	keyS := toStringZeroCopy(key)
+	// unwoundLatest returns the pre-unwound-block value for a key that was
+	// modified by the unwound block. Only fires when ts is at-or-after the
+	// unwind point — for ts < unwindToTxNum the caller falls through to the
+	// underlying tx (chain DB / files) which holds the older committed value
+	// that was never unwound. Without this fallback, when the unwound block's
+	// writes were already committed to chain DB before the in-memory unwind
+	// the chain DB still holds the post-change value, and the commitment
+	// calculator's asOfStateReader (committer.go) reads those stale values
+	// for unwound keys and computes a wrong trie root.
+	unwoundLatest := func(domain kv.Domain, key string) (v []byte, ok bool, err error) {
+		if sd.unwindChangeset == nil || ts < sd.unwindToTxNum {
+			return nil, false, nil
+		}
+		values := sd.unwindChangeset[domain]
+		if values == nil {
+			return nil, false, nil
+		}
+		value, found := values[key]
+		if !found {
+			return nil, false, nil
+		}
+		if len(value.Value) == 0 {
+			// Pre-unwind state had no value at this key.
+			return nil, true, nil
+		}
+		return value.Value, true, nil
+	}
+
+	keyS := common.ToStringZeroCopy(key)
 	var dataWithTxNums []dataWithTxNum
 	if domain == kv.StorageDomain {
 		dataWithTxNums, ok = sd.storage.Get(keyS)
 		if !ok {
-			return nil, false, nil
+			return unwoundLatest(domain, keyS)
 		}
 		for i, dataWithTxNum := range dataWithTxNums {
 			if ts > dataWithTxNum.txNum && (i == len(dataWithTxNums)-1 || ts <= dataWithTxNums[i+1].txNum) {
 				return dataWithTxNum.data, true, nil
 			}
 		}
-		return nil, false, nil
+		return unwoundLatest(domain, keyS)
 	}
 
 	dataWithTxNums, ok = sd.domains[domain][keyS]
 	if !ok {
-		return nil, false, nil
+		return unwoundLatest(domain, keyS)
 	}
 	for i, dataWithTxNum := range dataWithTxNums {
 		if ts > dataWithTxNum.txNum && (i == len(dataWithTxNums)-1 || ts <= dataWithTxNums[i+1].txNum) {
 			return dataWithTxNum.data, true, nil
 		}
 	}
-	return nil, false, nil
+	return unwoundLatest(domain, keyS)
 }
 
 func (sd *TemporalMemBatch) SizeEstimate() uint64 {
@@ -298,7 +348,12 @@ func (sd *TemporalMemBatch) ClearRam() {
 	sd.metrics.CachePutSize = 0
 	sd.metrics.CachePutKeySize = 0
 	sd.metrics.CachePutValueSize = 0
-	sd.metrics.Domains = [kv.DomainLen]*changeset.DomainIOMetrics{}
+	for _, dm := range sd.metrics.Domains {
+		dm.CachePutCount = 0
+		dm.CachePutSize = 0
+		dm.CachePutKeySize = 0
+		dm.CachePutValueSize = 0
+	}
 }
 
 func (sd *TemporalMemBatch) IteratePrefix(domain kv.Domain, prefix []byte, roTx kv.Tx, it func(k []byte, v []byte) (cont bool, err error)) error {
@@ -309,7 +364,32 @@ func (sd *TemporalMemBatch) IteratePrefix(domain kv.Domain, prefix []byte, roTx 
 		ramIter = sd.storage.Iter()
 	}
 
-	return AggTx(roTx).d[domain].debugIteratePrefixLatest(prefix, ramIter, it, roTx)
+	// Wrap the callback to respect sd.unwindChangeset: when iterating the
+	// underlying tx + ramIter, the chain DB may still hold values written by
+	// blocks that were unwound in-memory but committed earlier. Without this
+	// wrapper, createContract's DomainDelPrefix sees the stale value via
+	// IteratePrefix and records it as the prev value in the new block's diff
+	// — which on the next unwind restores that stale value, masking a
+	// freshly-written same-value SSTORE as a no-op and producing a wrong
+	// trie root. See GetAsOf's unwoundLatest for the equivalent point-read
+	// fix.
+	wrappedIt := it
+	if sd.unwindChangeset != nil {
+		if values := sd.unwindChangeset[domain]; len(values) > 0 {
+			wrappedIt = func(k []byte, v []byte) (cont bool, err error) {
+				if entry, ok := values[common.ToStringZeroCopy(k)]; ok {
+					if len(entry.Value) == 0 {
+						// Pre-unwind state had no value at this key — skip it.
+						return true, nil
+					}
+					// Restore the pre-unwind value.
+					return it(k, entry.Value)
+				}
+				return it(k, v)
+			}
+		}
+	}
+	return AggTx(roTx).d[domain].debugIteratePrefixLatest(prefix, ramIter, wrappedIt, roTx)
 }
 
 func (sd *TemporalMemBatch) HasPrefix(domain kv.Domain, prefix []byte, roTx kv.Tx) ([]byte, []byte, bool, error) {
@@ -338,7 +418,7 @@ func (sd *TemporalMemBatch) HasPrefixInRAM(domain kv.Domain, prefix []byte) bool
 	defer sd.latestStateLock.RUnlock()
 
 	if domain == kv.StorageDomain {
-		prefixStr := unsafe.String(unsafe.SliceData(prefix), len(prefix))
+		prefixStr := common.ToStringZeroCopy(prefix)
 		iter := sd.storage.Iter()
 		for ok := iter.Seek(prefixStr); ok; ok = iter.Next() {
 			if !strings.HasPrefix(iter.Key(), prefixStr) {
@@ -352,7 +432,7 @@ func (sd *TemporalMemBatch) HasPrefixInRAM(domain kv.Domain, prefix []byte) bool
 		return false
 	}
 
-	prefixStr := unsafe.String(unsafe.SliceData(prefix), len(prefix))
+	prefixStr := common.ToStringZeroCopy(prefix)
 	for k, vals := range sd.domains[domain] {
 		if strings.HasPrefix(k, prefixStr) && len(vals) > 0 && len(vals[len(vals)-1].data) > 0 {
 			return true
@@ -376,19 +456,28 @@ func (sd *TemporalMemBatch) SetChangesetAccumulator(acc *changeset.StateChangeSe
 	}
 }
 func (sd *TemporalMemBatch) SavePastChangesetAccumulator(blockHash common.Hash, blockNumber uint64, acc *changeset.StateChangeSet) {
+	sd.pastChangesLock.Lock()
+	defer sd.pastChangesLock.Unlock()
 	if sd.pastChangesAccumulator == nil {
 		sd.pastChangesAccumulator = make(map[string]*changeset.StateChangeSet)
 	}
 	key := make([]byte, 40)
 	binary.BigEndian.PutUint64(key[:8], blockNumber)
 	copy(key[8:], blockHash[:])
-	sd.pastChangesAccumulator[toStringZeroCopy(key)] = acc
+	sd.pastChangesAccumulator[common.ToStringZeroCopy(key)] = acc
 }
 
 // GetChangesetByBlockNum returns the changeset for a given block number and its block hash.
+//
+// WARNING: ambiguous when pastChangesAccumulator holds multiple changesets for
+// the same block number (e.g. canonical + fork during a reorg-bounce test).
+// The first match in non-deterministic map iteration order is returned.
+// Prefer GetChangesetByHash when the caller has the block hash available.
 func (sd *TemporalMemBatch) GetChangesetByBlockNum(blockNumber uint64) (common.Hash, *changeset.StateChangeSet) {
+	sd.pastChangesLock.RLock()
+	defer sd.pastChangesLock.RUnlock()
 	for key, cs := range sd.pastChangesAccumulator {
-		keyBytes := toBytesZeroCopy(key)
+		keyBytes := common.ToBytesZeroCopy(key)
 		if binary.BigEndian.Uint64(keyBytes[:8]) == blockNumber {
 			blockHash := common.BytesToHash(keyBytes[8:])
 			return blockHash, cs
@@ -397,16 +486,34 @@ func (sd *TemporalMemBatch) GetChangesetByBlockNum(blockNumber uint64) (common.H
 	return common.Hash{}, nil
 }
 
+// GetChangesetByHash returns the changeset saved under the exact (blockNumber,
+// blockHash) key. Returns nil if not found. Use this in preference to
+// GetChangesetByBlockNum when both pieces of information are known —
+// pastChangesAccumulator can hold multiple changesets per block number after
+// a fork-bounce, and number-only lookups can return the wrong one
+// non-deterministically.
+func (sd *TemporalMemBatch) GetChangesetByHash(blockNumber uint64, blockHash common.Hash) *changeset.StateChangeSet {
+	var key [40]byte
+	binary.BigEndian.PutUint64(key[:8], blockNumber)
+	copy(key[8:], blockHash[:])
+	sd.pastChangesLock.RLock()
+	defer sd.pastChangesLock.RUnlock()
+	return sd.pastChangesAccumulator[common.ToStringZeroCopy(key[:])]
+}
+
 func (sd *TemporalMemBatch) GetDiffset(tx kv.RwTx, blockHash common.Hash, blockNumber uint64) ([kv.DomainLen][]kv.DomainEntryDiff, bool, error) {
 	var key [40]byte
 	binary.BigEndian.PutUint64(key[:8], blockNumber)
 	copy(key[8:], blockHash[:])
-	if changeset, ok := sd.pastChangesAccumulator[toStringZeroCopy(key[:])]; ok {
+	sd.pastChangesLock.RLock()
+	cs, ok := sd.pastChangesAccumulator[common.ToStringZeroCopy(key[:])]
+	sd.pastChangesLock.RUnlock()
+	if ok {
 		return [kv.DomainLen][]kv.DomainEntryDiff{
-			changeset.Diffs[kv.AccountsDomain].GetDiffSet(),
-			changeset.Diffs[kv.StorageDomain].GetDiffSet(),
-			changeset.Diffs[kv.CodeDomain].GetDiffSet(),
-			changeset.Diffs[kv.CommitmentDomain].GetDiffSet(),
+			cs.Diffs[kv.AccountsDomain].GetDiffSet(),
+			cs.Diffs[kv.StorageDomain].GetDiffSet(),
+			cs.Diffs[kv.CodeDomain].GetDiffSet(),
+			cs.Diffs[kv.CommitmentDomain].GetDiffSet(),
 		}, true, nil
 	}
 	return changeset.ReadDiffSet(tx, blockNumber, blockHash)
@@ -524,7 +631,7 @@ func (sd *TemporalMemBatch) Close() {
 	for _, iiWriter := range sd.iiWriters {
 		iiWriter.close()
 	}
-	for _, iiWriter := range sd.iiWriters {
+	for _, iiWriter := range sd.pastIIWriters {
 		iiWriter.close()
 	}
 	for _, fWriter := range sd.forkableWriters {
@@ -587,12 +694,22 @@ func (sd *TemporalMemBatch) Merge(o kv.TemporalMemBatch) error {
 		return fmt.Errorf("can't merge from batch with non-nil currentChangesAccumulator")
 	}
 
+	// Fixed lock order (receiver write-lock, then `other` read-lock).
+	// Callers must not interleave reciprocal Merge calls — i.e. never run
+	// a.Merge(b) and b.Merge(a) concurrently, which would deadlock here.
+	// In practice Merge runs single-threaded at stage commit / batch
+	// rollup, so this is a documented assumption rather than an enforced
+	// invariant.
+	sd.pastChangesLock.Lock()
+	other.pastChangesLock.RLock()
 	for key, changeSet := range other.pastChangesAccumulator {
 		if sd.pastChangesAccumulator == nil {
 			sd.pastChangesAccumulator = map[string]*changeset.StateChangeSet{}
 		}
 		sd.pastChangesAccumulator[key] = changeSet
 	}
+	other.pastChangesLock.RUnlock()
+	sd.pastChangesLock.Unlock()
 
 	if other.unwindChangeset != nil {
 		if sd.unwindChangeset == nil {
@@ -656,7 +773,9 @@ func (sd *TemporalMemBatch) Flush(ctx context.Context, tx kv.RwTx) error {
 				return sd.unwindChangesetRaw[domain][i].Key < sd.unwindChangesetRaw[domain][j].Key
 			})
 		}
-		tx.(kv.TemporalRwTx).Unwind(ctx, sd.unwindToTxNum, sd.unwindChangesetRaw)
+		if err := tx.(kv.TemporalRwTx).Unwind(ctx, sd.unwindToTxNum, sd.unwindChangesetRaw); err != nil {
+			return err
+		}
 	}
 
 	if err := sd.flushDiffSet(ctx, tx); err != nil {
@@ -673,8 +792,8 @@ func (sd *TemporalMemBatch) Flush(ctx context.Context, tx kv.RwTx) error {
 
 func (sd *TemporalMemBatch) flushDiffSet(_ context.Context, tx kv.RwTx) error {
 	for key, changeSet := range sd.pastChangesAccumulator {
-		blockNum := binary.BigEndian.Uint64(toBytesZeroCopy(key[:8]))
-		blockHash := common.BytesToHash(toBytesZeroCopy(key[8:]))
+		blockNum := binary.BigEndian.Uint64(common.ToBytesZeroCopy(key[:8]))
+		blockHash := common.BytesToHash(common.ToBytesZeroCopy(key[8:]))
 		if err := changeset.WriteDiffSet(tx, blockNum, blockHash, changeSet); err != nil {
 			return err
 		}
@@ -755,12 +874,3 @@ func AggTx(tx kv.Tx) *AggregatorRoTx {
 
 	return nil
 }
-
-func toStringZeroCopy(v []byte) string {
-	if len(v) == 0 {
-		return ""
-	}
-	return unsafe.String(&v[0], len(v))
-}
-
-func toBytesZeroCopy(s string) []byte { return unsafe.Slice(unsafe.StringData(s), len(s)) }

@@ -27,7 +27,6 @@ import (
 	"strings"
 	"time"
 
-	btree2 "github.com/tidwall/btree"
 	"golang.org/x/sync/errgroup"
 
 	"github.com/erigontech/erigon/common"
@@ -59,17 +58,11 @@ type History struct {
 	// dirtyFiles - list of ALL files - including: un-indexed-yet, garbage, merged-into-bigger-one, ...
 	// thread-safe, but maybe need 1 RWLock for all trees in Aggregator
 	//
-	// _visibleFiles derivative from field `file`, but without garbage:
-	//  - no files with `canDelete=true`
-	//  - no overlaps
-	//  - no un-indexed files (`power-off` may happen between .ef and .efi creation)
-	//
-	// BeginRo() using _visibleFiles in zero-copy way
-	dirtyFiles *btree2.BTreeG[*FilesItem]
-
-	// _visibleFiles - underscore in name means: don't use this field directly, use BeginFilesRo()
-	// underlying array is immutable - means it's ready for zero-copy use
-	_visibleFiles []visibleFile
+	// The visible view (derivative of dirtyFiles, without garbage: no `canDelete=true`,
+	// no overlaps, no un-indexed files) is computed by Aggregator into an immutable
+	// snapshot and published atomically via Aggregator.visible. BeginFilesRo opens
+	// readers against that snapshot in zero-copy way.
+	dirtyFiles *DirtyFiles
 
 	// _testBuildVIHook - test-only: called with the recsplit before the build loop in buildVI
 	_testBuildVIHook func(rs *recsplit.RecSplit)
@@ -82,9 +75,8 @@ func NewHistory(cfg statecfg.HistCfg, stepSize, stepsInFrozenFile uint64, dirs d
 	}
 
 	h := History{
-		HistCfg:       cfg,
-		dirtyFiles:    btree2.NewBTreeGOptions(filesItemLess, btree2.Options{Degree: 128, NoLocks: false}),
-		_visibleFiles: []visibleFile{},
+		HistCfg:    cfg,
+		dirtyFiles: newDirtyFiles(),
 	}
 
 	var err error
@@ -276,8 +268,8 @@ func (h *History) buildVI(ctx context.Context, historyIdxPath string, hist, efHi
 		h._testBuildVIHook(rs)
 	}
 
-	seq := &multiencseq.SequenceReader{}
-	it := &multiencseq.SequenceIterator{}
+	var seq multiencseq.SequenceReader
+	var it multiencseq.SequenceIterator
 
 	for {
 		histReader.Reset(0)
@@ -294,7 +286,7 @@ func (h *History) buildVI(ctx context.Context, historyIdxPath string, hist, efHi
 			// fmt.Printf("ef key %x\n", keyBuf)
 
 			seq.Reset(efBaseTxNum, valBuf)
-			it.Reset(seq, 0)
+			it.Reset(&seq, 0)
 			for it.HasNext() {
 				txNum, err := it.Next()
 				if err != nil {
@@ -362,7 +354,7 @@ func (h *History) Scan(toTxNum uint64) error {
 		return err
 	}
 
-	h.reCalcVisibleFiles(toTxNum)
+	//h.reCalcVisibleFiles(toTxNum) // TODO: what need here?
 
 	salt, err := GetStateIndicesSalt(h.dirs, false, h.logger)
 	if err != nil {
@@ -611,7 +603,7 @@ func (h *History) collate(ctx context.Context, step kv.Step, txFrom, txTo uint64
 		numBuf = make([]byte, 8)
 		// offsets: stores (txNum-baseTxNum) values; ETL delivers txNums sorted per key
 		// so no dedup/sort needed. Safe: collate covers exactly one step so values < stepSize < math.MaxUint32.
-		// Worst case: one key touched every txNum in the step → stepSize entries (390_625 × 4B ≈ 1.56 MB).
+		// Worst case: one key touched every txNum in the step → stepSize uint32 entries.
 		offsets    = make([]uint32, 0, 64)
 		prevEf     []byte
 		prevKey    []byte
@@ -686,6 +678,10 @@ func (h *History) collate(ctx context.Context, step kv.Step, txFrom, txTo uint64
 			return fmt.Errorf("add %s ef history val: %w", h.FilenameBase, err)
 		}
 
+		if k == nil { // sentinel flush: no next group to start
+			return nil
+		}
+
 		prevKey = append(prevKey[:0], k...)
 		txNum = binary.BigEndian.Uint64(v)
 		offsets = append(offsets[:0], uint32(txNum-baseTxNum))
@@ -742,9 +738,11 @@ func (sf HistoryFiles) CleanupOnError() {
 		sf.efExistence.Close()
 	}
 }
-func (h *History) reCalcVisibleFiles(toTxNum uint64) {
-	h._visibleFiles = calcVisibleFiles(h.dirtyFiles, h.Accessors, nil, false, toTxNum)
-	h.InvertedIndex.reCalcVisibleFiles(toTxNum)
+
+func (h *History) calcVisibleFiles(toTxNum uint64) (visibleFiles, *iiVisible) {
+	hv := calcVisibleFiles(h.dirtyFiles, h.Accessors, nil, false, toTxNum)
+	hiv := h.InvertedIndex.calcVisibleFiles(toTxNum)
+	return hv, hiv
 }
 
 // buildFiles performs potentially resource intensive operations of creating
@@ -914,17 +912,23 @@ type HistoryRoTx struct {
 	snappyReadBuffer []byte
 }
 
-func (h *History) BeginFilesRo() *HistoryRoTx {
-	files := h._visibleFiles
-	for i := 0; i < len(files); i++ {
-		if !files[i].src.frozen {
-			files[i].src.refcount.Add(1)
-		}
-	}
+func (h *History) beginForTests() *HistoryRoTx {
+	hv, hvi := h.calcVisibleFiles(h.dirtyFilesEndTxNumMinimax())
+	return h.beginFilesRo(hv, hvi)
+}
 
+// BeginFilesRoForDebug is the exported entry point for standalone debug tools
+// (cmd/integration) that open a bare History without an Aggregator. Production
+// code must go through Aggregator.BeginFilesRo so reads are opened from the
+// Aggregator-managed snapshot rather than directly from a standalone History.
+func (h *History) BeginFilesRoForDebug() *HistoryRoTx {
+	return h.beginForTests()
+}
+
+func (h *History) beginFilesRo(files visibleFiles, iv *iiVisible) *HistoryRoTx {
 	return &HistoryRoTx{
 		h:                 h,
-		iit:               h.InvertedIndex.BeginFilesRo(),
+		iit:               h.InvertedIndex.beginFilesRo(iv),
 		files:             files,
 		stepSize:          h.stepSize,
 		stepsInFrozenFile: h.stepsInFrozenFile,
@@ -955,7 +959,7 @@ func (ht *HistoryRoTx) statelessIdxReader(i int) *recsplit.IndexReader {
 	}
 	r := ht.readers[i]
 	if r == nil {
-		r = ht.files[i].src.index.GetReaderFromPool()
+		r = ht.files[i].src.index.Reader()
 		ht.readers[i] = r
 	}
 	return r
@@ -1096,7 +1100,7 @@ func (ht *HistoryRoTx) prune(ctx context.Context, rwTx kv.RwTx, txFrom, txTo, li
 		case *mdbx2.MdbxDupSortCursor:
 			valsCP = valsC.(*mdbx2.MdbxDupSortCursor)
 		default:
-			return nil, fmt.Errorf("unexpected cursor type %T for table %s", valsC, ht.h.ValuesTable)
+			valsCP = &kv.RwCursorPseudoDupSort{RwCursor: c}
 		}
 	}
 
@@ -1120,22 +1124,7 @@ func (ht *HistoryRoTx) Close() {
 	if ht.files == nil { // invariant: it's safe to call Close multiple times
 		return
 	}
-	files := ht.files
 	ht.files = nil
-	for i := 0; i < len(files); i++ {
-		src := files[i].src
-		if src == nil || src.frozen {
-			continue
-		}
-		refCnt := src.refcount.Add(-1)
-		//GC: last reader responsible to remove useles files: close it and delete
-		if refCnt == 0 && src.canDelete.Load() {
-			if traceFileLife != "" && ht.h.FilenameBase == traceFileLife {
-				ht.h.logger.Warn("[agg.dbg] real remove at HistoryRoTx.Close", "file", src.decompressor.FileName())
-			}
-			src.closeFilesAndRemove()
-		}
-	}
 	for _, r := range ht.readers {
 		r.Close()
 	}

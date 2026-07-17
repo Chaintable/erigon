@@ -97,22 +97,22 @@ type btSlotChanges struct {
 }
 
 type btStorageChange struct {
-	BlockAccessIndex hexutil.Uint16       `json:"blockAccessIndex"`
+	BlockAccessIndex hexutil.Uint32       `json:"blockAccessIndex"`
 	PostValue        math.HexOrDecimal256 `json:"postValue"`
 }
 
 type btBalanceChange struct {
-	BlockAccessIndex hexutil.Uint16       `json:"blockAccessIndex"`
+	BlockAccessIndex hexutil.Uint32       `json:"blockAccessIndex"`
 	PostBalance      math.HexOrDecimal256 `json:"postBalance"`
 }
 
 type btNonceChange struct {
-	BlockAccessIndex hexutil.Uint16      `json:"blockAccessIndex"`
+	BlockAccessIndex hexutil.Uint32      `json:"blockAccessIndex"`
 	PostNonce        math.HexOrDecimal64 `json:"postNonce"`
 }
 
 type btCodeChange struct {
-	BlockAccessIndex hexutil.Uint16 `json:"blockAccessIndex"`
+	BlockAccessIndex hexutil.Uint32 `json:"blockAccessIndex"`
 	NewCode          hexutil.Bytes  `json:"newCode"`
 }
 
@@ -137,7 +137,7 @@ func (bal btBlockAccessList) toBAL() types.BlockAccessList {
 			}
 			for _, change := range sc.SlotChanges {
 				slotChanges.Changes = append(slotChanges.Changes, &types.StorageChange{
-					Index: uint16(change.BlockAccessIndex),
+					Index: uint32(change.BlockAccessIndex),
 					Value: *uint256.MustFromBig((*big.Int)(&change.PostValue)),
 				})
 			}
@@ -148,19 +148,19 @@ func (bal btBlockAccessList) toBAL() types.BlockAccessList {
 		}
 		for _, bc := range ac.BalanceChanges {
 			entry.BalanceChanges = append(entry.BalanceChanges, &types.BalanceChange{
-				Index: uint16(bc.BlockAccessIndex),
+				Index: uint32(bc.BlockAccessIndex),
 				Value: *uint256.MustFromBig((*big.Int)(&bc.PostBalance)),
 			})
 		}
 		for _, nc := range ac.NonceChanges {
 			entry.NonceChanges = append(entry.NonceChanges, &types.NonceChange{
-				Index: uint16(nc.BlockAccessIndex),
+				Index: uint32(nc.BlockAccessIndex),
 				Value: uint64(nc.PostNonce),
 			})
 		}
 		for _, cc := range ac.CodeChanges {
 			entry.CodeChanges = append(entry.CodeChanges, &types.CodeChange{
-				Index:    uint16(cc.BlockAccessIndex),
+				Index:    uint32(cc.BlockAccessIndex),
 				Bytecode: cc.NewCode,
 			})
 		}
@@ -212,9 +212,16 @@ type btHeaderMarshaling struct {
 }
 
 func (bt *BlockTest) Run(t *testing.T) error {
+	_, err := bt.RunWithTester(t)
+	return err
+}
+
+// newTester builds the ExecModuleTester for this block test. tb may be nil for
+// CLI usage, in which case the caller owns the tester's lifecycle and MUST Close it.
+func (bt *BlockTest) newTester(tb testing.TB) (*execmoduletester.ExecModuleTester, error) {
 	config, ok := testforks.Forks[bt.json.Network]
 	if !ok {
-		return testforks.UnsupportedForkError{Name: bt.json.Network}
+		return nil, testforks.UnsupportedForkError{Name: bt.json.Network}
 	}
 	engine := rulesconfig.CreateRulesEngineBareBones(context.Background(), config, log.New())
 	mOpts := []execmoduletester.Option{
@@ -224,15 +231,21 @@ func (bt *BlockTest) Run(t *testing.T) error {
 	if bt.ExperimentalBAL {
 		mOpts = append(mOpts, execmoduletester.WithExperimentalBAL())
 	}
-	m := execmoduletester.New(t, mOpts...)
+	return execmoduletester.New(tb, mOpts...), nil
+}
 
+// runChecks imports the test blocks into m and validates the result against the
+// fixture (genesis, head block hash, post-state, imported headers).
+func (bt *BlockTest) runChecks(m *execmoduletester.ExecModuleTester) error {
 	bt.br = m.BlockReader
 	// import pre accounts & construct test genesis block & state root
-	if m.Genesis.Hash() != bt.json.Genesis.Hash {
-		return fmt.Errorf("genesis block hash doesn't match test: computed=%x, test=%x", m.Genesis.Hash().Bytes()[:6], bt.json.Genesis.Hash[:6])
+	genesisHash := m.Genesis.Hash()
+	if genesisHash != bt.json.Genesis.Hash {
+		return fmt.Errorf("genesis block hash doesn't match test: computed=%x, test=%x", genesisHash[:6], bt.json.Genesis.Hash[:6])
 	}
-	if m.Genesis.Root() != bt.json.Genesis.StateRoot {
-		return fmt.Errorf("genesis block state root does not match test: computed=%x, test=%x", m.Genesis.Root().Bytes()[:6], bt.json.Genesis.StateRoot[:6])
+	genesisRoot := m.Genesis.Root()
+	if genesisRoot != bt.json.Genesis.StateRoot {
+		return fmt.Errorf("genesis block state root does not match test: computed=%x, test=%x", genesisRoot[:6], bt.json.Genesis.StateRoot[:6])
 	}
 
 	validBlocks, err := bt.insertBlocks(m)
@@ -258,46 +271,37 @@ func (bt *BlockTest) Run(t *testing.T) error {
 	return bt.validateImportedHeaders(tx, validBlocks, m)
 }
 
+// RunWithTester runs the block test and returns the ExecModuleTester it built.
+// The returned tester's lifetime is bound to t (via t.Cleanup); callers MUST NOT Close it.
+func (bt *BlockTest) RunWithTester(t *testing.T) (*execmoduletester.ExecModuleTester, error) {
+	m, err := bt.newTester(t)
+	if err != nil {
+		return nil, err
+	}
+	if err := bt.runChecks(m); err != nil {
+		return nil, err
+	}
+	return m, nil
+}
+
+// RunWithTesterCLI is the CLI counterpart of RunWithTester: it builds the tester
+// with a nil testing.TB and returns it even on failure so the caller owns its
+// lifecycle and MUST Close it.
+func (bt *BlockTest) RunWithTesterCLI() (*execmoduletester.ExecModuleTester, error) {
+	m, err := bt.newTester(nil)
+	if err != nil {
+		return nil, err
+	}
+	return m, bt.runChecks(m)
+}
+
 // RunCLI executes the test without requiring a testing.T context, suitable for CLI usage.
 func (bt *BlockTest) RunCLI() error {
-	config, ok := testforks.Forks[bt.json.Network]
-	if !ok {
-		return testforks.UnsupportedForkError{Name: bt.json.Network}
+	m, err := bt.RunWithTesterCLI()
+	if m != nil {
+		defer m.Close()
 	}
-	engine := rulesconfig.CreateRulesEngineBareBones(context.Background(), config, log.New())
-	m := execmoduletester.New(nil, execmoduletester.WithGenesisSpec(bt.genesis(config)), execmoduletester.WithEngine(engine))
-	defer m.DB.Close()
-
-	bt.br = m.BlockReader
-	// import pre accounts & construct test genesis block & state root
-	if m.Genesis.Hash() != bt.json.Genesis.Hash {
-		return fmt.Errorf("genesis block hash doesn't match test: computed=%x, test=%x", m.Genesis.Hash().Bytes()[:6], bt.json.Genesis.Hash[:6])
-	}
-	if m.Genesis.Root() != bt.json.Genesis.StateRoot {
-		return fmt.Errorf("genesis block state root does not match test: computed=%x, test=%x", m.Genesis.Root().Bytes()[:6], bt.json.Genesis.StateRoot[:6])
-	}
-
-	validBlocks, err := bt.insertBlocks(m)
-	if err != nil {
-		return err
-	}
-
-	tx, err := m.DB.BeginTemporalRo(m.Ctx)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-
-	cmlast := rawdb.ReadHeadBlockHash(tx)
-	if common.Hash(bt.json.BestBlock) != cmlast {
-		return fmt.Errorf("last block hash validation mismatch: want: %x, have: %x", bt.json.BestBlock, cmlast)
-	}
-	newDB := state.New(m.NewStateReader(tx))
-	if err := bt.validatePostState(newDB); err != nil {
-		return fmt.Errorf("post state validation failed: %w", err)
-	}
-
-	return bt.validateImportedHeaders(tx, validBlocks, m)
+	return err
 }
 
 func (bt *BlockTest) genesis(config *chain.Config) *types.Genesis {
@@ -515,7 +519,7 @@ func (bt *BlockTest) validatePostState(statedb *state.IntraBlockState) error {
 			return fmt.Errorf("account balance mismatch for addr: %x, want: %d, have: %d", addr, acct.Balance, &balance2)
 		}
 		for loc, val := range acct.Storage {
-			val1 := uint256.NewInt(0).SetBytes(val.Bytes())
+			val1 := uint256.NewInt(0).SetBytes(val[:])
 			val2, _ := statedb.GetState(address, accounts.InternKey(loc))
 			if !val1.Eq(&val2) {
 				return fmt.Errorf("storage mismatch for addr: %x loc: %x want: %d have: %d", addr, loc, val1, &val2)

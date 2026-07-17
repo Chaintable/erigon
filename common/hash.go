@@ -33,10 +33,6 @@ var (
 	hashT = reflect.TypeFor[Hash]()
 )
 
-const (
-	hexPrefix = `0x`
-)
-
 // Hash represents the 32 byte Keccak256 hash of arbitrary data.
 type Hash [length.Hash]byte
 
@@ -66,9 +62,6 @@ func HexToHash(s string) Hash { return BytesToHash(hexutil.FromHex(s)) }
 func (h Hash) Cmp(other Hash) int {
 	return bytes.Compare(h[:], other[:])
 }
-
-// Bytes gets the byte representation of the underlying hash.
-func (h Hash) Bytes() []byte { return h[:] }
 
 // Big converts a hash to a big integer.
 func (h Hash) Big() *big.Int { return new(big.Int).SetBytes(h[:]) }

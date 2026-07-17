@@ -316,7 +316,7 @@ func TestGetBlockReceipts(t *testing.T) {
 		hashes = append(hashes, block.Hash())
 		// If known, encode and queue for response packet
 
-		r, err := receiptsGetter.GetReceipts(m.Ctx, m.ChainConfig, tx, block)
+		r, err := receiptsGetter.GetReceipts(m.Ctx, m.ChainConfig, tx, block, eth.ReceiptsOpts{})
 		require.NoError(t, err)
 		encoded, err := rlp.EncodeToBytes(r)
 		require.NoError(t, err)
@@ -350,7 +350,7 @@ func mockWithGenerator(t *testing.T, blocks int, generator func(int, *blockgen.B
 	m := execmoduletester.New(
 		t,
 		execmoduletester.WithGenesisSpec(&types.Genesis{
-			Config: chain.TestChainConfig,
+			Config: chain.TestChainBerlinConfig,
 			Alloc:  types.GenesisAlloc{testAddr: {Balance: big.NewInt(1000000)}},
 		}),
 		execmoduletester.WithKey(testKey),

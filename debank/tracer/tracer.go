@@ -71,7 +71,8 @@ func (bs *BlockStorageDiffMap) ToStateDiff(parrentRoot, root common.Hash) *dtype
 }
 
 func (bs *BlockStorageDiffMap) UpdateAccountData(address accounts.Address, original, account *accounts.Account) error {
-	addrhash := crypto.Keccak256Hash(address.Value().Bytes())
+	addr := address.Value()
+	addrhash := crypto.Keccak256Hash(addr[:])
 	delete(bs.DeletedAccounts, addrhash)
 	bs.NewAccounts[addrhash] = dtypes.NewAccount{
 		Address:  addrhash,
@@ -91,21 +92,23 @@ func (bs *BlockStorageDiffMap) UpdateAccountCode(address accounts.Address, incar
 }
 
 func (bs *BlockStorageDiffMap) DeleteAccount(address accounts.Address, original *accounts.Account) error {
-	addrhash := crypto.Keccak256Hash(address.Value().Bytes())
+	addr := address.Value()
+	addrhash := crypto.Keccak256Hash(addr[:])
 	delete(bs.NewAccounts, addrhash)
 	bs.DeletedAccounts[addrhash] = struct{}{}
 	return nil
 }
 
 func (bs *BlockStorageDiffMap) WriteAccountStorage(address accounts.Address, incarnation uint64, key accounts.StorageKey, original, value uint256.Int) error {
-	addrhash := crypto.Keccak256Hash(address.Value().Bytes())
+	addr := address.Value()
+	addrhash := crypto.Keccak256Hash(addr[:])
 	if _, ok := bs.StorageDiff[addrhash]; !ok {
 		bs.StorageDiff[addrhash] = make(map[common.Hash]*uint256.Int)
 	}
 	storageDiff := bs.StorageDiff[addrhash]
 	valueCopy := value.Clone()
 	keyValue := key.Value()
-	storageDiff[crypto.Keccak256Hash(keyValue.Bytes())] = valueCopy
+	storageDiff[crypto.Keccak256Hash(keyValue[:])] = valueCopy
 	bs.StorageChanges[address.Value()] = struct{}{}
 	return nil
 }
@@ -497,7 +500,7 @@ func GenesisAllocToStateDiff(genesisAlloc types.GenesisAlloc) *dtypes.BlockStora
 		for index, v := range acc.Storage {
 			value := uint256.NewInt(0)
 			if len(v) > 0 {
-				value = uint256.NewInt(0).SetBytes(v.Bytes())
+				value = uint256.NewInt(0).SetBytes(v[:])
 			}
 			values = append(values, dtypes.IndexValuePair{
 				Index: index,

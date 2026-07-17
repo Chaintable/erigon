@@ -51,6 +51,20 @@ func KeyToNibblizedHash(key []byte) []byte {
 	return nibblized
 }
 
+// NibblesToString returns a hex string representation of a nibble sequence.
+// Each nibble (0-15) is printed as a single hex character. Works for both
+// even and odd length sequences.
+func NibblesToString(nibbles []byte) string {
+	var b strings.Builder
+	b.Grow(len(nibbles))
+	for _, n := range nibbles {
+		b.WriteByte("0123456789abcdef"[n&0x0F])
+	}
+	return b.String()
+}
+
+// CompactKey takes a slice of nibbles and compacts them into the original byte slice.
+// It returns an error if the input contains invalid nibbles (values > 0xF).
 func CompactKey(nibbles []byte) ([]byte, error) {
 	// If the number of nibbles is odd, you might decide to handle it differently.
 	// For this example, we'll return an error.
