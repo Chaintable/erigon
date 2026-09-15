@@ -31,7 +31,6 @@ import (
 	"github.com/holiman/uint256"
 
 	"github.com/erigontech/erigon/common"
-	"github.com/erigontech/erigon/common/dbg"
 	"github.com/erigontech/erigon/common/hexutil"
 	"github.com/erigontech/erigon/common/length"
 	"github.com/erigontech/erigon/common/log/v3"
@@ -39,6 +38,7 @@ import (
 	"github.com/erigontech/erigon/db/kv/dbutils"
 	"github.com/erigontech/erigon/db/kv/rawdbv3"
 	"github.com/erigontech/erigon/db/kv/stream"
+	"github.com/erigontech/erigon/db/rawdb/rawtemporaldb"
 	"github.com/erigontech/erigon/db/rawdb/utils"
 	"github.com/erigontech/erigon/execution/rlp"
 	"github.com/erigontech/erigon/execution/types"
@@ -546,9 +546,14 @@ func RawTransactionsRange(db kv.Getter, from, to uint64) (res [][]byte, err erro
 		if err != nil {
 			return nil, err
 		}
+		if txCount <= 2 {
+			continue
+		}
 
-		binary.BigEndian.PutUint64(encNum, baseTxnID.U64())
-		if err = db.ForAmount(kv.EthTx, encNum, txCount, func(k, v []byte) error {
+		// TxCount counts the two system txns, which have no kv.EthTx entries;
+		// reading from the system slot drifts into neighbouring blocks' txns.
+		binary.BigEndian.PutUint64(encNum, baseTxnID.First())
+		if err = db.ForAmount(kv.EthTx, encNum, txCount-2, func(k, v []byte) error {
 			res = append(res, v)
 			return nil
 		}); err != nil {
@@ -622,7 +627,7 @@ func ReadSenders(db kv.Getter, hash common.Hash, number uint64) ([]common.Addres
 		return nil, fmt.Errorf("readSenders failed: %w", err)
 	}
 	senders := make([]common.Address, len(data)/length.Addr)
-	for i := 0; i < len(senders); i++ {
+	for i := range senders {
 		copy(senders[i][:], data[i*length.Addr:])
 	}
 	return senders, nil
@@ -891,7 +896,7 @@ func PruneBlocks(tx kv.RwTx, blockTo uint64, blocksDeleteLimit int) (deleted int
 		}
 		// Copying k because otherwise the same memory will be reused
 		// for the next key and Delete below will end up deleting 1 more record than required
-		kCopy := common.Copy(k)
+		kCopy := bytes.Clone(k)
 		if err = tx.Delete(kv.Senders, kCopy); err != nil {
 			return deleted, err
 		}
@@ -942,7 +947,7 @@ func TruncateBlocks(ctx context.Context, tx kv.RwTx, blockFrom uint64) error {
 		}
 		// Copying k because otherwise the same memory will be reused
 		// for the next key and Delete below will end up deleting 1 more record than required
-		kCopy := common.Copy(k)
+		kCopy := bytes.Clone(k)
 		if err := tx.Delete(kv.Senders, kCopy); err != nil {
 			return err
 		}
@@ -999,6 +1004,7 @@ func ReadHeaderByHash(db kv.Getter, hash common.Hash) (*types.Header, error) {
 	return ReadHeader(db, hash, *number), nil
 }
 
+// DeleteNewerEpochs drops [blockNum, ∞)
 func DeleteNewerEpochs(tx kv.RwTx, number uint64) error {
 	if err := tx.ForEach(kv.PendingEpoch, hexutil.EncodeTs(number), func(k, v []byte) error {
 		return tx.Delete(kv.PendingEpoch, k)
@@ -1247,7 +1253,7 @@ type RCacheV2Query struct {
 
 // doesn't do DeriveFieldsV4ForCachedReceipt
 func ReceiptCacheV2Stream(tx kv.TemporalTx, fromTxNum, toTxNum uint64) (stream.Duo[uint64, *types.Receipt], error) {
-	it, err := tx.Debug().TraceKey(kv.RCacheDomain, receiptCacheKey, fromTxNum, toTxNum)
+	it, err := tx.Debug().TraceKey(kv.RCacheDomain, rawtemporaldb.ReceiptCacheKey, fromTxNum, toTxNum)
 	if err != nil {
 		return nil, err
 	}
@@ -1270,7 +1276,7 @@ func ReceiptCacheV2Stream(tx kv.TemporalTx, fromTxNum, toTxNum uint64) (stream.D
 }
 
 func ReadReceiptCacheV2(tx kv.TemporalTx, query RCacheV2Query) (*types.Receipt, bool, error) {
-	v, ok, err := tx.HistorySeek(kv.RCacheDomain, receiptCacheKey, query.TxNum+1 /*history storing value BEFORE-change*/)
+	v, ok, err := tx.HistorySeek(kv.RCacheDomain, rawtemporaldb.ReceiptCacheKey, query.TxNum+1 /*history storing value BEFORE-change*/)
 	if err != nil {
 		return nil, false, err
 	}
@@ -1307,7 +1313,7 @@ func ReadReceiptsCacheV2(tx kv.TemporalTx, block *types.Block, txNumReader rawdb
 
 	receiptIdx := 0
 	for txNum := minTxNum; txNum < maxTxNum+1; txNum++ {
-		v, ok, err := tx.HistorySeek(kv.RCacheDomain, receiptCacheKey, txNum+1)
+		v, ok, err := tx.HistorySeek(kv.RCacheDomain, rawtemporaldb.ReceiptCacheKey, txNum+1)
 		if err != nil {
 			return nil, err
 		}
@@ -1343,43 +1349,6 @@ func ReadReceiptsCacheV2(tx kv.TemporalTx, block *types.Block, txNumReader rawdb
 }
 
 func WriteReceiptCacheV2(tx kv.TemporalPutDel, receipt *types.Receipt, txNum uint64) error {
-	var toWrite []byte
-
-	if receipt != nil {
-		if len(receipt.Logs) > 0 && int(receipt.FirstLogIndexWithinBlock) != int(receipt.Logs[0].Index) {
-			panic(fmt.Sprintf("assert: FirstLogIndexWithinBlock is wrong: %d %d, blockNum=%d", receipt.FirstLogIndexWithinBlock, receipt.Logs[0].Index, receipt.BlockNumber.Uint64()))
-		}
-
-		var err error
-		storageReceipt := (*types.ReceiptForStorage)(receipt)
-		toWrite, err = rlp.EncodeToBytes(storageReceipt)
-		if err != nil {
-			return fmt.Errorf("WriteReceiptCache: %w", err)
-		}
-		if dbg.AssertEnabled {
-			storageReceipt2 := &types.ReceiptForStorage{}
-			rlp.DecodeBytes(toWrite, storageReceipt2)
-			if storageReceipt.ContractAddress != storageReceipt2.ContractAddress {
-				panic(fmt.Sprintf("assert: %x, %x\n", storageReceipt.ContractAddress, storageReceipt2.ContractAddress))
-			}
-			if storageReceipt.FirstLogIndexWithinBlock != storageReceipt2.FirstLogIndexWithinBlock {
-				panic(fmt.Sprintf("assert: %x, %x\n", storageReceipt.FirstLogIndexWithinBlock, storageReceipt2.FirstLogIndexWithinBlock))
-			}
-			if storageReceipt.TransactionIndex != storageReceipt2.TransactionIndex {
-				panic(fmt.Sprintf("assert: TransactionIndex mismatch: %d, %d\n", storageReceipt.TransactionIndex, storageReceipt2.TransactionIndex))
-			}
-		}
-	} else {
-		toWrite = []byte{}
-	}
-
-	if err := tx.DomainPut(kv.RCacheDomain, receiptCacheKey, toWrite, txNum, nil); err != nil {
-		return fmt.Errorf("WriteReceiptCache: %w", err)
-	}
-
-	return nil
+	var w rawtemporaldb.ReceiptWriter
+	return w.Append(tx, receipt, txNum)
 }
-
-var (
-	receiptCacheKey = []byte{0x0}
-)

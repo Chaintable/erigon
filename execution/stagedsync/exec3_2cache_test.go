@@ -61,7 +61,7 @@ func setup2CacheTest(t *testing.T) (kv.TemporalRwTx, *execctx.SharedDomains) {
 	require.NoError(t, err)
 	t.Cleanup(agg.Close)
 
-	db, err := temporal.New(rawDb, agg)
+	db, err := temporal.New(rawDb, agg, nil)
 	require.NoError(t, err)
 
 	tx, err := db.BeginTemporalRw(context.Background()) //nolint:gocritic
@@ -114,6 +114,7 @@ func TestCrossBlockTimingRace(t *testing.T) {
 	baseReader := state.NewReaderV3(domains.AsGetter(tx))
 	bufferedRdr := state.NewBufferedReader(rs, baseReader)
 	ibsN1 := state.New(bufferedRdr)
+	defer ibsN1.Release(false)
 
 	// Must read block N's value from rs.accounts, not stale domains.
 	gotBal, err := ibsN1.GetBalance(addr)
@@ -129,6 +130,7 @@ func TestCrossBlockTimingRace(t *testing.T) {
 	// Sanity check: a plain domain reader (no buffering) still sees zero —
 	// the timing hole is real without rs.accounts.
 	ibsRaw := state.New(state.NewReaderV3(domains.AsGetter(tx)))
+	defer ibsRaw.Release(false)
 	rawBal, err := ibsRaw.GetBalance(addr)
 	require.NoError(t, err)
 	require.Equal(t, uint64(0), rawBal.Uint64(),
@@ -137,6 +139,7 @@ func TestCrossBlockTimingRace(t *testing.T) {
 	// Simulate ApplyStateWrites completing (domain apply catches up).
 	w := state.NewWriter(domains.AsPutDel(tx), nil, 5)
 	ibsApply := state.New(state.NewReaderV3(domains.AsGetter(tx)))
+	defer ibsApply.Release(false)
 	ibsApply.SetTxContext(1, 0)
 	err = ibsApply.SetBalance(addr, *uint256.NewInt(500), tracing.BalanceChangeUnspecified)
 	require.NoError(t, err)
@@ -147,6 +150,7 @@ func TestCrossBlockTimingRace(t *testing.T) {
 
 	// After domain apply, plain reader must see the correct value.
 	ibsRawAfter := state.New(state.NewReaderV3(domains.AsGetter(tx)))
+	defer ibsRawAfter.Release(false)
 	rawBalAfter, err := ibsRawAfter.GetBalance(addr)
 	require.NoError(t, err)
 	require.Equal(t, uint64(500), rawBalAfter.Uint64(),
@@ -216,4 +220,45 @@ func TestNotifyAccumulatorFromVersionedWrites(t *testing.T) {
 	require.Len(t, changes[0].Changes[0].StorageChanges, 1, "one StorageChange expected (no-op skipped)")
 	require.Equal(t, storageVal.Bytes(), changes[0].Changes[0].StorageChanges[0].Data,
 		"ChangeStorage must populate StorageChange.Data")
+}
+
+// A CREATE landing on an address that already holds committed storage must wipe
+// that storage before the new account is written, or the recreated contract
+// inherits slots from its predecessor. Pins the apply-side wipe itself: the
+// suite previously passed with `if d.createContract` disabled outright, so
+// nothing guarded the account-present branch of that clear.
+func TestApplyStateWritesCreateContractWipesCommittedStorage(t *testing.T) {
+	if testing.Short() {
+		t.Skip("requires mdbx")
+	}
+
+	tx, domains := setup2CacheTest(t)
+	rs := state.NewStateV3Buffered(state.NewStateV3(domains, false, log.New()))
+
+	addr := accounts.InternAddress(common.HexToAddress("0xc0ffee"))
+	addrVal := addr.Value()
+	seed := accounts.Account{Nonce: 1, Balance: *uint256.NewInt(7)}
+	require.NoError(t, domains.DomainPut(kv.AccountsDomain, tx, addrVal[:], accounts.SerialiseV3(&seed), 0, nil))
+
+	slotVal := common.HexToHash("0x01")
+	composite := append(append([]byte{}, addrVal[:]...), slotVal[:]...)
+	require.NoError(t, domains.DomainPut(kv.StorageDomain, tx, composite, []byte{0xaa}, 0, nil))
+
+	countSlots := func() int {
+		n := 0
+		require.NoError(t, domains.IteratePrefix(kv.StorageDomain, addrVal[:], tx, func(k, v []byte) (bool, error) {
+			n++
+			return true, nil
+		}))
+		return n
+	}
+	require.Equal(t, 1, countSlots(), "seeded storage must be visible before the create")
+
+	writes := newWS().
+		createContract(addr, state.Version{}, true).
+		nonce(addr, state.Version{}, 1).
+		build()
+	require.NoError(t, rs.ApplyStateWrites(context.Background(), tx, 1, 100, writes, nil, &chain.Rules{}, nil))
+
+	require.Zero(t, countSlots(), "CREATE over an existing account must clear its committed storage")
 }

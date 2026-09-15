@@ -287,7 +287,7 @@ func validAnchorEnvelopeFixture(t *testing.T, builderIndex uint64) (*clparams.Be
 	parentHash := common.HexToHash("0x10")
 	prevRandao := common.HexToHash("0x13")
 	feeRecipient := common.HexToAddress("0x0000000000000000000000000000000000000014")
-	requests := cltypes.NewExecutionRequests(&cfg)
+	requests := cltypes.NewExecutionRequestsWithVersion(&cfg, clparams.GloasVersion)
 	requestsRoot, err := requests.HashSSZ()
 	require.NoError(t, err)
 	requestsHash := cltypes.ComputeExecutionRequestHash(cltypes.GetExecutionRequestsList(&cfg, requests))
@@ -392,9 +392,11 @@ func (t *testExecutionEngine) ForkChoiceUpdate(context.Context, common.Hash, com
 
 func (t *testExecutionEngine) SupportInsertion() bool { return t.supportInsertion }
 
-func (t *testExecutionEngine) InsertBlocks(context.Context, []*types.Block, bool) error { return nil }
+func (t *testExecutionEngine) InsertBlocks(context.Context, []*types.Block, [][]byte) error {
+	return nil
+}
 
-func (t *testExecutionEngine) InsertBlock(context.Context, *types.Block) error { return nil }
+func (t *testExecutionEngine) InsertBlock(context.Context, *types.Block, []byte) error { return nil }
 
 func (t *testExecutionEngine) CurrentHeader(context.Context) (*types.Header, error) { return nil, nil }
 
@@ -424,6 +426,10 @@ func (t *testExecutionEngine) GetAssembledBlock(context.Context, []byte, clparam
 
 func (t *testExecutionEngine) GetBlobs(context.Context, []common.Hash, clparams.StateVersion) ([][]byte, [][][]byte, error) {
 	return nil, nil, nil
+}
+
+func (t *testExecutionEngine) GetClientVersionV1(context.Context, *engine_types.ClientVersionV1) ([]engine_types.ClientVersionV1, error) {
+	return nil, nil
 }
 
 var _ execution_client.ExecutionEngine = (*testExecutionEngine)(nil)

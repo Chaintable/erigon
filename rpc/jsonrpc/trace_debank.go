@@ -17,7 +17,6 @@ import (
 	dtypes "github.com/erigontech/erigon/debank/types"
 	"github.com/erigontech/erigon/diagnostics/metrics"
 	chainspec "github.com/erigontech/erigon/execution/chain/spec"
-	polygonchain "github.com/erigontech/erigon/polygon/chain"
 	"github.com/erigontech/erigon/execution/protocol"
 	"github.com/erigontech/erigon/execution/protocol/rules"
 	"github.com/erigontech/erigon/execution/rlp"
@@ -27,6 +26,7 @@ import (
 	"github.com/erigontech/erigon/execution/vm"
 	"github.com/erigontech/erigon/execution/vm/evmtypes"
 	bortypes "github.com/erigontech/erigon/polygon/bor/types"
+	polygonchain "github.com/erigontech/erigon/polygon/chain"
 	"github.com/erigontech/erigon/rpc"
 	"github.com/erigontech/erigon/rpc/rpchelper"
 	"github.com/erigontech/erigon/rpc/transactions"
@@ -280,7 +280,7 @@ func (api *TraceAPIImpl) DebankBlockRaw(ctx context.Context, blockNrOrHash rpc.B
 type DebankOutPutJs struct {
 	BlockFile      *dtypes.BlockFile `json:"block_file"`
 	Header         *dtypes.Header    `json:"header"`
-	StateDiff      hexutil.Bytes  `json:"state_diff"`
+	StateDiff      hexutil.Bytes     `json:"state_diff"`
 	ValidationHash int64             `json:"validation_hash"`
 }
 
@@ -373,7 +373,7 @@ func getFrom(txn types.Transaction) common.Address {
 	switch t := txn.(type) {
 	case *types.LegacyTx:
 		if t.Protected() {
-			chainId = types.DeriveChainId(&t.V)
+			chainId, _ = types.DeriveChainId(&t.V)
 		}
 	default:
 		chainId = txn.GetChainID()

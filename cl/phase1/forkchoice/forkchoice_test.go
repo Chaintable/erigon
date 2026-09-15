@@ -17,11 +17,13 @@
 package forkchoice
 
 import (
+	"errors"
 	"testing"
 
 	lru "github.com/hashicorp/golang-lru/v2"
 	"github.com/stretchr/testify/require"
 
+	"github.com/erigontech/erigon/cl/beacon/beaconevents"
 	"github.com/erigontech/erigon/cl/clparams"
 	"github.com/erigontech/erigon/cl/cltypes"
 	"github.com/erigontech/erigon/cl/cltypes/solid"
@@ -68,16 +70,65 @@ func TestGetFinalizedExecutionHash(t *testing.T) {
 	require.Equal(t, missingExecutionHash, store.GetFinalizedExecutionHash(missingRoot))
 }
 
+func TestAddChainSegmentDoesNotQueueLightClientEventsOnError(t *testing.T) {
+	insertErr := errors.New("invalid block")
+	update := &cltypes.LightClientUpdate{}
+	store := &ForkChoiceStore{
+		forkGraph: &getFinalizedExecutionHashForkGraph{
+			afterUpdate:           update,
+			addChainSegmentStatus: fork_graph.InvalidBlock,
+			addChainSegmentErr:    insertErr,
+		},
+		emitters: beaconevents.NewEventEmitter(),
+	}
+	block := cltypes.NewSignedBeaconBlock(&clparams.MainnetBeaconConfig, clparams.AltairVersion)
+
+	_, status, err := store.addChainSegmentAndQueueLightClientEvents(block, true)
+
+	require.ErrorIs(t, err, insertErr)
+	require.Equal(t, fork_graph.InvalidBlock, status)
+	require.Empty(t, store.queuedEmits)
+}
+
+func TestAddChainSegmentQueuesLightClientEventsOnSuccess(t *testing.T) {
+	update := &cltypes.LightClientUpdate{}
+	store := &ForkChoiceStore{
+		forkGraph: &getFinalizedExecutionHashForkGraph{
+			afterUpdate:           update,
+			addChainSegmentStatus: fork_graph.Success,
+		},
+		emitters: beaconevents.NewEventEmitter(),
+	}
+	block := cltypes.NewSignedBeaconBlock(&clparams.MainnetBeaconConfig, clparams.AltairVersion)
+
+	_, status, err := store.addChainSegmentAndQueueLightClientEvents(block, true)
+
+	require.NoError(t, err)
+	require.Equal(t, fork_graph.Success, status)
+	require.Len(t, store.queuedEmits, 1)
+}
+
 type getFinalizedExecutionHashForkGraph struct {
-	blocks map[common.Hash]*cltypes.SignedBeaconBlock
+	blocks                map[common.Hash]*cltypes.SignedBeaconBlock
+	headers               map[common.Hash]*cltypes.BeaconBlockHeader
+	beforeUpdate          *cltypes.LightClientUpdate
+	afterUpdate           *cltypes.LightClientUpdate
+	addChainSegmentStatus fork_graph.ChainSegmentInsertionResult
+	addChainSegmentErr    error
+	addChainSegmentCalled bool
+	anchorRoot            common.Hash
+	anchorSlot            uint64
+	currentJustified      solid.Checkpoint
 }
 
 func (g *getFinalizedExecutionHashForkGraph) AddChainSegment(*cltypes.SignedBeaconBlock, bool) (*state.CachingBeaconState, fork_graph.ChainSegmentInsertionResult, error) {
-	panic("not used")
+	g.addChainSegmentCalled = true
+	return nil, g.addChainSegmentStatus, g.addChainSegmentErr
 }
 
-func (g *getFinalizedExecutionHashForkGraph) GetHeader(common.Hash) (*cltypes.BeaconBlockHeader, bool) {
-	panic("not used")
+func (g *getFinalizedExecutionHashForkGraph) GetHeader(blockRoot common.Hash) (*cltypes.BeaconBlockHeader, bool) {
+	header := g.headers[blockRoot]
+	return header, header != nil
 }
 
 func (g *getFinalizedExecutionHashForkGraph) GetBlock(blockRoot common.Hash) (*cltypes.SignedBeaconBlock, bool) {
@@ -90,7 +141,7 @@ func (g *getFinalizedExecutionHashForkGraph) GetState(common.Hash, bool) (*state
 }
 
 func (g *getFinalizedExecutionHashForkGraph) GetCurrentJustifiedCheckpoint(common.Hash) (solid.Checkpoint, bool) {
-	panic("not used")
+	return g.currentJustified, true
 }
 
 func (g *getFinalizedExecutionHashForkGraph) GetFinalizedCheckpoint(common.Hash) (solid.Checkpoint, bool) {
@@ -106,11 +157,11 @@ func (g *getFinalizedExecutionHashForkGraph) MarkHeaderAsInvalid(common.Hash) {
 }
 
 func (g *getFinalizedExecutionHashForkGraph) AnchorSlot() uint64 {
-	panic("not used")
+	return g.anchorSlot
 }
 
 func (g *getFinalizedExecutionHashForkGraph) AnchorRoot() common.Hash {
-	panic("not used")
+	return g.anchorRoot
 }
 
 func (g *getFinalizedExecutionHashForkGraph) Prune(uint64) error {
@@ -130,7 +181,10 @@ func (g *getFinalizedExecutionHashForkGraph) GetLightClientBootstrap(common.Hash
 }
 
 func (g *getFinalizedExecutionHashForkGraph) NewestLightClientUpdate() *cltypes.LightClientUpdate {
-	panic("not used")
+	if g.addChainSegmentCalled {
+		return g.afterUpdate
+	}
+	return g.beforeUpdate
 }
 
 func (g *getFinalizedExecutionHashForkGraph) GetLightClientUpdate(uint64) (*cltypes.LightClientUpdate, bool) {

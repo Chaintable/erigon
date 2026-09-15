@@ -34,7 +34,7 @@ func BuildPipelineBlock(rawBlock *types.Block) dtypes.Block {
 }
 
 func BuildPipelineWithdrawals(rawBlock *types.Block) []dtypes.SpecialTransfer {
-	res := make([]dtypes.SpecialTransfer, 0)
+	res := make([]dtypes.SpecialTransfer, 0, len(rawBlock.Withdrawals()))
 	for _, withdrawal := range rawBlock.Withdrawals() {
 		specialTransfer := dtypes.SpecialTransfer{
 			FromAddress: strings.ToLower("0x00000000219ab540356cBB839Cbe05303d7705Fa"), //eth2 合约

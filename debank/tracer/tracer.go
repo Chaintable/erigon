@@ -48,7 +48,7 @@ func (bs *BlockStorageDiffMap) ToStateDiff(parrentRoot, root common.Hash) *dtype
 		stateDiff.NewAccounts = append(stateDiff.NewAccounts, v)
 	}
 	for account, storage := range bs.StorageDiff {
-		Values := make([]dtypes.IndexValuePair, 0)
+		Values := make([]dtypes.IndexValuePair, 0, len(storage))
 		for index, v := range storage {
 			Values = append(Values, dtypes.IndexValuePair{
 				Index: index,
@@ -496,7 +496,7 @@ func GenesisAllocToStateDiff(genesisAlloc types.GenesisAlloc) *dtypes.BlockStora
 				Code:     acc.Code,
 			})
 		}
-		values := make([]dtypes.IndexValuePair, 0)
+		values := make([]dtypes.IndexValuePair, 0, len(acc.Storage))
 		for index, v := range acc.Storage {
 			value := uint256.NewInt(0)
 			if len(v) > 0 {

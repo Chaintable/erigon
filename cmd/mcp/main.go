@@ -32,6 +32,7 @@ import (
 	"github.com/erigontech/erigon/cmd/rpcdaemon/cli"
 	"github.com/erigontech/erigon/cmd/rpcdaemon/cli/httpcfg"
 	"github.com/erigontech/erigon/cmd/utils"
+	"github.com/erigontech/erigon/cmd/utils/flags"
 	"github.com/erigontech/erigon/common/log/v3"
 	"github.com/erigontech/erigon/db/datadir"
 	"github.com/erigontech/erigon/db/kv/kvcache"
@@ -150,7 +151,7 @@ Examples:
 
 	rootCmd.Flags().StringVar(&rpcURL, "rpc.url", "http://127.0.0.1:8545", "Erigon JSON-RPC endpoint URL")
 	rootCmd.Flags().UintVar(&port, "port", 0, "Erigon JSON-RPC port (shorthand for --rpc.url=http://127.0.0.1:{port})")
-	rootCmd.Flags().StringVar(&dataDir, "datadir", "", "Erigon data directory (enables direct DB access mode)")
+	flags.DirVar(rootCmd.Flags(), &dataDir, "datadir", "", "Erigon data directory (enables direct DB access mode)")
 	rootCmd.Flags().StringVar(&privAPI, "private.api.addr", "127.0.0.1:9090", "Erigon gRPC private API address (used with --datadir)")
 	rootCmd.Flags().StringVar(&transport, "transport", "stdio", "MCP transport: 'stdio' or 'sse'")
 	rootCmd.Flags().StringVar(&sseAddr, "sse.addr", "127.0.0.1:8553", "SSE server listen address (when transport=sse)")
@@ -180,7 +181,7 @@ func serve(ctx context.Context, srv mcpserver.MCPTransport, transport, sseAddr s
 		return srv.ServeContext(ctx)
 	case "sse":
 		logger.Info("[MCP] Starting SSE transport", "addr", sseAddr)
-		return srv.ServeSSE(sseAddr)
+		return srv.ServeSSE(ctx, sseAddr)
 	default:
 		return fmt.Errorf("unknown transport: %s (use 'stdio' or 'sse')", transport)
 	}

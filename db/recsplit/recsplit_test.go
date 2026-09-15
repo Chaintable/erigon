@@ -29,6 +29,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/erigontech/erigon/common/log/v3"
+	"github.com/erigontech/erigon/db/version"
 )
 
 func TestRecSplit2(t *testing.T) {
@@ -123,7 +124,7 @@ func TestIndexLookup(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer rs.Close()
-		for i := 0; i < 100; i++ {
+		for i := range 100 {
 			if err = rs.AddKey(fmt.Appendf(nil, "key %d", i), uint64(i*17)); err != nil {
 				t.Fatal(err)
 			}
@@ -133,7 +134,7 @@ func TestIndexLookup(t *testing.T) {
 		}
 		idx := MustOpen(indexFile)
 		defer idx.Close()
-		for i := 0; i < 100; i++ {
+		for i := range 100 {
 			reader := NewIndexReader(idx)
 			offset, ok := reader.Lookup(fmt.Appendf(nil, "key %d", i))
 			assert.True(t, ok)
@@ -348,7 +349,7 @@ func BenchmarkBuild(b *testing.B) {
 
 	// Pre-allocate all keys outside the benchmark loop
 	keys := make([][]byte, KeysN)
-	for j := 0; j < KeysN; j++ {
+	for j := range KeysN {
 		keys[j] = fmt.Appendf(nil, "key %d", j)
 	}
 	b.ResetTimer()
@@ -367,7 +368,7 @@ func BenchmarkBuild(b *testing.B) {
 		if err != nil {
 			b.Fatal(err)
 		}
-		for j := 0; j < KeysN; j++ {
+		for j := range KeysN {
 			if err = rs.AddKey(keys[j], uint64(j*17)); err != nil {
 				b.Fatal(err)
 			}
@@ -389,7 +390,7 @@ func BenchmarkAddKeyAndBuild(b *testing.B) {
 	const KeysN = 1_000_000
 
 	keys := make([][]byte, KeysN)
-	for j := 0; j < KeysN; j++ {
+	for j := range KeysN {
 		keys[j] = fmt.Appendf(nil, "key %d", j)
 	}
 
@@ -416,7 +417,7 @@ func BenchmarkAddKeyAndBuild(b *testing.B) {
 					b.Fatal(err)
 				}
 				b.StartTimer()
-				for j := 0; j < KeysN; j++ {
+				for j := range KeysN {
 					if err = rs.AddKey(keys[j], uint64(j*17)); err != nil {
 						b.Fatal(err)
 					}
@@ -445,7 +446,7 @@ func TestTwoLayerIndex(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer rs.Close()
-		for i := 0; i < N; i++ {
+		for i := range N {
 			if err = rs.AddKey(fmt.Appendf(nil, "key %d", i), uint64(i*17)); err != nil {
 				t.Fatal(err)
 			}
@@ -456,7 +457,7 @@ func TestTwoLayerIndex(t *testing.T) {
 
 		idx := MustOpen(indexFile)
 		defer idx.Close()
-		for i := 0; i < N; i++ {
+		for i := range N {
 			reader := NewIndexReader(idx)
 			e, _ := reader.Lookup(fmt.Appendf(nil, "key %d", i))
 			if e != uint64(i) {
@@ -516,7 +517,7 @@ func TestIndexLookupParallel(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer rs.Close()
-			for i := 0; i < N; i++ {
+			for i := range N {
 				if err = rs.AddKey(fmt.Appendf(nil, "key %d", i), uint64(i*17)); err != nil {
 					t.Fatal(err)
 				}
@@ -526,7 +527,7 @@ func TestIndexLookupParallel(t *testing.T) {
 			}
 			idx := MustOpen(indexFile)
 			defer idx.Close()
-			for i := 0; i < N; i++ {
+			for i := range N {
 				reader := NewIndexReader(idx)
 				offset, ok := reader.Lookup(fmt.Appendf(nil, "key %d", i))
 				assert.True(t, ok)
@@ -604,7 +605,7 @@ func BenchmarkBuildParallel(b *testing.B) {
 	const KeysN = 1_000_000
 
 	keys := make([][]byte, KeysN)
-	for j := 0; j < KeysN; j++ {
+	for j := range KeysN {
 		keys[j] = fmt.Appendf(nil, "key %d", j)
 	}
 
@@ -627,7 +628,7 @@ func BenchmarkBuildParallel(b *testing.B) {
 				if err != nil {
 					b.Fatal(err)
 				}
-				for j := 0; j < KeysN; j++ {
+				for j := range KeysN {
 					if err = rs.AddKey(keys[j], uint64(j*17)); err != nil {
 						b.Fatal(err)
 					}
@@ -641,5 +642,104 @@ func BenchmarkBuildParallel(b *testing.B) {
 				b.StartTimer()
 			}
 		})
+	}
+}
+
+// ResetNextSalt must leave the builder as if it were fresh. It is reached on
+// every collision retry, so state carried over from the failed attempt lands in
+// the rebuilt index.
+func TestResetNextSaltRebuilds(t *testing.T) {
+	for _, ver := range []version.DataStructureVersion{0, 1, 2} {
+		t.Run(fmt.Sprintf("v%d", ver), func(t *testing.T) {
+			testResetNextSaltRebuilds(t, ver, false)
+		})
+		t.Run(fmt.Sprintf("v%d_lessFalsePositives", ver), func(t *testing.T) {
+			testResetNextSaltRebuilds(t, ver, true)
+		})
+	}
+}
+
+func testResetNextSaltRebuilds(t *testing.T, ver version.DataStructureVersion, lessFalsePositives bool) {
+	logger := log.New()
+	tmpDir := t.TempDir()
+	indexFile := filepath.Join(tmpDir, "index")
+	salt := uint32(1)
+	const N = 1000
+
+	cfg := RecSplitArgs{
+		KeyCount: N, BucketSize: 10, Salt: &salt, TmpDir: tmpDir,
+		IndexFile: indexFile, LeafSize: 8, Enums: true,
+		LessFalsePositives: lessFalsePositives, Version: ver,
+	}
+	rs, err := NewRecSplit(cfg, logger)
+	require.NoError(t, err)
+	defer rs.Close()
+
+	build := func() {
+		t.Helper()
+		for i := range N {
+			require.NoError(t, rs.AddKey(fmt.Appendf(nil, "key %d", i), uint64(i*17)))
+		}
+		require.NoError(t, rs.Build(t.Context()))
+
+		idx := MustOpen(indexFile)
+		defer idx.Close()
+		reader := NewIndexReader(idx)
+		for i := range N {
+			e, ok := reader.Lookup(fmt.Appendf(nil, "key %d", i))
+			require.True(t, ok)
+			require.Equal(t, uint64(i), e)
+			require.Equal(t, uint64(i*17), idx.OrdinalLookup(e))
+		}
+	}
+
+	build()
+	require.NoError(t, rs.ResetNextSalt())
+	build()
+}
+
+// A real collision surfaces part-way through the build, so ResetNextSalt runs
+// with the encoders already holding the failed attempt's output.
+func TestResetNextSaltAfterCollision(t *testing.T) {
+	logger := log.New()
+	tmpDir := t.TempDir()
+	indexFile := filepath.Join(tmpDir, "index")
+	salt := uint32(1)
+	const N = 1000
+
+	rs, err := NewRecSplit(RecSplitArgs{
+		KeyCount: N, BucketSize: 10, Salt: &salt, TmpDir: tmpDir,
+		IndexFile: indexFile, LeafSize: 8, Enums: true, LessFalsePositives: true,
+		Version: 2,
+	}, logger)
+	require.NoError(t, err)
+	defer rs.Close()
+
+	// a duplicated key collides in its bucket, after earlier buckets are encoded
+	for i := range N {
+		key := fmt.Appendf(nil, "key %d", i)
+		if i == N-1 {
+			key = fmt.Appendf(nil, "key %d", 0)
+		}
+		require.NoError(t, rs.AddKey(key, uint64(i*17)))
+	}
+	require.ErrorIs(t, rs.Build(t.Context()), ErrCollision)
+	require.NotZero(t, rs.gr.Bits(), "collision must surface after some buckets are encoded")
+
+	require.NoError(t, rs.ResetNextSalt())
+
+	for i := range N {
+		require.NoError(t, rs.AddKey(fmt.Appendf(nil, "key %d", i), uint64(i*17)))
+	}
+	require.NoError(t, rs.Build(t.Context()))
+
+	idx := MustOpen(indexFile)
+	defer idx.Close()
+	reader := NewIndexReader(idx)
+	for i := range N {
+		e, ok := reader.Lookup(fmt.Appendf(nil, "key %d", i))
+		require.True(t, ok)
+		require.Equal(t, uint64(i), e)
+		require.Equal(t, uint64(i*17), idx.OrdinalLookup(e))
 	}
 }

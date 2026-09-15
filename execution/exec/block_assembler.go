@@ -22,13 +22,13 @@ import (
 	"github.com/erigontech/erigon/execution/vm"
 	"github.com/erigontech/erigon/execution/vm/evmtypes"
 
-	"github.com/erigontech/erigon/db/services"
+	"github.com/erigontech/erigon/db/dbservices"
 )
 
 type AssemblerCfg struct {
 	ChainConfig     *chain.Config
 	Engine          rules.Engine
-	BlockReader     services.FullBlockReader
+	BlockReader     dbservices.FullBlockReader
 	ExperimentalBAL bool
 }
 
@@ -101,6 +101,7 @@ type BlockAssembler struct {
 	*AssembledBlock
 	cfg         AssemblerCfg
 	balIO       *state.VersionedIO
+	blockRules  *chain.Rules
 	stateWriter state.StateWriter // optional: if set, domain writes go here instead of NoopWriter
 	gasUsed     protocol.GasUsed  // EIP-8037: cumulative per-dimension gas across AddTransactions calls
 }
@@ -108,16 +109,15 @@ type BlockAssembler struct {
 func (ba *BlockAssembler) CumulativeGasUsed() protocol.GasUsed { return ba.gasUsed }
 
 func NewBlockAssembler(cfg AssemblerCfg, block *AssembledBlock) *BlockAssembler {
-	var balIO *state.VersionedIO
-
+	ba := &BlockAssembler{AssembledBlock: block, cfg: cfg}
 	if cfg.ChainConfig.IsAmsterdam(block.Header.Time) || cfg.ExperimentalBAL {
-		balIO = &state.VersionedIO{}
+		ba.balIO = &state.VersionedIO{}
+		blockContext := protocol.NewEVMBlockContext(
+			block.Header, protocol.GetHashFn(block.Header, nil), cfg.Engine, accounts.NilAddress, cfg.ChainConfig,
+		)
+		ba.blockRules = blockContext.Rules(cfg.ChainConfig)
 	}
-	return &BlockAssembler{
-		AssembledBlock: block,
-		cfg:            cfg,
-		balIO:          balIO,
-	}
+	return ba
 }
 
 func (ba *BlockAssembler) HasBAL() bool {
@@ -155,7 +155,8 @@ func (ba *BlockAssembler) Initialize(ibs *state.IntraBlockState, tx kv.TemporalT
 		return err
 	}
 	if ba.HasBAL() {
-		ba.balIO = ba.balIO.Merge(ibs.TxIO())
+		writes := ibs.FinalizedWrites(ba.blockRules, false)
+		ibs.MergeTxIOInto(ba.balIO, writes)
 		ibs.ResetVersionedIO()
 	}
 	return nil
@@ -204,14 +205,15 @@ func (ba *BlockAssembler) AddTransactions(
 	// SharedDomains become stale when system calls revert storage slots.
 	// CommitBlock in AssembleBlock writes all final state correctly.
 	writer := state.NewNoopWriter()
-	recordTxIO := func(balIO *state.VersionedIO) {
-		if balIO != nil {
-			ba.balIO = ba.balIO.Merge(ibs.TxIO())
+	recordTxIO := func() {
+		if ba.HasBAL() {
+			writes := ibs.FinalizedWrites(ba.blockRules, false)
+			ibs.MergeTxIOInto(ba.balIO, writes)
 		}
 		ibs.ResetVersionedIO()
 	}
-	clearTxIO := func(balIO *state.VersionedIO) {
-		if balIO == nil {
+	clearTxIO := func() {
+		if !ba.HasBAL() {
 			return
 		}
 		ibs.AccessedAddresses()
@@ -350,9 +352,9 @@ LOOP:
 		// Start executing the transaction
 		logs, err := commitTx(txn, coinbase, vmConfig, ba.cfg.ChainConfig, ibs, ba.AssembledBlock)
 		if err == nil {
-			recordTxIO(ba.balIO)
+			recordTxIO()
 		} else {
-			clearTxIO(ba.balIO)
+			clearTxIO()
 		}
 		if errors.Is(err, protocol.ErrGasLimitReached) {
 			logger.Debug(fmt.Sprintf("[%s] Gas limit exceeded for env block", logPrefix), "hash", txn.Hash(), "sender", from)
@@ -397,8 +399,9 @@ func (ba *BlockAssembler) AssembleBlock(stateReader state.StateReader, ibs *stat
 	// so we must modify the block's header directly, not ba.Header.
 	header := block.HeaderNoCopy()
 	if ba.HasBAL() {
+		writes := ibs.FinalizedWrites(ba.blockRules, false)
 		// Record finalize system call I/O (EIP-7002, EIP-7251, etc.)
-		ba.balIO = ba.balIO.Merge(ibs.TxIO())
+		ibs.MergeTxIOInto(ba.balIO, writes)
 		ibs.ResetVersionedIO()
 		ba.BlockAccessList = ba.balIO.AsBlockAccessList()
 		// Only embed the BAL hash in the header for Amsterdam+ chains.

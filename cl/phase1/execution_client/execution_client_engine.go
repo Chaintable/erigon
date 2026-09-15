@@ -17,6 +17,7 @@
 package execution_client
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"errors"
@@ -78,12 +79,13 @@ func NewExecutionClientEngineLocal(
 	txpool txpoolproto.TxpoolClient,
 	beaconCfg *clparams.BeaconChainConfig,
 ) (*ExecutionClientEngine, error) {
-	return &ExecutionClientEngine{
-		engine:    engine,
-		chainRW:   &chainRW,
-		txpool:    txpool,
-		beaconCfg: beaconCfg,
-	}, nil
+	cc := &ExecutionClientEngine{
+		engine:  engine,
+		chainRW: &chainRW,
+		txpool:  txpool,
+	}
+	cc.SetBeaconChainConfig(beaconCfg)
+	return cc, nil
 }
 
 // NewExecutionClientEngineRPC creates a remote engine client that communicates
@@ -106,6 +108,11 @@ func (cc *ExecutionClientEngine) isLocal() bool {
 
 func (cc *ExecutionClientEngine) SetBeaconChainConfig(beaconCfg *clparams.BeaconChainConfig) {
 	cc.beaconCfg = beaconCfg
+	if engineWithCfg, ok := cc.engine.(interface {
+		SetBeaconChainConfig(*clparams.BeaconChainConfig)
+	}); ok {
+		engineWithCfg.SetBeaconChainConfig(beaconCfg)
+	}
 }
 
 // Close releases resources held by the engine client (HTTP connections, goroutines).
@@ -117,7 +124,7 @@ func (cc *ExecutionClientEngine) Close() {
 
 // buildExecutionPayload converts a CL Eth1Block into an Engine API ExecutionPayload.
 func buildExecutionPayload(payload *cltypes.Eth1Block) *engine_types.ExecutionPayload {
-	reversedBaseFeePerGas := common.Copy(payload.BaseFeePerGas[:])
+	reversedBaseFeePerGas := bytes.Clone(payload.BaseFeePerGas[:])
 	for i, j := 0, len(reversedBaseFeePerGas)-1; i < j; i, j = i+1, j-1 {
 		reversedBaseFeePerGas[i], reversedBaseFeePerGas[j] = reversedBaseFeePerGas[j], reversedBaseFeePerGas[i]
 	}
@@ -153,9 +160,11 @@ func buildExecutionPayload(payload *cltypes.Eth1Block) *engine_types.ExecutionPa
 	}
 
 	if payload.Version() >= clparams.GloasVersion {
+		bal := hexutil.Bytes{}
 		if payload.BlockAccessList != nil {
-			request.BlockAccessList = payload.BlockAccessList.Bytes()
+			bal = payload.BlockAccessList.Bytes()
 		}
+		request.BlockAccessList = &bal
 		slotNumber := hexutil.Uint64(payload.SlotNumber)
 		request.SlotNumber = &slotNumber
 	}
@@ -235,14 +244,20 @@ func (cc *ExecutionClientEngine) ForkChoiceUpdate(
 		resp, err = cc.engine.ForkchoiceUpdatedV4(ctx, forkChoiceState, attributes)
 	}
 	if err != nil {
-		if err.Error() == errContextExceeded {
-			return nil, nil
+		if isDeadlineExceeded(err) {
+			return nil, fmt.Errorf("%w: %w", ErrForkChoiceUpdateTimeout, err)
 		}
 		return nil, fmt.Errorf("engine ForkchoiceUpdated failed: %w", err)
 	}
 
 	if resp.PayloadId == nil {
-		return []byte{}, checkPayloadStatus(resp.PayloadStatus)
+		if err := checkPayloadStatus(resp.PayloadStatus); err != nil {
+			return nil, err
+		}
+		if attributes != nil {
+			return nil, ErrForkChoiceUpdateNoPayloadID
+		}
+		return []byte{}, nil
 	}
 	return *resp.PayloadId, checkPayloadStatus(resp.PayloadStatus)
 }
@@ -251,21 +266,18 @@ func (cc *ExecutionClientEngine) SupportInsertion() bool {
 	return cc.isLocal()
 }
 
-func (cc *ExecutionClientEngine) InsertBlocks(ctx context.Context, blocks []*types.Block, wait bool) error {
+func (cc *ExecutionClientEngine) InsertBlocks(ctx context.Context, blocks []*types.Block, bals [][]byte) error {
 	if !cc.isLocal() {
 		return ErrNotSupported
 	}
-	if wait {
-		return cc.chainRW.InsertBlocksAndWait(ctx, blocks)
-	}
-	return cc.chainRW.InsertBlocks(ctx, blocks)
+	return cc.chainRW.InsertBlocks(ctx, blocks, bals)
 }
 
-func (cc *ExecutionClientEngine) InsertBlock(ctx context.Context, block *types.Block) error {
+func (cc *ExecutionClientEngine) InsertBlock(ctx context.Context, block *types.Block, bal []byte) error {
 	if !cc.isLocal() {
 		return ErrNotSupported
 	}
-	return cc.chainRW.InsertBlockAndWait(ctx, block)
+	return cc.chainRW.InsertBlock(ctx, block, bal)
 }
 
 func (cc *ExecutionClientEngine) CurrentHeader(ctx context.Context) (*types.Header, error) {
@@ -365,7 +377,7 @@ func (cc *ExecutionClientEngine) HasBlock(ctx context.Context, hash common.Hash)
 
 func (cc *ExecutionClientEngine) GetAssembledBlock(ctx context.Context, id []byte, version clparams.StateVersion) (*cltypes.Eth1Block, *engine_types.BlobsBundle, *typesproto.RequestsBundle, *big.Int, error) {
 	if cc.isLocal() {
-		return cc.chainRW.GetAssembledBlock(binary.LittleEndian.Uint64(id))
+		return cc.chainRW.GetAssembledBlock(ctx, binary.LittleEndian.Uint64(id))
 	}
 
 	// Select Engine API version based on CL state version.
@@ -529,13 +541,13 @@ func executionPayloadToEth1Block(ep *engine_types.ExecutionPayload, version clpa
 	if ep.SlotNumber != nil {
 		block.SlotNumber = uint64(*ep.SlotNumber)
 	}
-	if len(ep.BlockAccessList) > 0 {
+	if ep.BlockAccessList != nil && len(*ep.BlockAccessList) > 0 {
 		maxBytes := uint64(1073741824) // MAX_BYTES_PER_TRANSACTION default
 		if beaconCfg != nil {
 			maxBytes = beaconCfg.MaxBytesPerTransaction
 		}
 		block.BlockAccessList = solid.NewByteListSSZ(maxBytes)
-		if err := block.BlockAccessList.SetBytes(ep.BlockAccessList); err != nil {
+		if err := block.BlockAccessList.SetBytes(*ep.BlockAccessList); err != nil {
 			return nil, err
 		}
 	}
@@ -611,4 +623,8 @@ func (cc *ExecutionClientEngine) GetBlobs(ctx context.Context, versionedHashes [
 		proofs[i] = [][]byte{bap.Proof}
 	}
 	return blobs, proofs, nil
+}
+
+func (cc *ExecutionClientEngine) GetClientVersionV1(ctx context.Context, callerVersion *engine_types.ClientVersionV1) ([]engine_types.ClientVersionV1, error) {
+	return cc.engine.GetClientVersionV1(ctx, callerVersion)
 }

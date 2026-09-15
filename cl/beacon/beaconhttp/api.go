@@ -20,11 +20,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"mime"
 	"net/http"
 	"reflect"
 	"slices"
+	"strconv"
 	"strings"
 
+	"github.com/erigontech/erigon/cl/beacon/synced_data"
 	"github.com/erigontech/erigon/cl/phase1/forkchoice/fork_graph"
 	"github.com/erigontech/erigon/common/log/v3"
 	"github.com/erigontech/erigon/common/ssz"
@@ -45,12 +48,22 @@ var ErrorCantFindBeaconState = errors.New("Could not find beacon state")
 var ErrorSszNotSupported = errors.New("This endpoint does not support SSZ response")
 
 func WrapEndpointError(err error) *EndpointError {
-	e := &EndpointError{}
-	if errors.As(err, e) {
-		return e
+	// Handlers build these with NewEndpointError, so the pointer form is the one that carries a
+	// deliberate code; matching only the value form would silently turn it into a 500.
+	var byPointer *EndpointError
+	if errors.As(err, &byPointer) {
+		return byPointer
+	}
+	byValue := EndpointError{}
+	if errors.As(err, &byValue) {
+		return &byValue
 	}
 	if errors.Is(err, fork_graph.ErrStateNotFound) {
 		return NewEndpointError(http.StatusNotFound, ErrorCantFindBeaconState)
+	}
+	// A node without a head state is transiently unavailable, not faulty.
+	if errors.Is(err, synced_data.ErrNotSynced) {
+		return NewEndpointError(http.StatusServiceUnavailable, err)
 	}
 	return NewEndpointError(http.StatusInternalServerError, err)
 }
@@ -127,7 +140,7 @@ func HandleEndpoint[T any](h EndpointHandler[T]) http.HandlerFunc {
 		if slices.Contains(w.Header().Values("Content-Type"), "text/event-stream") {
 			return
 		}
-		if beaconResponse, ok := any(ans).(*BeaconResponse); ok {
+		if beaconResponse, ok := any(ans).(*BeaconResponse); ok && beaconResponse != nil {
 			for key, value := range beaconResponse.Headers() {
 				w.Header().Set(key, value)
 			}
@@ -137,8 +150,8 @@ func HandleEndpoint[T any](h EndpointHandler[T]) http.HandlerFunc {
 				w.Header().Set("Eth-Consensus-Version", beaconResponse.Version.String())
 			}
 		}
-		switch {
-		case contentType == "*/*", contentType == "", strings.Contains(contentType, "text/html"), strings.Contains(contentType, "application/json"):
+		switch responseEncodingForAccept(contentType, supportsSSZ(ans)) {
+		case responseEncodingJSON:
 			if !isNil(ans) {
 				w.Header().Set("Content-Type", "application/json")
 				err := json.NewEncoder(w).Encode(ans)
@@ -149,7 +162,11 @@ func HandleEndpoint[T any](h EndpointHandler[T]) http.HandlerFunc {
 			} else {
 				w.WriteHeader(200)
 			}
-		case strings.Contains(contentType, "application/octet-stream"):
+		case responseEncodingSSZ:
+			if !supportsSSZ(ans) {
+				NewEndpointError(http.StatusBadRequest, ErrorSszNotSupported).WriteTo(w)
+				return
+			}
 			sizeMarshaller, ok := any(ans).(ssz.Marshaler)
 			if !ok {
 				NewEndpointError(http.StatusBadRequest, ErrorSszNotSupported).WriteTo(w)
@@ -163,7 +180,7 @@ func HandleEndpoint[T any](h EndpointHandler[T]) http.HandlerFunc {
 				return
 			}
 			w.Write(encoded)
-		case strings.Contains(contentType, "text/event-stream"):
+		case responseEncodingEventStream:
 			return
 		default:
 			http.Error(w, "content type must include application/json, application/octet-stream, or text/event-stream, got "+contentType, http.StatusBadRequest)
@@ -174,14 +191,91 @@ func HandleEndpoint[T any](h EndpointHandler[T]) http.HandlerFunc {
 // WillEncodeSSZ reports whether the given Accept header will cause
 // HandleEndpoint to use SSZ encoding. Mirrors the switch priority above.
 func WillEncodeSSZ(accept string) bool {
-	switch {
-	case accept == "*/*", accept == "", strings.Contains(accept, "text/html"), strings.Contains(accept, "application/json"):
-		return false
-	case strings.Contains(accept, "application/octet-stream"):
-		return true
-	default:
-		return false
+	return responseEncodingForAccept(accept, true) == responseEncodingSSZ
+}
+
+type responseEncoding int
+
+const (
+	responseEncodingUnsupported responseEncoding = iota
+	responseEncodingJSON
+	responseEncodingSSZ
+	responseEncodingEventStream
+)
+
+func responseEncodingForAccept(accept string, sszSupported bool) responseEncoding {
+	if accept == "" {
+		return responseEncodingJSON
 	}
+
+	jsonQ, jsonOK := acceptQuality(accept, "application/json")
+	htmlQ, htmlOK := acceptQuality(accept, "text/html")
+	anyQ, anyOK := acceptQuality(accept, "*/*")
+	sszQ, sszOK := acceptQuality(accept, "application/octet-stream")
+	eventQ, eventOK := acceptQuality(accept, "text/event-stream")
+
+	hasExplicitJSON := (jsonOK && jsonQ > 0) || (htmlOK && htmlQ > 0)
+	explicitJSONQ := max(jsonQ, htmlQ)
+
+	if sszSupported && sszOK && sszQ > 0 {
+		switch {
+		case !jsonOK && !htmlOK && !anyOK:
+			return responseEncodingSSZ
+		case hasExplicitJSON && sszQ > explicitJSONQ:
+			return responseEncodingSSZ
+		case !hasExplicitJSON && anyOK && sszQ >= anyQ:
+			// Exact type beats wildcard at equal quality (RFC 9110 §12.5.1).
+			return responseEncodingSSZ
+		}
+	}
+	hasJSONAlternative := hasExplicitJSON || (anyOK && anyQ > 0)
+	hasEventStreamAlternative := eventOK && eventQ > 0
+	if !sszSupported && sszOK && sszQ > 0 && !hasJSONAlternative && !hasEventStreamAlternative {
+		return responseEncodingSSZ
+	}
+	if hasJSONAlternative {
+		return responseEncodingJSON
+	}
+	if hasEventStreamAlternative {
+		return responseEncodingEventStream
+	}
+	return responseEncodingUnsupported
+}
+
+func supportsSSZ(ans any) bool {
+	if beaconResponse, ok := ans.(*BeaconResponse); ok {
+		if beaconResponse == nil {
+			return false
+		}
+		_, ok = beaconResponse.Data.(ssz.Marshaler)
+		return ok
+	}
+	_, ok := ans.(ssz.Marshaler)
+	return ok
+}
+
+func acceptQuality(accept, target string) (float64, bool) {
+	var best float64
+	var found bool
+	for part := range strings.SplitSeq(accept, ",") {
+		mediaType, params, err := mime.ParseMediaType(strings.TrimSpace(part))
+		if err != nil || mediaType != target {
+			continue
+		}
+		q := 1.0
+		if qValue, ok := params["q"]; ok {
+			parsed, err := strconv.ParseFloat(qValue, 64)
+			if err != nil {
+				parsed = 0
+			}
+			q = max(0, min(1, parsed))
+		}
+		if !found || q > best {
+			best = q
+		}
+		found = true
+	}
+	return best, found
 }
 
 func isNil[T any](t T) bool {

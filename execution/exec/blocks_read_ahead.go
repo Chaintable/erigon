@@ -1,21 +1,24 @@
 package exec
 
 import (
+	"bytes"
 	"context"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	lru "github.com/hashicorp/golang-lru/v2"
 	"golang.org/x/sync/errgroup"
+	"golang.org/x/sync/semaphore"
 
 	"github.com/erigontech/erigon/common"
 	"github.com/erigontech/erigon/common/dbg"
 	"github.com/erigontech/erigon/common/length"
 	"github.com/erigontech/erigon/common/log/v3"
+	"github.com/erigontech/erigon/db/dbservices"
 	"github.com/erigontech/erigon/db/kv"
 	"github.com/erigontech/erigon/db/kv/dbutils"
-	"github.com/erigontech/erigon/db/services"
+	"github.com/erigontech/erigon/db/rawdb"
+	"github.com/erigontech/erigon/execution/cache"
 	"github.com/erigontech/erigon/execution/protocol/rules"
 	"github.com/erigontech/erigon/execution/state"
 	"github.com/erigontech/erigon/execution/types"
@@ -28,9 +31,18 @@ type BlockReadAheader struct {
 	bodies  *lru.Cache[common.Hash, *types.Body]
 	senders *lru.Cache[common.Hash, []byte] // just do raw senders
 
-	// this is for warming state
-	warming atomic.Bool // only one warmBody can run at a time
-	warmWg  sync.WaitGroup
+	// The single permit belongs either to one warmup or to the code suspending
+	// warmup across an unwind. Warmups never wait for it: read-ahead is
+	// best-effort, and queued work would be stale by the time an unwind ends.
+	warmupGate *semaphore.Weighted
+
+	// stateCache is the process-global state cache that SharedDomains.GetLatest
+	// consults on the EVM hot path. When set, warmBody routes its prefetches
+	// through a cache-populating getter so the same hashmap the EVM probes is
+	// pre-warmed. Without it, prefetches only warm OS page cache + RoTx
+	// cursors — disconnected from the cache layer the EVM actually reads.
+	// Mirrors reth's CachedReads / ExecutionCache "same hashmap" property.
+	stateCache *cache.StateCache
 }
 
 func NewBlockReadAheader() *BlockReadAheader {
@@ -47,10 +59,55 @@ func NewBlockReadAheader() *BlockReadAheader {
 		panic(err)
 	}
 	return &BlockReadAheader{
-		headers: headers,
-		bodies:  bodies,
-		senders: senders,
+		headers:    headers,
+		bodies:     bodies,
+		senders:    senders,
+		warmupGate: semaphore.NewWeighted(1),
 	}
+}
+
+// SetStateCache wires the process-global state cache so warmBody's
+// prefetches land in the same hashmap that SharedDomains.GetLatest probes
+// on the EVM hot path. Without this, prefetches warm OS page cache only —
+// the EVM still pays the file accessor stack on its first per-address read.
+// Idempotent; safe to call before the first AddHeaderAndBody.
+func (bra *BlockReadAheader) SetStateCache(sc *cache.StateCache) {
+	bra.stateCache = sc
+}
+
+// cachePopulatingGetter wraps a kv.TemporalGetter and fills a StateCache
+// ReadView as a side effect. Used by warmBody to make read-ahead prefetches
+// populate the same in-process cache layer that SharedDomains.GetLatest
+// consults — eliminating the file-accessor stack cost on the EVM's first
+// touch of any prefetched address.
+//
+// Code reads also populate the content-addressed and size-cache layers.
+type cachePopulatingGetter struct {
+	kv.TemporalGetter
+	view     cache.ReadView
+	stepSize uint64 // for the read txNum upper bound (last txNum of the read's step)
+}
+
+func readAheadGetter(ttx kv.TemporalTx, sc *cache.StateCache) kv.TemporalGetter {
+	if sc == nil {
+		return ttx
+	}
+	debug := ttx.Debug()
+	stateVersion, err := rawdb.GetStateVersion(ttx)
+	if err != nil {
+		return ttx
+	}
+	frontier := cache.FrontierWithStateVersion(debug, stateVersion)
+	return &cachePopulatingGetter{TemporalGetter: ttx, view: sc.View(frontier), stepSize: debug.StepSize()}
+}
+
+func (cpg *cachePopulatingGetter) GetLatest(name kv.Domain, k []byte) ([]byte, kv.Step, error) {
+	v, step, err := cpg.TemporalGetter.GetLatest(name, k)
+	if err == nil {
+		readTxNum := (uint64(step)+1)*cpg.stepSize - 1
+		cpg.view.Fill(name, k, v, readTxNum)
+	}
+	return v, step, err
 }
 
 func (bra *BlockReadAheader) AddHeaderAndBody(ctx context.Context, db kv.RoDB, header *types.Header, body *types.Body) {
@@ -58,30 +115,40 @@ func (bra *BlockReadAheader) AddHeaderAndBody(ctx context.Context, db kv.RoDB, h
 	bra.headers.Add(blockHash, header)
 	bra.bodies.Add(blockHash, body)
 	if db != nil && ctx != nil {
-		// Only allow one warmBody to run at a time
-		if !bra.warming.CompareAndSwap(false, true) {
-			return
-		}
-		bra.warmWg.Add(1)
-		go func() {
-			defer bra.warmWg.Done()
+		bra.startWarmup(func() {
 			bra.warmBody(ctx, db, header, body, 8) // use 8 workers for warming
-		}()
+		})
 	}
 }
 
-// WaitForWarmup blocks until any in-flight warmBody goroutine finishes or
-// the context is cancelled. Call before closing the database to avoid
-// waitTxsAllDoneOnClose hangs.
-func (bra *BlockReadAheader) WaitForWarmup(ctx context.Context) {
-	done := make(chan struct{})
+func (bra *BlockReadAheader) startWarmup(warm func()) bool {
+	if !bra.warmupGate.TryAcquire(1) {
+		return false
+	}
 	go func() {
-		bra.warmWg.Wait()
-		close(done)
+		defer bra.warmupGate.Release(1)
+		warm()
 	}()
-	select {
-	case <-done:
-	case <-ctx.Done():
+	return true
+}
+
+// SuspendWarmup waits for active state-cache warmup and prevents another
+// warmup from starting until the returned function is called. Keep it
+// suspended while staged unwind state is being read or published. If ctx is
+// cancelled first, no suspension remains pending.
+func (bra *BlockReadAheader) SuspendWarmup(ctx context.Context) (func(), error) {
+	if err := bra.warmupGate.Acquire(ctx, 1); err != nil {
+		return nil, err
+	}
+	return sync.OnceFunc(func() { bra.warmupGate.Release(1) }), nil
+}
+
+// WaitForWarmup waits until neither a warmup nor a suspension owns the permit,
+// or until the context is cancelled. Call it before closing the database to
+// avoid waitTxsAllDoneOnClose hangs.
+func (bra *BlockReadAheader) WaitForWarmup(ctx context.Context) {
+	if err := bra.warmupGate.Acquire(ctx, 1); err == nil {
+		bra.warmupGate.Release(1)
 	}
 }
 
@@ -89,16 +156,15 @@ func (bra *BlockReadAheader) AddSenders(senders []byte, blockHash common.Hash) {
 	if _, ok := bra.bodies.Get(blockHash); !ok {
 		return
 	}
-	bra.senders.Add(blockHash, common.Copy(senders))
+	bra.senders.Add(blockHash, bytes.Clone(senders))
 }
 
 // warmBody warms state for all transactions in a body using multiple workers.
 // It reads: To accounts, To account code, To account storage from access lists,
 // and block-level access lists. Each worker creates its own transaction.
-// Only one warmBody can run at a time - concurrent calls are no-ops.
+// AddHeaderAndBody permits only one warmBody at a time; concurrent requests
+// skip warming.
 func (bra *BlockReadAheader) warmBody(ctx context.Context, db kv.RoDB, header *types.Header, body *types.Body, workers int) {
-	defer bra.warming.Store(false)
-
 	if !dbg.ReadAhead {
 		return
 	}
@@ -136,7 +202,7 @@ func (bra *BlockReadAheader) warmBody(ctx context.Context, db kv.RoDB, header *t
 		// Pre-divide work: each worker gets a dedicated range of BAL entries
 		entriesPerWorker := (balLen + balWorkers - 1) / balWorkers
 
-		for w := 0; w < balWorkers; w++ {
+		for w := range balWorkers {
 			start := w * entriesPerWorker
 			end := min(start+entriesPerWorker, balLen)
 			if start >= balLen {
@@ -157,7 +223,7 @@ func (bra *BlockReadAheader) warmBody(ctx context.Context, db kv.RoDB, header *t
 				if !ok {
 					return nil
 				}
-				stateReader := state.NewReaderV3(ttx)
+				stateReader := state.NewReaderV3(readAheadGetter(ttx, bra.stateCache))
 
 				for idx := workerStart; idx < workerEnd; idx++ {
 					select {
@@ -168,8 +234,10 @@ func (bra *BlockReadAheader) warmBody(ctx context.Context, db kv.RoDB, header *t
 
 					acctChanges := bal[idx]
 					acct, _ := stateReader.ReadAccountData(acctChanges.Address)
-					// Warm code if account has code or if there are code changes
-					if (acct != nil && !acct.CodeHash.IsEmpty()) || len(acctChanges.CodeChanges) > 0 {
+					// Warm code if account has code or if there are code changes.
+					if acct != nil && !acct.CodeHash.IsEmpty() {
+						stateReader.ReadAccountCode(acctChanges.Address)
+					} else if len(acctChanges.CodeChanges) > 0 {
 						stateReader.ReadAccountCode(acctChanges.Address)
 					}
 					for _, slotChanges := range acctChanges.StorageChanges {
@@ -221,7 +289,7 @@ func (bra *BlockReadAheader) warmBody(ctx context.Context, db kv.RoDB, header *t
 			if !ok {
 				return nil
 			}
-			stateReader := state.NewReaderV3(ttx)
+			stateReader := state.NewReaderV3(readAheadGetter(ttx, bra.stateCache))
 
 			for txIdx := workerStart; txIdx < workerEnd; txIdx++ {
 				select {
@@ -284,11 +352,11 @@ func (bra *BlockReadAheader) ReadBlockWithSenders(blockHash common.Hash) (*types
 	return types.NewBlockFromStorage(header.Hash(), header, body.Transactions, body.Uncles, body.Withdrawals), true
 }
 
-func BlocksReadAhead(ctx context.Context, workers int, db kv.RoDB, engine rules.Engine, blockReader services.FullBlockReader) (chan uint64, context.CancelFunc) {
+func BlocksReadAhead(ctx context.Context, workers int, db kv.RoDB, engine rules.Engine, blockReader dbservices.FullBlockReader) (chan uint64, context.CancelFunc) {
 	const readAheadBlocks = 500
 	readAhead := make(chan uint64, readAheadBlocks)
 	g, gCtx := errgroup.WithContext(ctx)
-	for workerNum := 0; workerNum < workers; workerNum++ {
+	for range workers {
 		g.Go(func() (err error) {
 			var bn uint64
 			var ok bool
@@ -330,7 +398,7 @@ func BlocksReadAhead(ctx context.Context, workers int, db kv.RoDB, engine rules.
 		_ = g.Wait()
 	}
 }
-func blocksReadAheadFunc(ctx context.Context, tx kv.Tx, blockNum uint64, engine rules.Engine, blockReader services.FullBlockReader) error {
+func blocksReadAheadFunc(ctx context.Context, tx kv.Tx, blockNum uint64, engine rules.Engine, blockReader dbservices.FullBlockReader) error {
 	block, err := blockReader.BlockByNumber(ctx, tx, blockNum)
 	if err != nil {
 		return err

@@ -32,9 +32,9 @@ import (
 	"github.com/erigontech/erigon/common/log/v3"
 	"github.com/erigontech/erigon/db/consensuschain"
 	"github.com/erigontech/erigon/db/datadir"
+	"github.com/erigontech/erigon/db/dbservices"
 	"github.com/erigontech/erigon/db/kv"
 	"github.com/erigontech/erigon/db/kv/rawdbv3"
-	"github.com/erigontech/erigon/db/services"
 	"github.com/erigontech/erigon/execution/chain"
 	"github.com/erigontech/erigon/execution/protocol"
 	"github.com/erigontech/erigon/execution/protocol/aa"
@@ -344,7 +344,7 @@ func (rw *HistoricalTraceWorker) ResetTx(chainTx kv.TemporalTx) {
 type ExecArgs struct {
 	ChainDB     kv.TemporalRoDB
 	Genesis     *types.Genesis
-	BlockReader services.FullBlockReader
+	BlockReader dbservices.FullBlockReader
 	Engine      rules.Engine
 	Dirs        datadir.Dirs
 	ChainConfig *chain.Config
@@ -424,8 +424,7 @@ func doHistoryMap(ctx context.Context, consumer TraceConsumer, cfg *ExecArgs, in
 	mapGroup, ctx := errgroup.WithContext(ctx)
 	// we all errors in background workers (except ctx.Cancel), because applyLoop will detect this error anyway.
 	// and in applyLoop all errors are critical
-	for i := 0; i < workerCount; i++ {
-		i := i
+	for i := range workerCount {
 		workers[i] = NewHistoricalTraceWorker(ctx, consumer, in, out, true, cfg, logger)
 		mapGroup.Go(func() error {
 			return workers[i].Run()
@@ -491,16 +490,16 @@ func (p *historicalResultProcessor) processResults(consumer TraceConsumer, cfg *
 				defer ibs.Release(false)
 				ibs.SetTxContext(txTask.BlockNumber(), txTask.TxIndex)
 				syscall := func(contract accounts.Address, data []byte) ([]byte, error) {
-					ret, err := protocol.SysCallContract(contract, data, cfg.ChainConfig, ibs, txTask.Header, txTask.Engine, false /* constCall */, vm.Config{
+					return protocol.SysCallContract(contract, data, cfg.ChainConfig, ibs, txTask.Header, txTask.Engine, false /* constCall */, vm.Config{
 						Tracer: result.TracingHooks(),
 					})
-					result.Logs = append(result.Logs, ibs.GetRawLogs(txTask.TxIndex)...)
-					return ret, err
 				}
 
 				_, err := cfg.Engine.Finalize(cfg.ChainConfig, types.CopyHeader(txTask.Header), ibs, txTask.Uncles, p.blockResult.Receipts, txTask.Withdrawals, chainReader, syscall, true /* skipReceiptsEval */, logger)
 				if err != nil {
 					result.Err = err
+				} else {
+					result.Logs = append(result.Logs, ibs.GetRawLogs(txTask.TxIndex)...)
 				}
 			}
 
@@ -663,7 +662,7 @@ func CustomTraceMapReduce(ctx context.Context, fromBlock, toBlock uint64, consum
 	return nil
 }
 
-func BlockWithSenders(ctx context.Context, db kv.RoDB, tx kv.Tx, blockReader services.BlockReader, blockNum uint64) (b *types.Block, err error) {
+func BlockWithSenders(ctx context.Context, db kv.RoDB, tx kv.Tx, blockReader dbservices.BlockReader, blockNum uint64) (b *types.Block, err error) {
 	select {
 	case <-ctx.Done():
 		return nil, ctx.Err()
