@@ -17,6 +17,7 @@
 package cltypes
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 
@@ -407,7 +408,7 @@ func (b *Eth1Block) EncodingSizeSSZ() (size int) {
 // DecodeSSZ decodes the block in SSZ format.
 func (b *Eth1Block) DecodeSSZ(buf []byte, version int) error {
 	b.Extra = solid.NewExtraData()
-	b.Transactions = &solid.TransactionsSSZ{}
+	b.Transactions = solid.NewTransactionsSSZWithLimits(b.beaconCfg.MaxTransactionsPerPayload, b.beaconCfg.MaxBytesPerTransaction)
 	b.Withdrawals = solid.NewStaticListSSZ[*Withdrawal](int(b.beaconCfg.MaxWithdrawalsPerPayload), 44)
 	b.version = clparams.StateVersion(version)
 	if b.version >= clparams.GloasVersion {
@@ -460,7 +461,7 @@ func (b *Eth1Block) getSchema() []any {
 // RlpHeader returns the equivalent types.Header struct with RLP-based fields.
 func (b *Eth1Block) RlpHeader(parentRoot *common.Hash, executionReqHash common.Hash) (*types.Header, error) {
 	// Reverse the order of the bytes in the BaseFeePerGas array and convert it to a big integer.
-	reversedBaseFeePerGas := common.Copy(b.BaseFeePerGas[:])
+	reversedBaseFeePerGas := bytes.Clone(b.BaseFeePerGas[:])
 	for i, j := 0, len(reversedBaseFeePerGas)-1; i < j; i, j = i+1, j-1 {
 		reversedBaseFeePerGas[i], reversedBaseFeePerGas[j] = reversedBaseFeePerGas[j], reversedBaseFeePerGas[i]
 	}
@@ -521,7 +522,7 @@ func (b *Eth1Block) RlpHeader(parentRoot *common.Hash, executionReqHash common.H
 		if b.BlockAccessList == nil || b.BlockAccessList.EncodingSizeSSZ() == 0 {
 			*blockAccessListHash = empty.BlockAccessListHash
 		} else {
-			*blockAccessListHash = crypto.HashData(b.BlockAccessList.Bytes())
+			*blockAccessListHash = crypto.Keccak256Hash(b.BlockAccessList.Bytes())
 		}
 		header.BlockAccessListHash = blockAccessListHash
 		slotNumber := b.SlotNumber

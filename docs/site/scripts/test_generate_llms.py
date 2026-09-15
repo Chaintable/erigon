@@ -159,6 +159,125 @@ class LandingSynthesisTests(unittest.TestCase):
         out = g.synthesize_landing("# Hello\n\nProse only, no cards.")
         self.assertIsNone(out)
 
+    def test_desc_with_inline_markup_is_extracted(self):
+        """Inline markup in a description must not defeat the match."""
+        body = """
+<div className="lp-grid">
+<Link className="lp-card" to="/pruning/">
+  <div className="lp-card-title">Flexible Pruning</div>
+  <div className="lp-card-desc"><code>--prune.mode=minimal</code> gives a <strong>smaller</strong> footprint.</div>
+</Link>
+</div>
+"""
+        out = g.synthesize_landing(body)
+        self.assertIsNotNone(out)
+        self.assertIn("--prune.mode=minimal gives a smaller footprint.", out)
+        self.assertNotIn("<code>", out)
+        self.assertNotIn("<strong>", out)
+
+    def test_markup_card_does_not_swallow_the_next_card(self):
+        """A card whose desc has markup must not steal the following card's desc."""
+        body = """
+<div className="lp-grid">
+<Link className="lp-card" to="/immutable/">
+  <div className="lp-card-title">Immutable Data</div>
+  <div className="lp-card-desc">Historical data lives in <strong>immutable</strong> files.</div>
+</Link>
+<Link className="lp-card" to="/staged-sync/">
+  <div className="lp-card-title">Staged Sync</div>
+  <div className="lp-card-desc">Splits processing into specialised stages.</div>
+</Link>
+</div>
+"""
+        out = g.synthesize_landing(body)
+        self.assertIsNotNone(out)
+        bullets = [ln for ln in out.split("\n") if ln.startswith("- [")]
+        self.assertEqual(len(bullets), 2)
+        self.assertIn(
+            "- [Immutable Data](https://docs.erigon.tech/immutable): "
+            "Historical data lives in immutable files.",
+            bullets,
+        )
+        self.assertIn(
+            "- [Staged Sync](https://docs.erigon.tech/staged-sync): "
+            "Splits processing into specialised stages.",
+            bullets,
+        )
+
+    def test_dropped_card_raises_instead_of_silently_shrinking(self):
+        """A card the parser cannot read must fail loudly — `--check` cannot see it."""
+        body = """
+<div className="lp-grid">
+<Link className="lp-card" to="/ok/">
+  <div className="lp-card-title">Fine</div>
+  <div className="lp-card-desc">Parses correctly.</div>
+</Link>
+<Link className="lp-card" to="/broken/">
+  <div className="lp-card-title">Missing Its Description</div>
+</Link>
+</div>
+"""
+        with self.assertRaises(SystemExit) as ctx:
+            g.synthesize_landing(body)
+        self.assertIn("dropped cards", str(ctx.exception))
+
+    def test_renamed_title_marker_is_caught_not_absorbed(self):
+        """The guard must not count the marker it validates.
+
+        Counting `lp-card-title` would shrink in step with the very loss it is
+        meant to detect, so a renamed marker would drop its card in silence.
+        Counting `lp-card` containers keeps the two signals independent.
+        """
+        body = """
+<div className="lp-grid">
+<Link className="lp-card" to="/a/">
+  <div className="lp-card-title">A</div>
+  <div className="lp-card-desc">Desc A.</div>
+</Link>
+<Link className="lp-card" to="/b/">
+  <div className="lp-card-heading">B</div>
+  <div className="lp-card-desc">Desc B.</div>
+</Link>
+</div>
+"""
+        with self.assertRaises(SystemExit) as ctx:
+            g.synthesize_landing(body)
+        self.assertIn("parsed 1 of 2", str(ctx.exception))
+
+    def test_card_attribute_order_does_not_matter(self):
+        """`to=` may precede or follow the class; both must parse."""
+        body = """
+<div className="lp-grid">
+<Link to="/a/" className="lp-card">
+  <div className="lp-card-title">A</div>
+  <div className="lp-card-desc">Desc A.</div>
+</Link>
+</div>
+"""
+        out = g.synthesize_landing(body)
+        self.assertIsNotNone(out)
+        self.assertIn("[A](https://docs.erigon.tech/a): Desc A.", out)
+
+    def test_all_cards_malformed_raises_rather_than_falling_back(self):
+        """Total parser failure must not look like an ordinary prose page.
+
+        Returning None here would send the caller to strip_mdx, degrading the
+        page silently — the exact outcome the guard exists to prevent.
+        """
+        body = """
+<div className="lp-grid">
+<Link className="lp-card" to="/a/">
+  <div className="lp-card-title">A</div>
+</Link>
+<Link className="lp-card" to="/b/">
+  <div className="lp-card-title">B</div>
+</Link>
+</div>
+"""
+        with self.assertRaises(SystemExit) as ctx:
+            g.synthesize_landing(body)
+        self.assertIn("parsed 0 of 2", str(ctx.exception))
+
 
 class LeadingH1StripTests(unittest.TestCase):
     """The build() body-prep step strips a leading H1 to avoid duplicate headings."""
@@ -176,6 +295,169 @@ class LeadingH1StripTests(unittest.TestCase):
         out = re.sub(r"^#\s+[^\n]+\n?", "", body.lstrip("\n"), count=1)
         self.assertIn("## Subheading", out)
 
+
+
+class TabItemLabelTests(unittest.TestCase):
+    """Tab labels must survive as headings — without them, sibling tables and
+    code blocks are indistinguishable in the text output.
+    """
+
+    def test_label_becomes_heading_below_enclosing_section(self):
+        text = (
+            "## Disk Size\n\n"
+            "<Tabs>\n"
+            '<TabItem value="ethereum-mainnet" label="Ethereum mainnet">\n'
+            "| Mode | Usage |\n"
+            "</TabItem>\n"
+            "</Tabs>"
+        )
+        out = g.strip_mdx(text)
+        self.assertIn("### Ethereum mainnet", out)
+        self.assertNotIn("TabItem", out)
+
+    def test_multiline_opening_tag_still_yields_heading(self):
+        """MDX allows the attributes to be spread over several lines. Matching
+        within one line found no label, so the heading was dropped and the
+        multi-line component strip then swallowed the label text as well.
+        """
+        text = (
+            "## Disk Size\n\n"
+            "<Tabs>\n"
+            "<TabItem\n"
+            '  value="ethereum-mainnet"\n'
+            '  label="Ethereum mainnet">\n'
+            "| Mode | Usage |\n"
+            "</TabItem>\n"
+            "</Tabs>"
+        )
+        out = g.strip_mdx(text)
+        self.assertIn("### Ethereum mainnet", out)
+        self.assertNotIn("TabItem", out)
+        self.assertNotIn("value=", out)
+
+    def test_angle_bracket_inside_label_does_not_end_the_tag(self):
+        text = (
+            "## Ports\n\n"
+            "<Tabs>\n"
+            '<TabItem value="gt" label="Version > 3.1">\n'
+            "body\n"
+            "</TabItem>\n"
+            "</Tabs>"
+        )
+        out = g.strip_mdx(text)
+        self.assertIn("### Version > 3.1", out)
+        self.assertNotIn("TabItem", out)
+
+    def test_sibling_tabs_are_each_labelled(self):
+        text = (
+            "## Disk Size\n\n"
+            "<Tabs>\n"
+            '<TabItem value="sepolia" label="Sepolia">\n'
+            "| Archive | 1.10 TB |\n"
+            "</TabItem>\n"
+            '<TabItem value="hoodi" label="Hoodi">\n'
+            "| Archive | 133.73 GB |\n"
+            "</TabItem>\n"
+            "</Tabs>"
+        )
+        out = g.strip_mdx(text)
+        self.assertIn("### Sepolia", out)
+        self.assertIn("### Hoodi", out)
+        self.assertLess(out.index("### Sepolia"), out.index("1.10 TB"))
+        self.assertLess(out.index("1.10 TB"), out.index("### Hoodi"))
+
+    def test_depth_follows_nearest_preceding_heading(self):
+        text = "### Install\n\n<TabItem value=\"linux\" label=\"Linux\">\napt install\n"
+        out = g.strip_mdx(text)
+        self.assertIn("#### Linux", out)
+
+    def test_following_heading_stays_a_sibling(self):
+        """A heading after the tab set must not become a subsection of the last
+        tab — the installation page has exactly this shape (h1, OS tabs, then
+        '### All Operating Systems').
+        """
+        text = (
+            "# Installation\n\n"
+            "<Tabs>\n"
+            '<TabItem value="linux" label="Linux">\n'
+            "apt install\n"
+            "</TabItem>\n"
+            '<TabItem value="windows" label="Windows">\n'
+            "choco install\n"
+            "</TabItem>\n"
+            "</Tabs>\n\n"
+            "### All Operating Systems\n\nShared steps.\n"
+        )
+        out = g.strip_mdx(text)
+        self.assertIn("### Linux", out)
+        self.assertIn("### Windows", out)
+        self.assertNotIn("## Linux", out.replace("### Linux", ""))
+        # Same level as the heading that follows, so it is not nested under it.
+        self.assertIn("### All Operating Systems", out)
+
+    def test_depth_defaults_when_no_preceding_heading(self):
+        out = g.strip_mdx('<TabItem value="linux" label="Linux">\napt install\n')
+        self.assertIn("### Linux", out)
+
+    def test_depth_capped_at_h6(self):
+        text = "###### Deep\n\n<TabItem value=\"linux\" label=\"Linux\">\napt install\n"
+        out = g.strip_mdx(text)
+        self.assertIn("###### Linux", out)
+        self.assertNotIn("#######", out)
+
+    def test_single_quoted_and_braced_labels(self):
+        out = g.strip_mdx("## S\n\n<TabItem value='a' label='macOS'>\nbrew\n")
+        self.assertIn("### macOS", out)
+        out = g.strip_mdx("## S\n\n<TabItem value=\"a\" label={'Windows'}>\nchoco\n")
+        self.assertIn("### Windows", out)
+
+    def test_tabitem_inside_fence_untouched(self):
+        text = '```mdx\n<TabItem value="a" label="Linux">\n```'
+        out = g.strip_mdx(text)
+        self.assertIn('<TabItem value="a" label="Linux">', out)
+
+    def test_unlabelled_tabitem_falls_back_to_value(self):
+        """Docusaurus renders `value` when `label` is absent, so a tab without a
+        label must still get a heading — otherwise it silently reintroduces the
+        unlabelled-tables problem.
+        """
+        out = g.strip_mdx('## S\n\n<TabItem value="linux">\nbody\n')
+        self.assertIn("### linux", out)
+        self.assertNotIn("TabItem", out)
+        self.assertIn("body", out)
+
+    def test_label_wins_over_value(self):
+        out = g.strip_mdx('## S\n\n<TabItem value="macos" label="macOS">\nbrew\n')
+        self.assertIn("### macOS", out)
+        self.assertNotIn("### macos", out)
+
+    def test_attributeless_tabitem_emits_no_heading(self):
+        out = g.strip_mdx("## S\n\n<TabItem>\nbody\n")
+        self.assertNotIn("TabItem", out)
+        self.assertIn("body", out)
+        self.assertEqual(out.count("###"), 0)
+
+    def test_heading_inside_tab_body_does_not_split_the_set(self):
+        """A heading inside the first tab's body must not demote the tabs after
+        it: the set is delimited by <Tabs>…</Tabs>, not by heading positions.
+        """
+        text = (
+            "## Setup\n\n"
+            "<Tabs>\n"
+            '<TabItem value="linux" label="Linux">\n'
+            "#### Extra step\n"
+            "apt install\n"
+            "</TabItem>\n"
+            '<TabItem value="windows" label="Windows">\n'
+            "choco install\n"
+            "</TabItem>\n"
+            "</Tabs>\n"
+        )
+        out = g.strip_mdx(text)
+        self.assertIn("### Linux", out)
+        self.assertIn("### Windows", out)
+        # Both tabs sit at the same level despite the h4 inside the first body.
+        self.assertNotIn("##### Windows", out)
 
 if __name__ == "__main__":
     unittest.main()

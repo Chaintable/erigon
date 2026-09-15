@@ -47,7 +47,7 @@ Erigon processes the chain in a series of **stages** rather than the traditional
 
 A simplified pipeline:
 
-```
+```text
 1. Snapshots    → fetch immutable history files via BitTorrent (OtterSync)
 2. Headers      → download and verify block headers
 3. Bodies       → download block bodies
@@ -92,7 +92,7 @@ Erigon stores everything under a single **datadir**. Two kinds of files live the
 
 This split is what enables Erigon's small disk footprint relative to other archive nodes:
 
-- **`chaindata/` is small (~15 GB on Ethereum mainnet)** because it only holds latest state and recently-updated values.
+- **`chaindata/` is small (~22 GB on Ethereum mainnet, rarely more than 25 GB)** because it only holds latest state and recently-updated values.
 - **`snapshots/` is large but content-addressed.** Once a `.seg` file is finalised it is the *same file* on every Erigon node in the world — meaning it can be distributed via BitTorrent and verified by hash. There is no rewrite-amplification penalty for keeping history.
 
 For the exact directory layout, file sizes on mainnet, and how to split storage across fast/slow disks, see [Database](database) and [Optimizing Storage](optimizing-storage).

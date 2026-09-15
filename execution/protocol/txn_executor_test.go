@@ -24,9 +24,11 @@ import (
 
 	"github.com/erigontech/erigon/common"
 	"github.com/erigontech/erigon/execution/chain"
+	"github.com/erigontech/erigon/execution/protocol/mdgas"
 	"github.com/erigontech/erigon/execution/protocol/misc"
 	"github.com/erigontech/erigon/execution/protocol/params"
 	"github.com/erigontech/erigon/execution/state"
+	"github.com/erigontech/erigon/execution/tracing"
 	"github.com/erigontech/erigon/execution/types"
 	"github.com/erigontech/erigon/execution/types/accounts"
 	"github.com/erigontech/erigon/execution/vm"
@@ -77,6 +79,7 @@ func TestEIP7825_GasPoolPreservedOnReject(t *testing.T) {
 
 	t.Run("rejected tx preserves gas pool", func(t *testing.T) {
 		ibs := state.New(state.NewNoopReader())
+		defer ibs.Release(false)
 		evm := newTestEVM(ibs, cfg, blockGasLimit)
 		msg := newSimpleTransferMsg(sender, recipient, params.MaxTxnGasLimit+1, true)
 		gp := new(GasPool).AddGas(blockGasLimit)
@@ -91,6 +94,7 @@ func TestEIP7825_GasPoolPreservedOnReject(t *testing.T) {
 
 	t.Run("valid tx debits gas pool normally", func(t *testing.T) {
 		ibs := state.New(state.NewNoopReader())
+		defer ibs.Release(false)
 		evm := newTestEVM(ibs, cfg, blockGasLimit)
 		msg := newSimpleTransferMsg(sender, recipient, params.MaxTxnGasLimit, true)
 		gp := new(GasPool).AddGas(blockGasLimit)
@@ -108,6 +112,7 @@ func TestEIP7825_GasPoolPreservedOnReject(t *testing.T) {
 		// Simulate the original bug scenario: a rejected tx should not prevent
 		// a subsequent valid tx from succeeding due to pool exhaustion.
 		ibs := state.New(state.NewNoopReader())
+		defer ibs.Release(false)
 		gp := new(GasPool).AddGas(blockGasLimit)
 
 		// First: a tx that exceeds the cap — must be rejected without touching pool.
@@ -151,6 +156,7 @@ func TestEIP8037_GasPoolTracksRegularAndStateIndependently(t *testing.T) {
 	recipient := accounts.InternAddress(common.HexToAddress("0x2222222222222222222222222222222222222222"))
 
 	ibs := state.New(state.NewNoopReader())
+	defer ibs.Release(false)
 	gp := NewGasPool(blockGasLimit, 0)
 	blockCtx := evmtypes.BlockContext{
 		CanTransfer: CanTransfer,
@@ -239,6 +245,7 @@ func TestPreCheckErrorOrdering_GasBeforeFeeCap(t *testing.T) {
 
 	t.Run("tx-gas > block-gas-limit AND fee-cap < baseFee returns ErrGasLimitReached", func(t *testing.T) {
 		ibs := state.New(state.NewNoopReader())
+		defer ibs.Release(false)
 		blockCtx := evmtypes.BlockContext{
 			CanTransfer: CanTransfer,
 			Transfer:    misc.Transfer,
@@ -294,5 +301,102 @@ func TestPreCheckErrorOrdering_GasBeforeFeeCap(t *testing.T) {
 	t.Run("CheckBlockGasInclusion accepts when both contributions fit", func(t *testing.T) {
 		gp := NewGasPool(100_000, 0)
 		require.NoError(t, CheckBlockGasInclusion(gp, 50_000, 80_000))
+	})
+}
+
+// nilBlobFeeMsg is a Message whose MaxFeePerBlobGas is nil, as returned by
+// call-style messages (e.g. the simulated backend's callMsg).
+type nilBlobFeeMsg struct{ *types.Message }
+
+func (nilBlobFeeMsg) MaxFeePerBlobGas() *uint256.Int { return nil }
+
+// TestBuyGas_NilMaxFeePerBlobGas verifies buyGas does not dereference a nil
+// MaxFeePerBlobGas for a non-blob transaction on Cancun.
+func TestBuyGas_NilMaxFeePerBlobGas(t *testing.T) {
+	t.Parallel()
+
+	sender := accounts.InternAddress(common.HexToAddress("0x1111111111111111111111111111111111111111"))
+	recipient := accounts.InternAddress(common.HexToAddress("0x2222222222222222222222222222222222222222"))
+
+	ibs := state.New(state.NewNoopReader())
+	evm := newTestEVM(ibs, chain.TestChainOsakaConfig, 30_000_000)
+	msg := nilBlobFeeMsg{newSimpleTransferMsg(sender, recipient, 100_000, false)}
+	st := NewTxnExecutor(evm, msg, new(GasPool).AddGas(30_000_000))
+
+	var err error
+	require.NotPanics(t, func() { err = st.buyGas(false) })
+	require.NoError(t, err)
+}
+
+// TestBuyGas_NilMaxFeePerBlobGasWithBlobs covers the same nil max fee on a
+// message that does carry blobs, so the blob-fee branch is actually entered.
+func TestBuyGas_NilMaxFeePerBlobGasWithBlobs(t *testing.T) {
+	t.Parallel()
+
+	sender := accounts.InternAddress(common.HexToAddress("0x1111111111111111111111111111111111111111"))
+	recipient := accounts.InternAddress(common.HexToAddress("0x2222222222222222222222222222222222222222"))
+
+	inner := newSimpleTransferMsg(sender, recipient, 100_000, false)
+	inner.SetBlobVersionedHashes([]common.Hash{{0x01}})
+
+	ibs := state.New(state.NewNoopReader())
+	evm := newTestEVM(ibs, chain.TestChainOsakaConfig, 30_000_000)
+	gp := new(GasPool).AddGas(30_000_000).AddBlobGas(params.GasPerBlob)
+	st := NewTxnExecutor(evm, nilBlobFeeMsg{inner}, gp)
+
+	var err error
+	require.NotPanics(t, func() { err = st.buyGas(false) })
+	require.NoError(t, err)
+}
+
+// TestPreCheckNonceMismatchError pins the message text and the errors.Is
+// identity that block assembly and eth_simulate match on. The sender address
+// carries letters so the pinned text also covers EIP-55 casing.
+func TestPreCheckNonceMismatchError(t *testing.T) {
+	t.Parallel()
+
+	sender := accounts.InternAddress(common.HexToAddress("0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"))
+	recipient := accounts.InternAddress(common.HexToAddress("0x2222222222222222222222222222222222222222"))
+
+	preCheckWithNonce := func(t *testing.T, stateNonce, msgNonce uint64) error {
+		t.Helper()
+		ibs := state.New(state.NewNoopReader())
+		require.NoError(t, ibs.SetNonce(sender, stateNonce, tracing.NonceChangeGenesis))
+
+		evm := newTestEVM(ibs, chain.TestChainOsakaConfig, 30_000_000)
+		msg := types.NewMessage(
+			sender, recipient, msgNonce, uint256.NewInt(0), 100_000,
+			uint256.NewInt(0), uint256.NewInt(0), uint256.NewInt(0),
+			nil, nil,
+			true,  // checkNonce
+			false, // checkTransaction
+			false, // checkGas
+			false, // isFree
+			nil,   // maxFeePerBlobGas
+		)
+		st := NewTxnExecutor(evm, msg, new(GasPool).AddGas(30_000_000))
+		return st.preCheck(false, mdgas.IntrinsicGasCalcResult{})
+	}
+
+	t.Run("nonce too high", func(t *testing.T) {
+		err := preCheckWithNonce(t, 3, 7)
+		require.ErrorIs(t, err, ErrNonceTooHigh)
+		require.NotErrorIs(t, err, ErrNonceTooLow)
+		require.Equal(t,
+			"nonce too high: address 0xDeaDbeefdEAdbeefdEadbEEFdeadbeEFdEaDbeeF, tx: 7 state: 3",
+			err.Error())
+	})
+
+	t.Run("nonce too low", func(t *testing.T) {
+		err := preCheckWithNonce(t, 7, 3)
+		require.ErrorIs(t, err, ErrNonceTooLow)
+		require.NotErrorIs(t, err, ErrNonceTooHigh)
+		require.Equal(t,
+			"nonce too low: address 0xDeaDbeefdEAdbeefdEadbEEFdeadbeEFdEaDbeeF, tx: 3 state: 7",
+			err.Error())
+	})
+
+	t.Run("matching nonce passes", func(t *testing.T) {
+		require.NoError(t, preCheckWithNonce(t, 5, 5))
 	})
 }

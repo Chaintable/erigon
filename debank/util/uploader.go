@@ -122,9 +122,7 @@ func (u *Uploader) UploadDebankOutPut(ctx context.Context, out *dtypes.DebankOut
 	var allerr error
 	var lock sync.Mutex
 
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		err := u.uploadBlockFile(out.BlockFile)
 		if err != nil {
 			lock.Lock()
@@ -132,11 +130,9 @@ func (u *Uploader) UploadDebankOutPut(ctx context.Context, out *dtypes.DebankOut
 			lock.Unlock()
 			log.Error("uploadBlockFile", "err", err)
 		}
-	}()
+	})
 
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		err := u.uploadFileValidation(u.chainID, out.BlockFile)
 		if err != nil {
 			lock.Lock()
@@ -144,11 +140,9 @@ func (u *Uploader) UploadDebankOutPut(ctx context.Context, out *dtypes.DebankOut
 			lock.Unlock()
 			log.Error("uploadFileValidation", "err", err)
 		}
-	}()
+	})
 
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		err := u.uploadHeader(u.chainID, out.Header)
 		if err != nil {
 			lock.Lock()
@@ -156,11 +150,9 @@ func (u *Uploader) UploadDebankOutPut(ctx context.Context, out *dtypes.DebankOut
 			lock.Unlock()
 			log.Error("uploadHeader", "err", err)
 		}
-	}()
+	})
 
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		// 如果StateDiff的Hash和ParentHash相同，说明是empty block，不用上传
 		if out.StateDiff.Hash == out.StateDiff.ParentHash {
 			return
@@ -172,7 +164,7 @@ func (u *Uploader) UploadDebankOutPut(ctx context.Context, out *dtypes.DebankOut
 			lock.Unlock()
 			log.Error("uploadStateDiff", "err", err)
 		}
-	}()
+	})
 	wg.Wait()
 
 	log.Info("upload debank output", "block", out.Header.Number.Uint64())

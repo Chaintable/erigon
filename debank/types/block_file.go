@@ -19,7 +19,7 @@ type BlockFile struct {
 }
 
 func (bf *BlockFile) Validation() BlockValidation {
-	var ids []string
+	ids := make([]string, 0, 1+len(bf.Txs)+len(bf.Events)+len(bf.Traces))
 
 	// Collect all IDs
 	ids = append(ids, bf.Block.ID) // assuming Block has an ID field

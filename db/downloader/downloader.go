@@ -57,6 +57,7 @@ import (
 
 	"github.com/erigontech/erigon/common"
 	"github.com/erigontech/erigon/common/dbg"
+	"github.com/erigontech/erigon/common/dir"
 	"github.com/erigontech/erigon/common/log/v3"
 	"github.com/erigontech/erigon/db/datadir"
 	"github.com/erigontech/erigon/db/downloader/downloadercfg"
@@ -471,11 +472,9 @@ func (d *Downloader) ManifestReady() <-chan struct{} {
 // It discovers chain.toml from P2P peers and either merges new entries (acquiring mode)
 // or verifies against local entries (verify mode after initial sync).
 func (d *Downloader) StartChainTomlDiscovery(ctx context.Context, networkName string) {
-	d.wg.Add(1)
-	go func() {
-		defer d.wg.Done()
+	d.wg.Go(func() {
 		d.chainTomlDiscoveryLoop(ctx, networkName)
-	}()
+	})
 }
 
 // StartTorrentPeerManager launches the background torrent peer manager that
@@ -490,11 +489,9 @@ func (d *Downloader) StartTorrentPeerManager(ctx context.Context) {
 	}
 
 	d.peerManager = NewTorrentPeerManager(d.torrentClient, fn, d.logger)
-	d.wg.Add(1)
-	go func() {
-		defer d.wg.Done()
+	d.wg.Go(func() {
 		d.peerManager.Run(ctx)
-	}()
+	})
 }
 
 // Check snapshot data looks right.
@@ -750,7 +747,10 @@ func (d *Downloader) VerifyData(
 func (d *Downloader) AddNewSeedableFile(ctx context.Context, name string) error {
 	ff, isStateFile, ok := snaptype.ParseFileName("", name)
 	if ok {
-		if !isStateFile && ff.Type == nil {
+		// Caplin beacon-state snapshots have no registered global snaptype, so
+		// ParseFileName leaves ff.Type nil but populates CaplinTypeString; they are
+		// still seedable by name.
+		if !isStateFile && ff.Type == nil && ff.CaplinTypeString == "" {
 			return fmt.Errorf("nil ptr after parsing file: %s", name)
 		}
 	}
@@ -834,9 +834,7 @@ func (d *Downloader) startSnapshotsDownload(
 	var batchCtx context.Context
 	batchCtx, batch.cancel = context.WithCancelCause(d.ctx)
 
-	batch.all.Add(1)
-	go func() {
-		defer batch.all.Done()
+	batch.all.Go(func() {
 		d.logDownload(
 			batchCtx,
 			items,
@@ -854,7 +852,7 @@ func (d *Downloader) startSnapshotsDownload(
 				}
 			},
 		)
-	}()
+	})
 
 	defer func() {
 		if err != nil {
@@ -1003,6 +1001,17 @@ func (d *Downloader) testStartSingleDownloadNoWait(
 	return err
 }
 
+// Once preverified.toml is on disk the local files are what this node built or restored, so the
+// manifest no longer outranks them: data that is present is neither moved aside nor downloaded
+// over. Read every call, the snapshot stage writes the file mid-run.
+func (d *Downloader) keepLocalSnapshot(name snapshotName) (bool, error) {
+	complete, err := dir.FileExist(d.cfg.Dirs.PreverifiedPath())
+	if err != nil || !complete {
+		return false, err
+	}
+	return dir.FileExist(d.filePathForName(name))
+}
+
 func (d *Downloader) invalidateData(name snapshotName, infoHash metainfo.Hash) (err error) {
 	_, ok := d.torrentClient.Torrent(infoHash)
 	// Torrent in use, bad idea to proceed. This shouldn't happen since we should have found
@@ -1011,10 +1020,17 @@ func (d *Downloader) invalidateData(name snapshotName, infoHash metainfo.Hash) (
 	// Ensure the data isn't reused. We're presuming the storage in use, but we can't afford
 	// to wait until another torrent is fetched, and then we mistake a non-partial file with
 	// the correct size as being complete.
-	err = os.Rename(d.filePathForName(name), d.filePathForName(name+".part"))
-	if err != nil && errors.Is(err, os.ErrNotExist) {
-		err = nil
+	from := d.filePathForName(name)
+	to := d.filePathForName(name + ".part")
+	err = os.Rename(from, to)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			err = nil
+		}
+		return
 	}
+	d.log(log.LvlWarn, "invalidated local snapshot data, will re-download",
+		"name", name, "renamed_to", to, "preverified", infoHash)
 	return
 }
 
@@ -1059,8 +1075,10 @@ func (d *Downloader) addPreverifiedSnapshotForDownload(
 	}
 	// We can invalidate data if a torrent isn't yet loaded.
 	if !ok {
-		miOpt, err = d.loadMatchingMetainfoOrInvalidateData(infoHash, name)
-		if err != nil {
+		var keep bool
+		miOpt, keep, err = d.loadMatchingMetainfoOrInvalidateData(infoHash, name)
+		// A nil torrent tells the caller the local file was kept.
+		if err != nil || keep {
 			return
 		}
 		var new bool
@@ -1080,6 +1098,8 @@ func (d *Downloader) loadMatchingMetainfoOrInvalidateData(
 	name string,
 ) (
 	miOpt g.Option[*metainfo.MetaInfo],
+	// Local data was kept, so there is nothing to download.
+	keep bool,
 	err error,
 ) {
 	miOpt, err = d.maybeLoadMetainfoFromDisk(name)
@@ -1101,6 +1121,13 @@ func (d *Downloader) loadMatchingMetainfoOrInvalidateData(
 		miOpt.SetNone()
 	} else {
 		d.log(log.LvlDebug, "snapshot metainfo missing", "name", name)
+	}
+	keep, err = d.keepLocalSnapshot(name)
+	if err != nil || keep {
+		if keep {
+			d.log(log.LvlWarn, "keeping local snapshot, skipping preverified download", "name", name)
+		}
+		return
 	}
 	err = d.invalidateData(name, infoHash)
 	if err != nil {
@@ -1508,8 +1535,8 @@ func (d *Downloader) logSyncStats(startTime time.Time, stats AggStats, target st
 	}
 
 	addCtx(
-		"time-left", calculateTime(remainingBytes, stats.CompletionRate),
-		"time-elapsed", time.Since(startTime).Truncate(time.Second).String(),
+		"eta", calculateTime(remainingBytes, stats.CompletionRate),
+		"elapsed", time.Since(startTime).Truncate(time.Second).String(),
 	)
 
 	d.logStatsInner(log.LvlInfo, stats, fmt.Sprintf("Syncing %v", target), logCtx, true)
@@ -1540,7 +1567,7 @@ func (d *Downloader) logStatsInner(
 		}
 	}
 	addCtx(
-		"file-metadata", fmt.Sprintf("%d/%d", stats.MetadataReady, stats.NumTorrents),
+		"metadata", fmt.Sprintf("%d/%d", stats.MetadataReady, stats.NumTorrents),
 		"files", fmt.Sprintf(
 			"%d/%d",
 			// For now it's 1:1 files:torrents.
@@ -1550,7 +1577,7 @@ func (d *Downloader) logStatsInner(
 		"data", func() string {
 			if haveAllMetadata {
 				return fmt.Sprintf(
-					"%.2f%% - %s/%s",
+					"%.2f%%,%s/%s",
 					percentDone,
 					common.ByteCount(bytesDone),
 					common.ByteCount(stats.BytesTotal),
@@ -1631,11 +1658,7 @@ func (d *Downloader) spawn(f func()) bool {
 	if d.ctx.Err() != nil {
 		return false
 	}
-	d.wg.Add(1)
-	go func() {
-		defer d.wg.Done()
-		f()
-	}()
+	d.wg.Go(f)
 	return true
 }
 

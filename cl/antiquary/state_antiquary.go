@@ -36,19 +36,13 @@ import (
 	"github.com/erigontech/erigon/cl/phase1/core/state/raw"
 	"github.com/erigontech/erigon/cl/transition"
 	"github.com/erigontech/erigon/cl/transition/impl/eth2"
+	"github.com/erigontech/erigon/cl/utils"
 	"github.com/erigontech/erigon/common"
 	"github.com/erigontech/erigon/common/log/v3"
 	"github.com/erigontech/erigon/db/kv"
 	"github.com/erigontech/erigon/db/snapshotsync"
 	"github.com/erigontech/erigon/db/snaptype"
 )
-
-// pool for buffers
-var bufferPool = sync.Pool{
-	New: func() any {
-		return &bytes.Buffer{}
-	},
-}
 
 func (s *Antiquary) loopStates(ctx context.Context) {
 	// Execute this each second
@@ -162,7 +156,7 @@ func FillStaticValidatorsTableIfNeeded(ctx context.Context, logger log.Logger, s
 			continue
 		}
 		event := state_accessors.NewStateEventsFromBytes(buf)
-		state_accessors.ReplayEvents(
+		if err := state_accessors.ReplayEvents(
 			func(validatorIndex uint64, validator solid.Validator) error {
 				return validatorsTable.AddValidator(validator, validatorIndex, slot)
 			},
@@ -185,7 +179,9 @@ func FillStaticValidatorsTableIfNeeded(ctx context.Context, logger log.Logger, s
 				return validatorsTable.AddSlashed(validatorIndex, slot, slashed)
 			},
 			event,
-		)
+		); err != nil {
+			return false, fmt.Errorf("replay validator events at slot %d: %w", slot, err)
+		}
 		lastSlot = slot
 	}
 	validatorsTable.SetSlot(lastSlot)
@@ -222,8 +218,16 @@ func (s *Antiquary) IncrementBeaconState(ctx context.Context, to uint64) error {
 	stateAntiquaryCollector := newBeaconStatesCollector(s.cfg, s.dirs.Tmp, s.logger)
 	defer stateAntiquaryCollector.close()
 
+	freshState := s.currentState == nil
 	if err := s.initializeStateAntiquaryIfNeeded(ctx, tx); err != nil {
 		return err
+	}
+	if freshState {
+		// A reconstruction resumed with backoff can re-flush rows the prune
+		// marker already passed; floor the markers so those rows stay prunable.
+		if err := s.floorStatePruneMarkers(ctx, s.currentState.Slot()); err != nil {
+			return err
+		}
 	}
 	if s.currentState.Slot() == s.genesisState.Slot() {
 		// Collect genesis state if we are at genesis
@@ -231,13 +235,17 @@ func (s *Antiquary) IncrementBeaconState(ctx context.Context, to uint64) error {
 			return err
 		}
 		// Mark all validators as touched because we just initizialized the whole state.
+		var addErr error
 		s.currentState.ForEachValidator(func(v solid.Validator, index, total int) bool {
 			changedValidators.Store(uint64(index), struct{}{})
-			if err = s.validatorsTable.AddValidator(v, uint64(index), 0); err != nil {
+			if addErr = s.validatorsTable.AddValidator(v, uint64(index), 0); addErr != nil {
 				return false
 			}
 			return true
 		})
+		if addErr != nil {
+			return fmt.Errorf("genesis validators table init: %w", addErr)
+		}
 	}
 	s.validatorsTable.SetSlot(s.currentState.Slot())
 
@@ -250,7 +258,6 @@ func (s *Antiquary) IncrementBeaconState(ctx context.Context, to uint64) error {
 	// Use this as the event slot (it will be incremented by 1 each time we process a block)
 	slot := s.currentState.Slot() + 1
 
-	var prevValSet []byte
 	events := state_accessors.NewStateEvents()
 	slashingOccurred := false
 	// setup the events handler for historical states replay.
@@ -345,6 +352,7 @@ func (s *Antiquary) IncrementBeaconState(ctx context.Context, to uint64) error {
 	progressTimer := time.NewTicker(1 * time.Minute)
 	defer progressTimer.Stop()
 	prevSlot := slot
+	startSlot := slot
 	first := false
 	timeBeforeCommit := 30 * time.Minute
 	blocksProcessed := 0
@@ -374,7 +382,7 @@ func (s *Antiquary) IncrementBeaconState(ctx context.Context, to uint64) error {
 			if writeErr = validator.WriteTo(buf); writeErr != nil {
 				return false
 			}
-			if writeErr = rwTx.Put(kv.StaticValidators, base_encoding.Encode64ToBytes4(validatorIndex), common.Copy(buf.Bytes())); writeErr != nil {
+			if writeErr = rwTx.Put(kv.StaticValidators, base_encoding.Encode64ToBytes4(validatorIndex), bytes.Clone(buf.Bytes())); writeErr != nil {
 				return false
 			}
 			return true
@@ -386,6 +394,13 @@ func (s *Antiquary) IncrementBeaconState(ctx context.Context, to uint64) error {
 	}
 	lastCommitSlot := slot
 
+	// A restored table shorter than the state it tracks is truncated; fail rather
+	// than silently mis-handle validators past the cut.
+	if got, want := s.validatorsTable.Length(), s.currentState.ValidatorLength(); got < want {
+		return fmt.Errorf("static validators table has %d entries, state at slot %d has %d validators (truncated table)", got, s.currentState.Slot(), want)
+	}
+
+	var prevEffectiveBalances, newEffectiveBalances []byte
 	for ; slot < to && startLoop.Add(timeBeforeCommit).After(time.Now()); slot++ {
 		// Bound each mdbx commit: once maxSlotsPerCommit slots have accumulated,
 		// flush + commit them and start a fresh collector, so no single commit
@@ -398,6 +413,7 @@ func (s *Antiquary) IncrementBeaconState(ctx context.Context, to uint64) error {
 			stateAntiquaryCollector = newBeaconStatesCollector(s.cfg, s.dirs.Tmp, s.logger)
 			changedValidators = &sync.Map{}
 			lastCommitSlot = slot
+			s.pruneFrozenStateTables(ctx, s.currentState.Slot())
 		}
 		slashingOccurred = false // Set this to false at the beginning of each slot.
 
@@ -451,9 +467,8 @@ func (s *Antiquary) IncrementBeaconState(ctx context.Context, to uint64) error {
 			}
 			continue
 		}
-		// We now compute the difference between the two balances.
-		prevValSet = prevValSet[:0]
-		prevValSet = append(prevValSet, s.currentState.RawValidatorSet()...)
+		// snapshot before TransitionState mutates the validator buffer in place
+		prevEffectiveBalances = base_encoding.AppendEffectiveBalances(prevEffectiveBalances[:0], s.currentState.RawValidatorSet())
 
 		fullValidation := slot%1000 == 0 || first
 		blockRewardsCollector := &eth2.BlockRewardsCollector{}
@@ -554,7 +569,8 @@ func (s *Antiquary) IncrementBeaconState(ctx context.Context, to uint64) error {
 		isEpochCrossed := prevEpoch != state.Epoch(s.currentState)
 
 		if prevValidatorSetLength != s.currentState.ValidatorLength() || isEpochCrossed {
-			if err := stateAntiquaryCollector.collectEffectiveBalancesDiffs(ctx, slot, prevValSet, s.currentState.RawValidatorSet()); err != nil {
+			newEffectiveBalances = base_encoding.AppendEffectiveBalances(newEffectiveBalances[:0], s.currentState.RawValidatorSet())
+			if err := stateAntiquaryCollector.collectEffectiveBalancesDiffs(ctx, slot, prevEffectiveBalances, newEffectiveBalances); err != nil {
 				return err
 			}
 			if s.currentState.Version() >= clparams.AltairVersion {
@@ -566,7 +582,16 @@ func (s *Antiquary) IncrementBeaconState(ctx context.Context, to uint64) error {
 		// We now do some post-processing on the state.
 		select {
 		case <-progressTimer.C:
-			log.Log(logLvl, "[Caplin-Archive] Historical States reconstruction", "slot", slot, "blk/sec", fmt.Sprintf("%.2f", float64(slot-prevSlot)/60))
+			slotsPerSec := float64(slot-prevSlot) / time.Minute.Seconds()
+			progress := 0.0
+			if to > startSlot {
+				progress = float64(slot-startSlot) / float64(to-startSlot) * 100
+			}
+			log.Log(logLvl, "[Caplin-Archive] Historical States reconstruction",
+				"slot", slot, "to", to,
+				"slots/sec", fmt.Sprintf("%.2f", slotsPerSec),
+				"progress", fmt.Sprintf("%.1f%%", progress),
+				"eta", utils.ETA(to-slot, slotsPerSec))
 			prevSlot = slot
 		default:
 		}
@@ -593,6 +618,9 @@ func (s *Antiquary) IncrementBeaconState(ctx context.Context, to uint64) error {
 			return err
 		}
 	}
+	// At tip this is the only prune site that runs on every call: the in-loop
+	// site needs a maxSlotsPerCommit batch and the snapgen site a fresh dump.
+	s.pruneFrozenStateTables(ctx, s.currentState.Slot())
 
 	if s.snapgen {
 		blocksPerStatefulFile := uint64(snaptype.CaplinMergeLimit * 5)
@@ -604,7 +632,7 @@ func (s *Antiquary) IncrementBeaconState(ctx context.Context, to uint64) error {
 		if to < (safetyMargin + blocksPerStatefulFile) {
 			return nil
 		}
-		to = to - (safetyMargin + blocksPerStatefulFile)
+		to -= (safetyMargin + blocksPerStatefulFile)
 		if from >= to {
 			return nil
 		}
@@ -625,6 +653,8 @@ func (s *Antiquary) IncrementBeaconState(ctx context.Context, to uint64) error {
 		if err := s.stateSn.OpenFolder(); err != nil {
 			return err
 		}
+		// Prune only after OpenFolder: coverage must include the just-frozen range.
+		s.pruneFrozenStateTables(ctx, s.currentState.Slot())
 		if s.downloader != nil {
 			paths := s.stateSn.SegFileNames(0, to)
 			// Notify bittorent to seed the new snapshots

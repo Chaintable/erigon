@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"math"
 	"path/filepath"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -61,6 +61,7 @@ var (
 	V1_2                Version  = Version{1, 2}
 	V2_0                Version  = Version{2, 0}
 	V2_1                Version  = Version{2, 1}
+	V2_2                Version  = Version{2, 2}
 	V1_0_standart       Versions = Versions{V1_0, V1_0}
 	V1_1_standart       Versions = Versions{V1_1, V1_0}
 	V1_2_standart       Versions = Versions{V1_2, V1_0}
@@ -232,14 +233,14 @@ func FindFilesWithVersionsByPattern(pattern string) (string, Version, bool, erro
 		return "", Version{}, false, nil
 	}
 	if len(matches) > 1 {
-		sort.Slice(matches, func(i, j int) bool {
-			_, fName1 := filepath.Split(matches[i])
+		slices.SortFunc(matches, func(a, b string) int {
+			_, fName1 := filepath.Split(a)
 			version1, _ := ParseVersion(fName1)
 
-			_, fName2 := filepath.Split(matches[j])
+			_, fName2 := filepath.Split(b)
 			version2, _ := ParseVersion(fName2)
 
-			return version1.Less(version2)
+			return version1.Cmp(version2)
 		})
 		_, fName := filepath.Split(matches[len(matches)-1])
 		ver, _ := ParseVersion(fName)

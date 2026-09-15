@@ -25,12 +25,11 @@ import (
 	"github.com/erigontech/erigon/common"
 	"github.com/erigontech/erigon/common/dbg"
 	"github.com/erigontech/erigon/common/log/v3"
-	"github.com/erigontech/erigon/db/downloader"
+	"github.com/erigontech/erigon/db/dbservices"
 	"github.com/erigontech/erigon/db/kv"
 	"github.com/erigontech/erigon/db/kv/rawdbv3"
 	"github.com/erigontech/erigon/db/rawdb"
 	"github.com/erigontech/erigon/db/rawdb/blockio"
-	"github.com/erigontech/erigon/db/services"
 	"github.com/erigontech/erigon/db/state/execctx"
 	"github.com/erigontech/erigon/execution/chain"
 	"github.com/erigontech/erigon/execution/exec"
@@ -53,7 +52,7 @@ import (
 // an implementation defined in another package (e.g. execmodule.Dispatcher)
 // without creating a circular import.
 type NotificationSender interface {
-	Dispatch(ctx context.Context, tx kv.Tx, accumulator *shards.Accumulator, recentReceipts *shards.RecentReceipts, finishProgressBefore, finishProgressAfter uint64, prevUnwindPoint *uint64) error
+	Dispatch(ctx context.Context, tx kv.Tx, stateVersion uint64, accumulator *shards.Accumulator, recentReceipts *shards.RecentReceipts, finishProgressBefore, finishProgressAfter uint64, prevUnwindPoint *uint64) error
 }
 
 type Hook struct {
@@ -139,8 +138,15 @@ func (h *Hook) SendNotifications(tx kv.Tx, finishProgressBefore uint64) error {
 	if err != nil {
 		return err
 	}
+	var stateVersion uint64
+	if h.notifications.Accumulator != nil {
+		stateVersion, err = rawdb.GetStateVersion(tx)
+		if err != nil {
+			return err
+		}
+	}
 	return h.dispatcher.Dispatch(
-		h.ctx, tx,
+		h.ctx, tx, stateVersion,
 		h.notifications.Accumulator,
 		h.notifications.RecentReceipts,
 		finishProgressBefore,
@@ -322,9 +328,9 @@ func NewDefaultStages(ctx context.Context,
 	cfg *ethconfig.Config,
 	controlServer *sentry_multi_client.MultiClient,
 	notifications *shards.Notifications,
-	snapDownloader downloader.Client,
-	blockReader services.FullBlockReader,
-	blockRetire services.BlockRetire,
+	snapDownloader dbservices.DownloaderClient,
+	blockReader dbservices.FullBlockReader,
+	blockRetire dbservices.BlockRetire,
 	tracer *tracers.Tracer,
 	afterSnapshotDownload func(ctx context.Context) error,
 	readAheader *exec.BlockReadAheader,
@@ -353,9 +359,9 @@ func NewPipelineStages(ctx context.Context,
 	cfg *ethconfig.Config,
 	controlServer *sentry_multi_client.MultiClient,
 	notifications *shards.Notifications,
-	snapDownloader downloader.Client,
-	blockReader services.FullBlockReader,
-	blockRetire services.BlockRetire,
+	snapDownloader dbservices.DownloaderClient,
+	blockReader dbservices.FullBlockReader,
+	blockRetire dbservices.BlockRetire,
 	tracer *tracers.Tracer,
 	afterSnapshotDownload func(ctx context.Context) error,
 	readAheader *exec.BlockReadAheader,
@@ -390,7 +396,7 @@ func NewInMemoryExecution(
 	cfg *ethconfig.Config,
 	controlServer *sentry_multi_client.MultiClient,
 	notifications *shards.Notifications,
-	blockReader services.FullBlockReader,
+	blockReader dbservices.FullBlockReader,
 	blockWriter *blockio.BlockWriter,
 	logger log.Logger,
 	readAheader *exec.BlockReadAheader,
