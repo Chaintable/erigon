@@ -12,7 +12,7 @@ const archivedVersions: string[] = require('./versions.json');
 // The docs series this branch publishes; also scopes the {ERIGON_VERSION}
 // lookup below. The `label: 'vX.Y'` literal is rewritten at each cutover.
 const currentDocsVersion = {
-  label: 'v3.6',
+  label: 'v3.8',
   badge: false,
 };
 
@@ -23,6 +23,11 @@ type Release = {tag_name: string; prerelease: boolean; draft: boolean};
 // GitHub API orders releases by publish date, so every selector there sorts by
 // semantic version instead of trusting that order.
 const {installableVersion, latestStableInSeries} = require('./src/releases.js');
+
+// Routes with no indexable content, skipped by the sitemap. The llms.txt
+// descriptor does not need them listed: it is emitted only for a declared
+// document route, which these are not.
+const nonDocumentRoutes: string[] = ['/search', '/404.html'];
 
 function githubHeaders(): Record<string, string> {
   const headers: Record<string, string> = {Accept: 'application/vnd.github.v3+json'};
@@ -71,7 +76,9 @@ export default async function createConfig(): Promise<Config> {
     markdown: {mermaid: true},
     themes: ['@docusaurus/theme-mermaid'],
 
-    customFields: {latestVersion},
+    // archivedVersions reaches src/theme/Root.tsx, which uses it to keep the
+    // llms.txt descriptor off versions the current index does not cover.
+    customFields: {latestVersion, archivedVersions},
 
     headTags: [
       {
@@ -85,21 +92,6 @@ export default async function createConfig(): Promise<Config> {
         tagName: 'script',
         attributes: {},
         innerHTML: 'window.plausible=window.plausible||function(){(plausible.q=plausible.q||[]).push(arguments)},plausible.init=plausible.init||function(i){plausible.o=i||{}};plausible.init()',
-      },
-      // Point every page at the llms.txt index that covers it. `describedby` is
-      // the relation the llmstxt.org proposal defines for exactly this; its
-      // `alternate` + `text/markdown` pairing is reserved for a *per-page*
-      // Markdown representation, which this site-wide index is not.
-      // llms-full.txt is deliberately not advertised here: it is not a
-      // description of any single page. It stays discoverable through llms.txt,
-      // the sitemap, and the MCP docs page.
-      {
-        tagName: 'link',
-        attributes: {
-          rel: 'describedby',
-          href: 'https://docs.erigon.tech/llms.txt',
-          title: 'Erigon Documentation — page index for LLMs',
-        },
       },
     ],
 
@@ -119,6 +111,13 @@ export default async function createConfig(): Promise<Config> {
             {
               from: '/get-started/easy-nodes/how-to-run-a-polygon-node',
               to: '/fundamentals/supported-networks',
+            },
+            // The bor_ namespace is removed along with Polygon support. Inbound
+            // links land on the namespace index; the page is still readable in
+            // the v3.4 archive.
+            {
+              from: '/interacting-with-erigon/bor',
+              to: '/interacting-with-erigon',
             },
           ],
         },
@@ -162,17 +161,19 @@ export default async function createConfig(): Promise<Config> {
         blog: false as false,
         theme: {customCss: './src/css/custom.css'},
         sitemap: {
-          // Emit <lastmod> per URL (from git history via showLastUpdateTime) so
-          // crawlers can prioritise changed pages. Exclude /search from the
-          // sitemap — it has no indexable content (the route itself still exists).
+          // Emit <lastmod> for routed pages (from git history via
+          // showLastUpdateTime) so crawlers can prioritise changed pages; the
+          // static artifacts appended below have no route and so carry none.
+          // The ignored routes still exist; they just have no indexable content.
           lastmod: 'date',
           changefreq: 'weekly',
           priority: 0.5,
-          ignorePatterns: ['/search'],
+          ignorePatterns: nonDocumentRoutes,
           // The llms.txt artifacts live in static/, so Docusaurus never routes
-          // them and the default sitemap omits them — which leaves them
-          // unindexable by search. Append them explicitly. This is also how
-          // llms-full.txt stays reachable, since it is not advertised in head.
+          // them and the default sitemap omits them. Append them explicitly so
+          // the sitemap declares them. This is sitemap discovery only, not what
+          // makes them reachable: the MCP page links both, and llms.txt links
+          // llms-full.txt.
           createSitemapItems: async ({defaultCreateSitemapItems, ...rest}) => [
             ...(await defaultCreateSitemapItems(rest)),
             {url: 'https://docs.erigon.tech/llms.txt', changefreq: 'weekly', priority: 0.5},

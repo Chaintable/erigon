@@ -7,6 +7,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/erigontech/erigon/common"
 	"github.com/erigontech/erigon/common/crypto"
 	"github.com/erigontech/erigon/execution/chain"
 	"github.com/erigontech/erigon/execution/commitment"
@@ -17,13 +18,23 @@ import (
 type emptyReader struct{}
 
 func (r *emptyReader) ReadAccountData(accounts.Address) (*accounts.Account, error) { return nil, nil }
+
 func (r *emptyReader) ReadAccountDataForDebug(accounts.Address) (*accounts.Account, error) {
 	return nil, nil
 }
+
+func (r *emptyReader) ReadAccountByPlainAddr(address common.Address) (*accounts.Account, error) {
+	return r.ReadAccountData(accounts.InternAddress(address))
+}
+
+func (r *emptyReader) HasAccount(address common.Address) (bool, error) {
+	acc, err := r.ReadAccountByPlainAddr(address)
+	return acc != nil, err
+}
+
 func (r *emptyReader) ReadAccountStorage(accounts.Address, accounts.StorageKey) (uint256.Int, bool, error) {
 	return uint256.Int{}, false, nil
 }
-func (r *emptyReader) HasStorage(accounts.Address) (bool, error)               { return false, nil }
 func (r *emptyReader) ReadAccountCode(accounts.Address) ([]byte, error)        { return nil, nil }
 func (r *emptyReader) ReadAccountCodeSize(accounts.Address) (int, error)       { return 0, nil }
 func (r *emptyReader) ReadAccountIncarnation(accounts.Address) (uint64, error) { return 0, nil }
@@ -48,7 +59,7 @@ func TestValueTiebreaker_BalancePath(t *testing.T) {
 	readVal := *balance // Same value
 
 	valid := validateRead(vm, 10, addr, BalancePath, accounts.NilKey, StorageRead, Version{TxIndex: UnknownDep},
-		readVal, liveBalance, eqUint256, // value tiebreaker
+		readVal, liveBalance, eqUint256, absentUint256, recordBalance, // value tiebreaker
 		func(rv, wv Version) VersionValidity { return VersionValid },
 		false, "")
 
@@ -69,7 +80,7 @@ func TestValueTiebreaker_DifferentBalance(t *testing.T) {
 	readVal := *uint256.NewInt(500)
 
 	valid := validateRead(vm, 10, addr, BalancePath, accounts.NilKey, StorageRead, Version{TxIndex: UnknownDep},
-		readVal, liveBalance, eqUint256,
+		readVal, liveBalance, eqUint256, absentUint256, recordBalance,
 		func(rv, wv Version) VersionValidity { return VersionValid },
 		false, "")
 
@@ -87,14 +98,14 @@ func TestValueTiebreaker_NoncePath(t *testing.T) {
 
 	// Same nonce from storage → valid
 	valid := validateRead(vm, 10, addr, NoncePath, accounts.NilKey, StorageRead, Version{TxIndex: UnknownDep},
-		uint64(42), liveNonce, eqUint64,
+		uint64(42), liveNonce, eqUint64, absentUint64, recordNonce,
 		func(rv, wv Version) VersionValidity { return VersionValid },
 		false, "")
 	assert.Equal(t, VersionValid, valid, "Same nonce should be valid")
 
 	// Different nonce → invalid
 	valid = validateRead(vm, 10, addr, NoncePath, accounts.NilKey, StorageRead, Version{TxIndex: UnknownDep},
-		uint64(41), liveNonce, eqUint64,
+		uint64(41), liveNonce, eqUint64, absentUint64, recordNonce,
 		func(rv, wv Version) VersionValidity { return VersionValid },
 		false, "")
 	assert.Equal(t, VersionInvalid, valid, "Different nonce should be invalid")
@@ -136,7 +147,7 @@ func TestVersionedWriteVersion(t *testing.T) {
 // TX executions on the same worker.
 func TestAccessListResetInIBSReset(t *testing.T) {
 	ibs := New(nil)
-	defer ibs.Release(false)
+	defer ibs.Close()
 
 	// Add an address to the access list
 	testAddr := accounts.InternAddress([20]byte{0x42})
@@ -158,24 +169,24 @@ func TestAccessListResetInIBSReset(t *testing.T) {
 // its own block's access list as phantom entries.
 func TestAddressAccessResetInIBSReset(t *testing.T) {
 	ibs := New(nil)
-	defer ibs.Release(false)
+	defer ibs.Close()
 	sender := accounts.InternAddress([20]byte{0x01})
 	coinbase := accounts.InternAddress([20]byte{0x02})
 	leaked := accounts.InternAddress([20]byte{0x42})
 	// Prepare enables access recording at tx start.
-	require.NoError(t, ibs.Prepare(&chain.Rules{}, sender, coinbase, accounts.NilAddress, nil, nil, nil))
+	ibs.Prepare(&chain.Rules{}, sender, coinbase, accounts.NilAddress, nil, nil)
 	ibs.MarkAddressAccess(leaked, false)
 	// Tx aborts: AccessedAddresses is never harvested. The worker resets
 	// the shared IBS before the next task.
 	ibs.Reset()
-	assert.Empty(t, ibs.AccessedAddresses(), "no recorded accesses should survive Reset")
+	assert.Empty(t, ibs.versionedReads.access, "no recorded accesses should survive Reset")
 }
 
 // TestTransientStorageResetInIBSReset verifies that IBS.Reset() clears
 // transient storage (EIP-1153).
 func TestTransientStorageResetInIBSReset(t *testing.T) {
 	ibs := New(nil)
-	defer ibs.Release(false)
+	defer ibs.Close()
 
 	testAddr := accounts.InternAddress([20]byte{0x42})
 	testKey := accounts.InternKey([32]byte{0x01})
@@ -203,9 +214,11 @@ func TestCodeReadFromVersionMap(t *testing.T) {
 	addr := accounts.InternAddress([20]byte{0x55})
 
 	// Write EIP-7702 delegation code to versionMap at txIndex=5
-	delegationCode := []byte{0xef, 0x01, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05,
+	delegationCode := []byte{
+		0xef, 0x01, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05,
 		0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
-		0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14}
+		0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14,
+	}
 	vm.WriteCode(addr, Version{TxIndex: 5, Incarnation: 0}, accounts.NewCode(delegationCode), true)
 
 	// Read at txIndex=10 should find the code
@@ -440,7 +453,7 @@ func TestBlockStateCacheDeleteAccount_RecreateThenDeleteRecords(t *testing.T) {
 // spurious zero writes made same-tx re-reads return 0 — wrong gas
 // (SSTORE_SET vs dirty-update, +19900) and a wrong written value
 // (EEST cancun/eip6780_selfdestruct/* under EXEC3_PARALLEL). The calc now
-// gets per-slot DELETEs from normalizeWriteSet's SD cascade instead.
+// gets per-slot DELETEs from Normalize's SD cascade instead.
 func TestSelfDestructKeepsDirtyStorageReadableSameTx(t *testing.T) {
 	addr := accounts.InternAddress([20]byte{0xAA})
 	slot0 := accounts.InternKey([32]byte{0x00})
@@ -449,12 +462,12 @@ func TestSelfDestructKeepsDirtyStorageReadableSameTx(t *testing.T) {
 	vm := NewVersionMap(nil)
 
 	ibs := New(&emptyReader{})
-	defer ibs.Release(false)
+	defer ibs.Close()
 	ibs.SetVersionMap(vm)
 	ibs.SetTxContext(100, 0)
 	ibs.SetVersion(0)
 
-	ibs.CreateAccount(addr, true)
+	require.NoError(t, ibs.CreateAccount(addr, true))
 	require.NoError(t, ibs.SetState(addr, slot0, *uint256.NewInt(42)))
 	require.NoError(t, ibs.SetState(addr, slot1, *uint256.NewInt(99)))
 
@@ -475,7 +488,7 @@ func TestSelfDestructKeepsDirtyStorageReadableSameTx(t *testing.T) {
 	assert.True(t, destructed)
 
 	// And it must NOT have emitted spurious StoragePath=0 writes.
-	for waddr, slots := range ibs.VersionedWrites(false).Storages() {
+	for waddr, slots := range ibs.VersionedWrites().Storages() {
 		if waddr != addr {
 			continue
 		}

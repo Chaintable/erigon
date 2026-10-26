@@ -7,10 +7,7 @@
  *        DESIGN-SPEC.md §7 Font Roles)
  */
 
-/* Self-hosted fonts — no Google Fonts or CDN. See DESIGN-SPEC.md §7.
-   Quantify is non-free and licensed to Erigon: keep self-hosting this woff2, and
-   do not swap it for the CDN copy at fonts.cdnfonts.com/css/quantify. Licence
-   scope is recorded in the design spec, not here. */
+/* Quantify is licensed to Erigon and must remain self-hosted. */
 
 @font-face {
   font-family: 'Montserrat';
@@ -459,20 +456,6 @@ details.alert.alert--info summary {
   color: var(--ifm-font-color-base) !important;
 }
 
-/* ─── Footer palette ─────────────────────────────────────────────────────── */
-/* Invariants:
-   - Surface follows the colour mode: white in light, black in dark.
-   - Text uses a fixed alpha ramp, not Infima's emphasis vars — those invert with
-     the theme and would render dark-on-black.
-   - Both modes carry a 1px top edge. A white footer on a white page body has no
-     edge of its own, and #000000 on the #0A0A0A page body is imperceptible.
-   - Fine print is 0.55, not 0.35: alpha is not perceptually symmetric across
-     inverted surfaces, and 0.35 on white is 2.44:1, below WCAG AA's 4.5:1.
-   - --footer-accent stays separate from --brand-accent, which is site-wide.
-   - The accent is per-mode for the same reason the alpha ramp is. Brand #EF7716
-     is 7.32:1 on the black footer but only 2.87:1 on the white one, below AA;
-     #A34E0B is 5.75:1 there. --footer-accent-tint carries the pre-color-mix
-     fallback for each mode so the tint cannot drift from the text it sits under. */
 :root {
   --footer-accent: #A34E0B;
   --footer-accent-tint: rgba(163, 78, 11, 0.12);
@@ -485,6 +468,7 @@ details.alert.alert--info summary {
   --footer-divider: rgba(0, 0, 0, 0.08);
   --footer-top-edge: rgba(0, 0, 0, 0.08);
 }
+
 [data-theme='dark'] {
   --footer-accent: #EF7716;
   --footer-accent-tint: rgba(239, 119, 22, 0.12);
@@ -498,13 +482,6 @@ details.alert.alert--info summary {
   --footer-top-edge: rgba(255, 255, 255, 0.08);
 }
 
-/* ─── Footer interactive states ──────────────────────────────────────────── */
-/* These live in CSS, not in React onMouseEnter/onMouseLeave handlers. Those
-   handlers only fire for a mouse: keyboard users tabbing through the footer got
-   no accent state at all, and mutating inline styles fights any later theming.
-   :hover and :focus-visible are declared together so mouse, keyboard and touch
-   all get the same affordance. */
-
 .footer-brand {
   display: flex;
   align-items: center;
@@ -516,8 +493,6 @@ details.alert.alert--info summary {
 .footer-brand:hover,
 .footer-brand:focus-visible {
   color: var(--footer-accent);
-  /* Infima's `a:hover` sets text-decoration: underline and outranks the base
-     class on specificity, so it has to be cleared on the state too. */
   text-decoration: none;
 }
 
@@ -546,12 +521,7 @@ details.alert.alert--info summary {
 .footer-social:focus-visible {
   color: var(--footer-accent);
   border-color: var(--footer-accent);
-  /* Fallback first: color-mix() is Chrome/Edge 111+, Firefox 113+, Safari 16.2+,
-     and the default production browserslist still resolves down to Chrome 109.
-     Older engines keep the flat tint; newer ones take the color-mix line. The
-     fallback is a per-mode var rather than a literal because --footer-accent
-     differs between modes: a hardcoded orange would tint the light footer with
-     the dark-mode accent on any engine without color-mix. */
+  /* Older browsers use the preceding fallback. */
   background-color: var(--footer-accent-tint);
   background-color: color-mix(in srgb, var(--footer-accent) 12%, transparent);
 }
@@ -568,7 +538,6 @@ details.alert.alert--info summary {
   text-decoration: none;
 }
 
-/* The icon buttons had no visible keyboard focus indicator at all. */
 .footer-brand:focus-visible,
 .footer-social:focus-visible,
 .footer-legal:focus-visible {
@@ -579,7 +548,6 @@ details.alert.alert--info summary {
 /* ─── Footer responsive (mobile) ────────────────────────────────────────── */
 
 @media (max-width: 768px) {
-  /* The footer top row is flex, not a grid — stack it, don't set columns. */
   .footer-top-grid {
     flex-direction: column !important;
     align-items: flex-start !important;
@@ -587,9 +555,6 @@ details.alert.alert--info summary {
     gap: 1rem !important;
   }
 
-  /* Socials are pushed right by margin-left:auto on desktop; drop that so they
-     align with the brand and tagline once stacked. Targets the dedicated class,
-     not > div:last-child, which broke if another div were appended. */
   .footer-socials {
     margin-left: 0;
   }

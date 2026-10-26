@@ -72,18 +72,12 @@ func SpawnTxLookup(s *StageState, tx kv.RwTx, toBlock uint64, cfg TxLookupCfg, c
 		pruneTo := cfg.prune.History.PruneTo(endBlock)
 		if startBlock < pruneTo {
 			startBlock = pruneTo
-			if err = s.UpdatePrune(tx, pruneTo); err != nil {
-				return err
-			}
 		}
 	}
 
 	if cfg.blockReader.FrozenBlocks() > startBlock {
 		// Snapshot .idx files already have TxLookup index - then no reason iterate over them here
 		startBlock = cfg.blockReader.FrozenBlocks()
-		if err = s.UpdatePrune(tx, startBlock); err != nil {
-			return err
-		}
 	}
 
 	if startBlock > 0 {
@@ -94,7 +88,7 @@ func SpawnTxLookup(s *StageState, tx kv.RwTx, toBlock uint64, cfg TxLookupCfg, c
 		return fmt.Errorf("txnLookupTransform: %w", err)
 	}
 
-	if err = s.Update(tx, endBlock); err != nil {
+	if err := s.Update(tx, endBlock); err != nil {
 		return err
 	}
 
@@ -204,11 +198,7 @@ func PruneTxLookup(s *PruneState, tx kv.RwTx, cfg TxLookupCfg, ctx context.Conte
 		return s.Done(tx)
 	}
 	logPrefix := s.LogPrefix()
-	// Rows below the snapshot frontier are duplicates of the .idx files, which is why
-	// SpawnTxLookup refuses to write them. Dropping a duplicate loses nothing, so the
-	// retention distance has no say here: prune.History.PruneTo would sit far below
-	// the frontier and leave every redundant row in place, and on a node whose
-	// snapshots lag it would sit above and delete the only copy.
+
 	blockTo := cfg.blockReader.CanPruneTo(s.ForwardProgress)
 	if blockTo == 0 {
 		return nil
@@ -233,14 +223,11 @@ func PruneTxLookup(s *PruneState, tx kv.RwTx, cfg TxLookupCfg, ctx context.Conte
 	// A record left by the pre-fix floor carries a non-zero TxFrom. Its cursor already
 	// passed rows this floor must delete, and its TxTo came from Max(blockTo) so it
 	// always covers the new Min(blockTo) — it must not short-circuit below.
-	staleFloor := prevStat != nil && prevStat.TxFrom != 0
+	staleFloor := prevStat.TxFrom != 0
 
 	// A completed rotation that covers current txTo — nothing more to do.
-	if !staleFloor && prevStat != nil && prevStat.TxTo >= txTo && prevStat.ValueProgress == prune.Done {
+	if !staleFloor && prevStat.TxTo >= txTo && prevStat.ValueProgress == prune.Done {
 		return nil
-	}
-	if prevStat == nil {
-		prevStat = &prune.Stat{}
 	}
 
 	// Rolling scan: preserve cursor position across txTo advances so each B-tree page
@@ -292,11 +279,11 @@ func PruneTxLookup(s *PruneState, tx kv.RwTx, cfg TxLookupCfg, ctx context.Conte
 	// The scan cannot seek to a floor nor stop at a ceiling — it walks every key and
 	// tests it — so a floor above 0 skips rows without skipping any work.
 	pruneStat, err := prune.TableScanningPrune(pruneCtx, logPrefix, "txlookup", 0, txTo, 1,
-		logEvery, logger, nil, valsCursor, false, prevStat, prune.ValueOffset8StorageMode)
+		logEvery, logger, nil, valsCursor, prevStat, prune.ValueOffset8StorageMode)
 	if err != nil {
 		return fmt.Errorf("prune TxLookup: %w", err)
 	}
-	logger.Debug(fmt.Sprintf("[%s] prune", logPrefix), "scanned", pruneStat.ScanCountValues,
+	logger.Debug(fmt.Sprintf("[%s] prune", logPrefix), "scanned", pruneStat.ScanCountKeys,
 		"pruned", pruneStat.PruneCountValues, "status", pruneStat.ValueProgress.String(), "blockTo", blockTo)
 	defer func() {
 		pruneStat.TxFrom, pruneStat.TxTo = 0, rotationTxTo
@@ -306,7 +293,7 @@ func PruneTxLookup(s *PruneState, tx kv.RwTx, cfg TxLookupCfg, ctx context.Conte
 	}()
 
 	if pruneStat.ValueProgress == prune.Done {
-		if err = s.DoneAt(tx, blockTo); err != nil {
+		if err := s.DoneAt(tx, blockTo); err != nil {
 			return err
 		}
 	}

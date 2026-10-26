@@ -248,8 +248,8 @@ func runWitnessTest(test *testutil.WitnessBlockTest) error {
 		return fmt.Errorf("commit commitment history flag: %w", err)
 	}
 
-	baseApi := jsonrpc.NewBaseApi(nil, m.StateCache, m.BlockReader, m.Engine, nil, &rpccfg.BaseApiConfig{Dirs: m.Dirs})
-	debugApi := jsonrpc.NewPrivateDebugAPI(baseApi, m.DB, nil, 0, false)
+	baseApi := jsonrpc.NewBaseApi(nil, m.StateCache, m.BlockReader, m.Engine, &rpccfg.BaseApiConfig{Dirs: m.Dirs})
+	debugApi := jsonrpc.NewPrivateDebugAPI(baseApi, m.DB, nil, rpccfg.DefaultDebugApiConfig())
 	canonicalMode := "canonical"
 
 	for i := 0; i < test.NumBlocks(); i++ {

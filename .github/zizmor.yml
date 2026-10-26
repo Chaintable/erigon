@@ -16,18 +16,62 @@ rules:
       - qa-rpc-integration-tests.yml
       - qa-sync-from-scratch.yml
 
-  # Workflows missing explicit permissions: blocks — needs a cleanup pass
-  # to add least-privilege permissions to each workflow; tracked in #21132.
+  # These workflows call the reusable test leaves. A called workflow's declared
+  # token permissions must be granted by the caller (else the run fails at
+  # startup), so each caller declares at the workflow level the union its leaves
+  # need: actions: write (cap for the self-cancelling leaves' `gh run cancel`).
+  # Callers that include sonar additionally grant pull-requests: read (PR context).
+  # ci-gate additionally uses pull-requests: write for its own dequeuePullRequest mutation.
+  # These are needed workflow-wide and can't be scoped to a single job. Tracked in #21132.
   excessive-permissions:
-    disable: true
+    ignore:
+      - ci-gate.yml
+      - cache-warming.yml
+      - sonar-branch-scan.yml
+      - cache-warming-kurtosis-cl-images.yml
 
-  # secrets: inherit is intentional in ci-gate.yml and cache-warming.yml;
-  # tracked in #21132.
+  # The remaining `secrets: inherit` calls target same-repo reusable workflows
+  # that genuinely consume secrets — sonar (SONAR_TOKEN) and the DockerHub-pull
+  # hive/kurtosis suites (DOCKERHUB_PULL_*). Those callees read the secrets
+  # directly without declaring workflow_call secrets, so inherit is how they
+  # receive them. Tracked in #21132.
   secrets-inherit:
-    disable: true
+    ignore:
+      - cache-warming.yml
+      - cache-warming-kurtosis-cl-images.yml
+      - cache-warming-kurtosis-gloas-images.yml
+      - ci-gate.yml
+      - sonar-branch-scan.yml
 
   # This workflow must build and publish an image for every triggering commit;
   # a concurrency group would cancel intermediate queued runs and skip images.
   concurrency-limits:
     ignore:
       - ci-cd-main-branch-docker-images.yml
+
+  # docs-cutover.yml's `switch` job writes the DOCS_DEPLOY_BRANCH repository
+  # variable, which needs the release App's `variables` permission. The pinned
+  # actions/create-github-app-token exposes no `permission-variables` input
+  # (v3.2.0 is the newest release and its action.yml has no such key), so any
+  # permission-* list there would mint a token MISSING the one permission the
+  # job exists to use. The token is scoped on the repository axis
+  # (`repositories: "erigon"`) and the job is gated on the
+  # `release-branch-management` environment behind its required reviewers, so
+  # the blanket grant is never reached without a human approving that run.
+  # Drop this ignore once the action gains `permission-variables`.
+  github-app:
+    ignore:
+      - docs-cutover.yml
+
+  # lint.yml installs js-yaml to cross-check the docs-deploy trigger parser
+  # against a second, unrelated YAML implementation. The version is not ad-hoc:
+  # it is read at runtime out of docs/site/package-lock.json, so the lockfile
+  # stays the single source of truth and the two cannot drift. zizmor cannot see
+  # that the version came from a lockfile, only that `npm install` was called.
+  # `npm ci` on docs/site would be lockfile-visible but pulls the whole
+  # Docusaurus tree into a job that runs for every pull request, to load one
+  # module. The apt line beside it installs a DISTRO package (python3-yaml),
+  # deliberately not PyPI, for the same supply-chain reason.
+  adhoc-packages:
+    ignore:
+      - lint.yml

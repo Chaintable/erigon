@@ -30,6 +30,7 @@ import (
 )
 
 func NoGapsInCanonicalHeaders(ctx context.Context, db kv.RoDB, br dbservices.FullBlockReader, failFast bool) error {
+	var probs problems
 	tx, err := db.BeginRo(ctx)
 	if err != nil {
 		return err
@@ -55,11 +56,12 @@ func NoGapsInCanonicalHeaders(ctx context.Context, db kv.RoDB, br dbservices.Ful
 			panic(err)
 		}
 		if !ok || hash == (common.Hash{}) {
-			err = fmt.Errorf("canonical marker not found: %d", i)
-			if failFast {
+			if err := probs.report(failFast, fmt.Errorf("canonical marker not found: %d", i)); err != nil {
 				return err
 			}
-			log.Error(err.Error())
+			// Without a hash there is nothing to read the header and body with, and reading them
+			// anyway ends the run on the first gap it was asked to carry on past.
+			continue
 		}
 		header := rawdb.ReadHeader(tx, hash, i)
 		if header == nil {
@@ -68,20 +70,18 @@ func NoGapsInCanonicalHeaders(ctx context.Context, db kv.RoDB, br dbservices.Ful
 		}
 		body, _, _ := rawdb.ReadBody(tx, hash, i)
 		if body == nil {
-			err = fmt.Errorf("body not found: %d", i)
-			if failFast {
+			if err := probs.report(failFast, fmt.Errorf("body not found: %d", i)); err != nil {
 				return err
 			}
-			log.Error(err.Error())
 		}
 
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-logEvery.C:
-			log.Info("[integrity] HeaderNoGaps", "progress", fmt.Sprintf("%s/%s", common.PrettyCounter(i), common.PrettyCounter(lastBlockNum)))
+			log.Info("[integrity] HeaderNoGaps", "progress", fmt.Sprintf("%s/%s", common.PrettyExact(i), common.PrettyExact(lastBlockNum)))
 		default:
 		}
 	}
-	return nil
+	return probs.verdict(string(HeaderNoGaps))
 }

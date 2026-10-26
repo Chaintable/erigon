@@ -21,6 +21,7 @@ import (
 
 	"github.com/erigontech/erigon/common"
 	"github.com/erigontech/erigon/common/log/v3"
+	"github.com/erigontech/erigon/common/math"
 	"github.com/erigontech/erigon/db/kv"
 	"github.com/erigontech/erigon/db/rawdb"
 	"github.com/erigontech/erigon/db/state/execctx"
@@ -97,16 +98,21 @@ func (d *Dispatcher) Dispatch(
 	if d.events != nil {
 		var notifyFrom uint64
 		var isUnwind bool
-		if prevUnwindPoint != nil && *prevUnwindPoint != 0 && (*prevUnwindPoint) < finishProgressBefore {
+		switch {
+		case prevUnwindPoint != nil && *prevUnwindPoint != 0 && (*prevUnwindPoint) < finishProgressBefore:
 			notifyFrom = *prevUnwindPoint + 1 // +1: unwind already reverted *prevUnwindPoint; notify starting from the block after
 			isUnwind = true
-		} else if finishProgressAfter == 0 {
+		case finishProgressAfter == 0:
 			// Genesis (block 0): notify from block 0.
 			notifyFrom = 0
-		} else {
-			heightSpan := min(finishProgressAfter-finishProgressBefore, 1024)
-			notifyFrom = finishProgressAfter - heightSpan
-			notifyFrom++
+		default:
+			// finishProgressAfter can trail finishProgressBefore, and a wrapped
+			// span would clamp to 1024 and notify over a range that never ran.
+			span, underflow := math.SafeSub(finishProgressAfter, finishProgressBefore)
+			if underflow {
+				span = 0
+			}
+			notifyFrom = finishProgressAfter - min(span, 1024) + 1
 		}
 		notifyTo := finishProgressAfter + 1 //[from, to)
 

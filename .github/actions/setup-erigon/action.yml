@@ -10,10 +10,6 @@ inputs:
     description: "Partial clone filter (e.g. blob:none)"
     required: false
     default: 'blob:none'
-  submodules:
-    description: "Clone submodules (recursive shallow clone)"
-    required: false
-    default: 'false'
   cleanup-space:
     description: "Remove large pre-installed packages to free disk space (Linux only)"
     required: false
@@ -76,14 +72,18 @@ runs:
         fi
         df -h
 
-    - name: "Use D: drive for temp files on Windows"
+    - name: "Use D: drive for caches and temp files on Windows"
       if: ${{ runner.os == 'Windows' }}
       shell: bash
       run: |
-        mkdir -p D:/tmp
-        echo "TEMP=D:/tmp" >> "$GITHUB_ENV"
-        echo "TMP=D:/tmp" >> "$GITHUB_ENV"
-        echo "TMPDIR=D:/tmp" >> "$GITHUB_ENV"
+        mkdir -p D:/tmp D:/go-build D:/go/pkg/mod
+        {
+          echo "TEMP=D:/tmp"
+          echo "TMP=D:/tmp"
+          echo "TMPDIR=D:/tmp"
+          echo "GOCACHE=D:/go-build"
+          echo "GOMODCACHE=D:/go/pkg/mod"
+        } >> "$GITHUB_ENV"
 
     - name: Enable long paths on Windows
       if: ${{ runner.os == 'Windows' }}
@@ -103,7 +103,6 @@ runs:
         fetch-depth: 1
         filter: ${{ inputs.filter }}
         clean: false
-        submodules: false
 
     - name: Unshallow current commit
       shell: bash
@@ -118,36 +117,6 @@ runs:
         fi
         time git fetch $filter_arg --unshallow --no-tags \
           --prune --no-recurse-submodules origin "$(git rev-parse HEAD)"
-
-    - name: Compute submodule objects cache key
-      id: submodule-key
-      if: ${{ inputs.submodules == 'true' }}
-      shell: bash
-      run: |
-        hash=$(git ls-tree -r HEAD | awk '$2 == "commit" {print $3}' | sort | sha256sum | cut -d' ' -f1)
-        echo "hash=$hash" >> "$GITHUB_OUTPUT"
-
-    - name: Restore submodule git objects cache
-      id: restore-submodules
-      if: ${{ inputs.submodules == 'true' }}
-      uses: actions/cache/restore@v5
-      with:
-        path: |
-          .git/modules
-        key: gitobjects|${{ runner.os }}|${{ steps.submodule-key.outputs.hash }}
-        restore-keys: |
-          gitobjects|${{ runner.os }}|
-
-    - name: Warn on submodule cache miss
-      if: ${{ inputs.submodules == 'true' && steps.restore-submodules.outputs.cache-hit != 'true' }}
-      shell: bash
-      run: |
-        echo "::warning::.git/modules cache miss (matched key: '${{ steps.restore-submodules.outputs.cache-matched-key }}')"
-
-    - name: Clone submodules
-      if: ${{ inputs.submodules == 'true' }}
-      shell: bash
-      run: time git submodule update --init --recursive --depth 1 --filter=blob:none --jobs 4
 
     - name: Install git-restore-mtime
       shell: bash
@@ -173,10 +142,6 @@ runs:
         # Main repo: git-restore-mtime sets each fixture's mtime to the
         # commit that last touched it (deterministic and content-sensitive).
         #
-        # Submodules (depth 1): git-restore-mtime can't help because files
-        # not in the single commit's log keep checkout time. Instead, set
-        # all files to the submodule HEAD commit timestamp.
-        #
         # Directories: normalize to a fixed epoch since git-restore-mtime
         # only handles dirs for file adds/deletes, not modifications.
 
@@ -187,6 +152,7 @@ runs:
         #   cl/transition/**/test_data/** - consensus transition test data
         #   cl/utils/eth2shuffle/spec/** - shuffle spec CSV (read at runtime)
         #   execution/state/genesiswrite/*.json - genesis JSON (read at runtime)
+        #   execution/vm/vmgen/*.go - generator sources TestRunIsGenerated reads
         #   Extensions: .json .js .txt .ssz .ssz_snappy .yaml .csv
         time git restore-mtime --no-directories -- \
           '**/testdata/**' \
@@ -194,11 +160,8 @@ runs:
           'cl/spectest/**/data_*/**' \
           'cl/transition/**/test_data/**' \
           'cl/utils/eth2shuffle/spec/**' \
-          'execution/state/genesiswrite/*.json'
-
-        # Submodules are all fixture data; set mtimes to HEAD commit time.
-        git submodule foreach --quiet --recursive \
-          'ts=$(git log -1 --format=%cd --date=format:%Y%m%d%H%M.%S HEAD); find . -not -path "./.git/*" -not -type d -print0 | TZ=UTC xargs -0 touch -t $ts'
+          'execution/state/genesiswrite/*.json' \
+          'execution/vm/vmgen/*.go'
 
         # Normalize directory mtimes to a fixed epoch.
         find . -type d -not -path '*/.git/*' -print0 | TZ=UTC xargs -0 touch -t 200902132331.30
@@ -332,6 +295,25 @@ runs:
       shell: bash
       run: echo "ERIGON_CI_MODCACHE_KEY=${{ steps.restore-mod-cache.outputs.primary-key }}" >> "$GITHUB_ENV"
 
+    - name: Fall back to direct module fetches after any proxy error
+      shell: bash
+      run: echo "GOPROXY=https://proxy.golang.org|direct" >> "$GITHUB_ENV"
+
+    - name: Download Go modules
+      shell: bash
+      run: |
+        for attempt in 1 2 3; do
+          if time go mod download; then
+            echo "ERIGON_CI_MODCACHE_COMPLETE=true" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          if [ "$attempt" -eq 3 ]; then
+            exit 1
+          fi
+          echo "go mod download failed (attempt $attempt), retrying..."
+          sleep $((attempt * 15))
+        done
+
     - id: restore-build-cache
       uses: ./.github/actions/restore-build-cache
       with:
@@ -343,13 +325,6 @@ runs:
     - name: Export build cache key
       shell: bash
       run: echo "ERIGON_CI_GOCACHE_KEY=${{ steps.restore-build-cache.outputs.primary-key }}" >> "$GITHUB_ENV"
-
-    - name: Export submodule cache keys
-      if: ${{ inputs.submodules == 'true' }}
-      shell: bash
-      run: |
-        echo "ERIGON_CI_GITOBJECTS_CACHE_KEY=gitobjects|${{ runner.os }}|${{ steps.submodule-key.outputs.hash }}" >> "$GITHUB_ENV"
-        echo "ERIGON_CI_GITOBJECTS_CACHE_RESTORED_KEY=${{ steps.restore-submodules.outputs.cache-matched-key }}" >> "$GITHUB_ENV"
 
     - name: Display free disk space after setup
       shell: bash

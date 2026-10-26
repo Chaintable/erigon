@@ -167,13 +167,11 @@ func (hmap *handlerMap) publish(bus *eventBus, args []any, argIndex int) int {
 						handlerBus := asyncHandler.bus.Load()
 						if handlerBus != nil {
 							asyncHandler.doPublish(handlerBus, logEnabled, args...)
-						} else {
-							if logEnabled {
-								log.Trace("Ignoring callback",
-									"handler", fmt.Sprint(asyncHandler),
-									"bus", app.LogInstance(handlerBus),
-									"args", fmt.Sprint(args...))
-							}
+						} else if logEnabled {
+							log.Trace("Ignoring callback",
+								"handler", fmt.Sprint(asyncHandler),
+								"bus", app.LogInstance(handlerBus),
+								"args", fmt.Sprint(args...))
 						}
 						bus.wg.Done()
 					})
@@ -271,7 +269,7 @@ func (handler *eventHandler) doPublish(bus *eventBus, logEnabled bool, args ...a
 				"async", handler.async,
 				"callback", fmt.Sprint(handler.callBack),
 				"args", fmt.Sprint(args...),
-				//TODO Stack().
+				// TODO Stack().
 				"err", err)
 		}
 	}()

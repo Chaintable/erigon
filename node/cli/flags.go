@@ -199,18 +199,23 @@ var (
 	}
 	RpcSubscriptionFiltersMaxAddressesFlag = cli.IntFlag{
 		Name:  "rpc.subscription.filters.maxaddresses",
-		Usage: "Maximum number of addresses per subscription to filter logs by.",
+		Usage: "Maximum number of addresses accepted per log subscription.",
 		Value: rpchelper.DefaultFiltersConfig.RpcSubscriptionFiltersMaxAddresses,
 	}
 	RpcSubscriptionFiltersMaxTopicsFlag = cli.IntFlag{
 		Name:  "rpc.subscription.filters.maxtopics",
-		Usage: "Maximum number of topics per subscription to filter logs by.",
+		Usage: "Maximum number of topic alternatives accepted across all positions per log subscription.",
 		Value: rpchelper.DefaultFiltersConfig.RpcSubscriptionFiltersMaxTopics,
 	}
 	RpcSubscriptionFiltersTimeoutFlag = cli.DurationFlag{
 		Name:  "rpc.subscription.filters.timeout",
 		Usage: "Timeout before idle filters are evicted. Defaults to 5m; set to 0 to disable eviction.",
 		Value: rpchelper.DefaultFiltersConfig.RpcSubscriptionFiltersTimeout,
+	}
+	RpcSubscriptionFiltersMaxSubscriptionsFlag = cli.IntFlag{
+		Name:  "rpc.subscription.filters.maxsubscriptions",
+		Usage: "Maximum number of live filters and subscriptions across all clients. Set to 0 to disable the limit.",
+		Value: rpchelper.DefaultFiltersConfig.RpcSubscriptionFiltersMaxSubscriptions,
 	}
 )
 
@@ -225,6 +230,7 @@ func BuildEthConfig(nodeCtx context.Context, ctx *cli.Command, nodeCfg *nodecfg.
 }
 
 // ApplyFlagsForEthConfig is kept for backward compatibility. New code should use BuildEthConfig.
+//
 // Deprecated: use BuildEthConfig instead.
 func ApplyFlagsForEthConfig(ctx *cli.Command, cfg *ethconfig.Config, logger log.Logger) {
 	applyRemainingEthFlags(ctx, cfg, logger)
@@ -300,6 +306,9 @@ func applyRemainingEthFlags(ctx *cli.Command, cfg *ethconfig.Config, logger log.
 		cfg.Sync.LoopBlockLimit = limit
 	}
 	cfg.Sync.ParallelStateFlushing = ctx.Bool(SyncParallelStateFlushing.Name)
+	if d := ctx.Duration(utils.SlowBlockThresholdFlag.Name); d >= 0 {
+		cfg.Sync.SlowBlockThreshold = &d
+	}
 
 	if ctx.String(BadBlockFlag.Name) != "" {
 		bytes, err := hexutil.Decode(ctx.String(BadBlockFlag.Name))
@@ -442,6 +451,15 @@ func setEmbeddedRpcDaemon(ctx *cli.Command, cfg *nodecfg.Config, logger log.Logg
 		GraphQLEnabled:           ctx.Bool(utils.GraphQLEnabledFlag.Name),
 		HttpListenAddress:        ctx.String(utils.HTTPListenAddrFlag.Name),
 		HttpPort:                 ctx.Int(utils.HTTPPortFlag.Name),
+		HttpURL:                  ctx.String(utils.HTTPURLFlag.Name),
+		SocketServerEnabled:      ctx.Bool(utils.SocketEnabledFlag.Name),
+		SocketListenUrl:          ctx.String(utils.SocketURLFlag.Name),
+		HttpsServerEnabled:       ctx.Bool(utils.HTTPSEnabledFlag.Name),
+		HttpsListenAddress:       ctx.String(utils.HTTPSListenAddrFlag.Name),
+		HttpsPort:                ctx.Int(utils.HTTPSPortFlag.Name),
+		HttpsURL:                 ctx.String(utils.HTTPSURLFlag.Name),
+		HttpsCertfile:            ctx.String(utils.HTTPSCertFlag.Name),
+		HttpsKeyFile:             ctx.String(utils.HTTPSKeyFlag.Name),
 		AuthRpcHTTPListenAddress: ctx.String(utils.AuthRpcAddr.Name),
 		AuthRpcPort:              int(ctx.Uint(utils.AuthRpcPort.Name)),
 		JWTSecretPath:            jwtSecretPath,
@@ -473,24 +491,29 @@ func setEmbeddedRpcDaemon(ctx *cli.Command, cfg *nodecfg.Config, logger log.Logg
 		WsMaxConnections:          ctx.Int(utils.WsMaxConnectionsFlag.Name),
 		RpcAllowListFilePath:      ctx.String(utils.RpcAccessListFlag.Name),
 		RpcFiltersConfig: rpchelper.FiltersConfig{
-			RpcSubscriptionFiltersMaxLogs:      ctx.Int(RpcSubscriptionFiltersMaxLogsFlag.Name),
-			RpcSubscriptionFiltersMaxHeaders:   ctx.Int(RpcSubscriptionFiltersMaxHeadersFlag.Name),
-			RpcSubscriptionFiltersMaxTxs:       ctx.Int(RpcSubscriptionFiltersMaxTxsFlag.Name),
-			RpcSubscriptionFiltersMaxAddresses: ctx.Int(RpcSubscriptionFiltersMaxAddressesFlag.Name),
-			RpcSubscriptionFiltersMaxTopics:    ctx.Int(RpcSubscriptionFiltersMaxTopicsFlag.Name),
-			RpcSubscriptionFiltersTimeout:      ctx.Duration(RpcSubscriptionFiltersTimeoutFlag.Name),
+			RpcSubscriptionFiltersMaxLogs:          ctx.Int(RpcSubscriptionFiltersMaxLogsFlag.Name),
+			RpcSubscriptionFiltersMaxHeaders:       ctx.Int(RpcSubscriptionFiltersMaxHeadersFlag.Name),
+			RpcSubscriptionFiltersMaxTxs:           ctx.Int(RpcSubscriptionFiltersMaxTxsFlag.Name),
+			RpcSubscriptionFiltersMaxAddresses:     ctx.Int(RpcSubscriptionFiltersMaxAddressesFlag.Name),
+			RpcSubscriptionFiltersMaxTopics:        ctx.Int(RpcSubscriptionFiltersMaxTopicsFlag.Name),
+			RpcSubscriptionFiltersTimeout:          ctx.Duration(RpcSubscriptionFiltersTimeoutFlag.Name),
+			RpcSubscriptionFiltersMaxSubscriptions: ctx.Int(RpcSubscriptionFiltersMaxSubscriptionsFlag.Name),
 		},
-		Gascap:              utils.RpcGasCap(ctx),
-		BlockRangeLimit:     ctx.Int(utils.RpcBlockRangeLimit.Name),
-		GetLogsMaxResults:   ctx.Int(utils.RpcGetLogsMaxResults.Name),
-		LogQueryLimit:       ctx.Int(utils.RpcLogQueryLimit.Name),
-		Feecap:              ctx.Float64(utils.RPCGlobalTxFeeCapFlag.Name),
-		MaxTraces:           uint64(ctx.Uint(utils.TraceMaxtracesFlag.Name)),
-		TraceCompatibility:  ctx.Bool(utils.RpcTraceCompatFlag.Name),
-		GethCompatibility:   ctx.Bool(utils.RpcGethCompatFlag.Name),
-		BatchLimit:          ctx.Int(utils.RpcBatchLimit.Name),
-		ReturnDataLimit:     ctx.Int(utils.RpcReturnDataLimit.Name),
-		AllowUnprotectedTxs: ctx.Bool(utils.AllowUnprotectedTxs.Name),
+		Gascap:                  utils.RpcGasCap(ctx),
+		BlockRangeLimit:         ctx.Int(utils.RpcBlockRangeLimit.Name),
+		GetLogsMaxResults:       ctx.Int(utils.RpcGetLogsMaxResults.Name),
+		LogQueryLimit:           ctx.Int(utils.RpcLogQueryLimit.Name),
+		Feecap:                  ctx.Float64(utils.RPCGlobalTxFeeCapFlag.Name),
+		MaxTraces:               uint64(ctx.Uint(utils.TraceMaxtracesFlag.Name)),
+		TraceCompatibility:      ctx.Bool(utils.RpcTraceCompatFlag.Name),
+		GethCompatibility:       ctx.Bool(utils.RpcGethCompatFlag.Name),
+		WitnessCacheBlocks:      ctx.Uint(utils.WitnessCacheBlocksFlag.Name),
+		WitnessCacheHeadCapture: ctx.Bool(utils.WitnessCacheHeadCaptureFlag.Name),
+		WitnessCacheMaxMB:       ctx.Uint(utils.WitnessCacheMaxMBFlag.Name),
+		BatchLimit:              ctx.Int(utils.RpcBatchLimit.Name),
+		SubscriptionLimit:       ctx.Int(utils.RpcSubscriptionLimit.Name),
+		ReturnDataLimit:         ctx.Int(utils.RpcReturnDataLimit.Name),
+		AllowUnprotectedTxs:     ctx.Bool(utils.AllowUnprotectedTxs.Name),
 
 		OtsMaxPageSize: ctx.Uint64(utils.OtsSearchMaxCapFlag.Name),
 

@@ -24,12 +24,8 @@ import (
 	"github.com/erigontech/erigon/execution/types"
 	"github.com/erigontech/erigon/execution/types/accounts"
 	"github.com/erigontech/erigon/execution/vm"
-	"github.com/erigontech/erigon/execution/vm/evmtypes"
-	bortypes "github.com/erigontech/erigon/polygon/bor/types"
-	polygonchain "github.com/erigontech/erigon/polygon/chain"
 	"github.com/erigontech/erigon/rpc"
 	"github.com/erigontech/erigon/rpc/rpchelper"
-	"github.com/erigontech/erigon/rpc/transactions"
 	"github.com/holiman/uint256"
 )
 
@@ -57,7 +53,7 @@ func (api *TraceAPIImpl) DebankBlockRaw(ctx context.Context, blockNrOrHash rpc.B
 		return nil, err
 	}
 
-	blockNumber, blockHash, _, err := rpchelper.GetBlockNumber(ctx, blockNrOrHash, dbtx, api._blockReader, api.filters)
+	blockNumber, blockHash, _, err := rpchelper.GetBlockNumber(ctx, blockNrOrHash, dbtx, api._blockReader)
 	if err != nil {
 		return nil, err
 	}
@@ -155,71 +151,9 @@ func (api *TraceAPIImpl) DebankBlockRaw(ctx context.Context, blockNrOrHash rpc.B
 		blockFile.Txs = append(blockFile.Txs, tx)
 	}
 
-	if chainConfig.Bor != nil {
-		var borTx types.Transaction
-		var borTxHash common.Hash
-		possibleBorTxnHash := bortypes.ComputeBorTxHash(block.NumberU64(), block.Hash())
-		_, ok, err := api.bridgeReader.EventTxnLookup(ctx, possibleBorTxnHash)
-		if err != nil {
-			return nil, err
-		}
-		if ok {
-			borTx = bortypes.NewBorTransaction()
-			borTxHash = possibleBorTxnHash
-		}
-		if borTx != nil {
-			var stateSyncEvents []*types.Message
-			stateSyncEvents, err = api.bridgeReader.Events(ctx, header.Hash(), blockNumber)
-			if err != nil {
-				return nil, err
-			}
-			txCtx := evmtypes.TxContext{
-				TxHash:   bortypes.ComputeBorTxHash(blockNumber, blockHash),
-				Origin:   accounts.ZeroAddress,
-				GasPrice: *uint256.NewInt(0),
-			}
-			hooks := dtracer.NewCallTracer(blockFile, txCtx.TxHash.Hex())
-			vmConfig.Tracer = hooks
-			ibs.SetTxContext(header.Number.Uint64(), len(block.Transactions()))
-			ibs.SetHooks(hooks)
-			blockCtx := transactions.NewEVMBlockContext(engine, header, true, dbtx, api._blockReader, chainConfig)
-			evm := vm.NewEVM(blockCtx, txCtx, ibs, chainConfig, vmConfig)
-			rules := blockCtx.Rules(chainConfig)
-			for _, msg := range stateSyncEvents {
-				gp := protocol.NewGasPool(msg.Gas(), msg.BlobGas())
-				_, err := protocol.ApplyMessage(evm, msg, gp, true, false /* gasBailout */, engine)
-				if err != nil {
-					return nil, err
-				}
-
-				err = ibs.FinalizeTx(rules, writer)
-				if err != nil {
-					return nil, err
-				}
-
-				evm.Reset(txCtx, ibs)
-			}
-
-			borBlockNum := block.Number()
-			receipt := types.Receipt{
-				Type:             0,
-				TxHash:           bortypes.ComputeBorTxHash(block.NumberU64(), block.Hash()),
-				GasUsed:          0,
-				BlockHash:        block.Hash(),
-				BlockNumber:      &borBlockNum,
-				TransactionIndex: uint(len(block.Transactions())),
-				Status:           types.ReceiptStatusSuccessful,
-			}
-
-			tx := dtracer.BuildBorPipelineTransaction(borTx, &receipt, borTxHash)
-			blockFile.Txs = append(blockFile.Txs, tx)
-		}
-
-	}
-
 	chainReader := consensuschain.NewReader(chainConfig, dbtx, api._blockReader, logger)
 
-	newBlock, _, err := protocol.FinalizeBlockExecution(engine, stateReader, block.Header(), block.Transactions(), block.Uncles(), writer, chainConfig, ibs, receipts, block.Withdrawals(), chainReader, true, logger, nil)
+	newBlock, _, err := protocol.FinalizeBlockExecution(engine, block.Header(), block.Transactions(), block.Uncles(), writer, chainConfig, ibs, receipts, block.Withdrawals(), chainReader, true, logger)
 	if err != nil {
 		return nil, err
 	}
@@ -363,7 +297,7 @@ func CreateHistoryStateReader2(ctx context.Context, tx kv.TemporalTx, txNumsRead
 	if minHistoryTxNum := state.StateHistoryStartTxNum(tx); txNum < minHistoryTxNum {
 		// data available only starting from minHistoryTxNum, throw error to avoid unintended
 		// consequences of using this StateReader
-		return nil, state.PrunedError
+		return nil, state.ErrPruned
 	}
 	return state.NewHistoryReaderV3(tx, txNum), nil
 }
@@ -397,14 +331,6 @@ func genesisBlockByChainName(chainName string) *types.Genesis {
 		return chainspec.GnosisGenesisBlock()
 	case "chiado":
 		return chainspec.ChiadoGenesisBlock()
-	case "bor-mainnet":
-		return polygonchain.BorMainnetGenesisBlock()
-	case "mumbai":
-		return polygonchain.MumbaiGenesisBlock()
-	case "amoy":
-		return polygonchain.AmoyGenesisBlock()
-	case "bor-devnet":
-		return polygonchain.BorDevnetGenesisBlock()
 	default:
 		return nil
 	}

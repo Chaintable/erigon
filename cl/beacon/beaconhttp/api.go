@@ -33,8 +33,10 @@ import (
 	"github.com/erigontech/erigon/common/ssz"
 )
 
-var _ error = EndpointError{}
-var _ error = (*EndpointError)(nil)
+var (
+	_ error = EndpointError{}
+	_ error = (*EndpointError)(nil)
+)
 
 type EndpointError struct {
 	Code        int      `json:"code"`
@@ -44,14 +46,15 @@ type EndpointError struct {
 	err error
 }
 
-var ErrorCantFindBeaconState = errors.New("Could not find beacon state")
-var ErrorSszNotSupported = errors.New("This endpoint does not support SSZ response")
+var (
+	ErrorCantFindBeaconState = errors.New("could not find beacon state")
+	ErrorSszNotSupported     = errors.New("this endpoint does not support SSZ response")
+)
 
 func WrapEndpointError(err error) *EndpointError {
 	// Handlers build these with NewEndpointError, so the pointer form is the one that carries a
 	// deliberate code; matching only the value form would silently turn it into a 500.
-	var byPointer *EndpointError
-	if errors.As(err, &byPointer) {
+	if byPointer, ok := errors.AsType[*EndpointError](err); ok {
 		return byPointer
 	}
 	byValue := EndpointError{}
@@ -70,9 +73,9 @@ func WrapEndpointError(err error) *EndpointError {
 
 func NewEndpointError(code int, err error) *EndpointError {
 	// TODO: consider adding stack traces/debug mode ?
-	//b := make([]byte, 2048)
-	//n := runtime.Stack(b, false)
-	//s := string(b[:n])
+	// b := make([]byte, 2048)
+	// n := runtime.Stack(b, false)
+	// s := string(b[:n])
 	return &EndpointError{
 		Code:    code,
 		Message: err.Error(),
@@ -90,6 +93,7 @@ func (e EndpointError) Unwrap() error {
 }
 
 func (e *EndpointError) WriteTo(w http.ResponseWriter) {
+	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(e.Code)
 	encErr := json.NewEncoder(w).Encode(e)
 	if encErr != nil {
@@ -116,10 +120,7 @@ func HandleEndpoint[T any](h EndpointHandler[T]) http.HandlerFunc {
 		ans, err := h.Handle(w, r)
 		if err != nil {
 			var endpointError *EndpointError
-			if e, ok := err.(*EndpointError); ok {
-				// Directly use the error if it's already an *EndpointError
-				endpointError = e
-			} else {
+			if !errors.As(err, &endpointError) {
 				// Wrap the error in an EndpointError otherwise
 				endpointError = WrapEndpointError(err)
 			}
@@ -129,7 +130,7 @@ func HandleEndpoint[T any](h EndpointHandler[T]) http.HandlerFunc {
 				endpointError.WriteTo(w)
 			} else {
 				// Failsafe: If the error is nil, write a generic 500 error
-				NewEndpointError(http.StatusInternalServerError, errors.New("Internal Server Error")).WriteTo(w)
+				NewEndpointError(http.StatusInternalServerError, errors.New("internal server error")).WriteTo(w)
 			}
 			return
 		}
@@ -148,6 +149,14 @@ func HandleEndpoint[T any](h EndpointHandler[T]) http.HandlerFunc {
 			// Many consumers rely on this header for fork-specific types.
 			if beaconResponse.Version != nil && w.Header().Get("Eth-Consensus-Version") == "" {
 				w.Header().Set("Eth-Consensus-Version", beaconResponse.Version.String())
+			}
+			if beaconResponse.noContent {
+				statusCode := beaconResponse.statusCode
+				if statusCode == 0 {
+					statusCode = http.StatusNoContent
+				}
+				w.WriteHeader(statusCode)
+				return
 			}
 		}
 		switch responseEncodingForAccept(contentType, supportsSSZ(ans)) {
@@ -179,11 +188,13 @@ func HandleEndpoint[T any](h EndpointHandler[T]) http.HandlerFunc {
 				WrapEndpointError(err).WriteTo(w)
 				return
 			}
-			w.Write(encoded)
+			if _, err := w.Write(encoded); err != nil {
+				log.Debug("beaconapi failed to write ssz response", "err", err)
+			}
 		case responseEncodingEventStream:
 			return
 		default:
-			http.Error(w, "content type must include application/json, application/octet-stream, or text/event-stream, got "+contentType, http.StatusBadRequest)
+			http.Error(w, "content type must include application/json, application/octet-stream, or text/event-stream, got "+contentType, http.StatusNotAcceptable)
 		}
 	}
 }

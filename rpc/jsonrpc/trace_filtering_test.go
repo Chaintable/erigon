@@ -19,12 +19,14 @@ package jsonrpc
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"math"
 	"math/big"
 	"testing"
 
+	"github.com/holiman/uint256"
 	"github.com/stretchr/testify/require"
 
-	"github.com/erigontech/erigon/cmd/rpcdaemon/cli/httpcfg"
 	"github.com/erigontech/erigon/cmd/rpcdaemon/rpcdaemontest"
 	"github.com/erigontech/erigon/common"
 	"github.com/erigontech/erigon/common/hexutil"
@@ -40,6 +42,7 @@ import (
 	"github.com/erigontech/erigon/execution/types"
 	"github.com/erigontech/erigon/node/shards"
 	"github.com/erigontech/erigon/rpc"
+	"github.com/erigontech/erigon/rpc/jsonstream"
 	"github.com/erigontech/erigon/rpc/rpchelper"
 	"github.com/erigontech/erigon/rpc/transactions"
 )
@@ -50,7 +53,7 @@ import (
 // worker-pool path of doCallBlockParallel.
 func TestCallBlockParallelMatchesSequential(t *testing.T) {
 	m, _, _ := rpcdaemontest.CreateTestExecModule(t)
-	api := NewTraceAPI(newBaseApiForTest(m), m.DB, &httpcfg.HttpCfg{})
+	api := newTraceApiForTest(m)
 
 	ctx := context.Background()
 	const blockNum = uint64(6) // block 6 has 32 txs (case i=5 in test chain generation)
@@ -100,7 +103,7 @@ func TestCallBlockParallelMatchesSequential(t *testing.T) {
 
 	// Set up the state reader at the parent block boundary (= pre-block-6 state).
 	stateReader, err := rpchelper.CreateStateReader(ctx, tx, api._blockReader, parentNrOrHash, 0,
-		api.filters, api.stateCache, api._txNumReader)
+		api.stateCache, api._txNumReader)
 	require.NoError(t, err)
 
 	hsr, ok := stateReader.(state.HistoricalStateReader)
@@ -112,10 +115,10 @@ func TestCallBlockParallelMatchesSequential(t *testing.T) {
 	noop := state.NewNoopWriter()
 	cachedWriter := state.NewCachedWriter(noop, sc)
 	ibs := state.New(cachedReader)
-	defer ibs.Release(false)
+	defer ibs.Close()
 
-	consensusHeaderReader := consensuschain.NewReader(cfg, tx, api._blockReader, nil)
 	logger := log.New("trace_filtering_test")
+	consensusHeaderReader := consensuschain.NewReader(cfg, tx, api._blockReader, logger)
 	err = protocol.InitializeBlockExecution(engine.(protocolrules.Engine), consensusHeaderReader,
 		block.HeaderNoCopy(), cfg, ibs, nil, logger, nil)
 	require.NoError(t, err)
@@ -130,7 +133,7 @@ func TestCallBlockParallelMatchesSequential(t *testing.T) {
 
 	// Sequential path — uses the stateReader/ibs prepared above.
 	sequentialResults, _, err := api.doCallBlock(ctx, tx, stateReader, sc, cachedWriter, ibs, txs, msgs,
-		callParams, &parentNrOrHash, header, false, nil)
+		callParams, header, parentNrOrHash.RequireCanonical, false, true /* advanceTxNum */, false /* noBaseFee */, nil, nil)
 	require.NoError(t, err)
 	require.Len(t, sequentialResults, len(txs))
 
@@ -147,12 +150,12 @@ func TestCallBlockParallelMatchesSequential(t *testing.T) {
 
 // TestCallTransactionNilTxnReturnsError reproduces
 // https://github.com/erigontech/erigon/issues/22643: at the live chain tip,
-// TxnByIdxInBlock can resolve a txIndex whose body hasn't materialized yet and
-// return (nil, nil) rather than an error. callTransaction must turn that into
-// a JSON-RPC error instead of dereferencing the nil transaction.
+// TxnByIdxInBlock can report a txIndex as not found because the body hasn't
+// materialized yet. callTransaction must turn that into a JSON-RPC error
+// instead of dereferencing the missing transaction.
 func TestCallTransactionNilTxnReturnsError(t *testing.T) {
 	m, _, _ := rpcdaemontest.CreateTestExecModule(t)
-	api := NewTraceAPI(newBaseApiForTest(m), m.DB, &httpcfg.HttpCfg{})
+	api := newTraceApiForTest(m)
 
 	ctx := context.Background()
 	const blockNum = uint64(6)
@@ -169,7 +172,7 @@ func TestCallTransactionNilTxnReturnsError(t *testing.T) {
 	require.NoError(t, err)
 
 	// Far past the last real transaction in the block, so TxnByIdxInBlock
-	// finds the body but no matching entry in kv.EthTx and returns (nil, nil).
+	// finds the body but no matching entry in kv.EthTx and returns ok=false.
 	unresolvedTxIndex := len(block.Transactions()) + 1_000_000
 
 	_, err = api.callTransaction(ctx, tx, block.Header(), []string{TraceTypeTrace}, unresolvedTxIndex, false, chainConfig, nil)
@@ -188,7 +191,8 @@ func traceConfigWithWithdrawals() *config.TraceConfig {
 
 func assertNoWithdrawalTraces(t *testing.T, traces ParityTraces) {
 	t.Helper()
-	for _, tr := range traces {
+	for i := range traces {
+		tr := &traces[i]
 		action, ok := tr.Action.(*RewardTraceAction)
 		require.False(t, ok && action.RewardType == rewardTypeWithdrawal,
 			"unexpected withdrawal trace entry")
@@ -205,12 +209,12 @@ func chainWithWithdrawal(t *testing.T, withdrawalAddr common.Address, withdrawal
 		Alloc:  types.GenesisAlloc{withdrawalAddr: {Balance: bankFunds}},
 	}
 	m := execmoduletester.New(t, execmoduletester.WithGenesisSpec(gspec))
-	generated, err := blockgen.GenerateChain(m.ChainConfig, m.Genesis, m.Engine, m.DB, 1, func(_ int, b *blockgen.BlockGen) {
+	generated, err := m.GenerateChain(1, func(_ int, b *blockgen.BlockGen) {
 		b.AddWithdrawal(&types.Withdrawal{
 			Index:     0,
 			Validator: 42,
 			Address:   withdrawalAddr,
-			Amount:    withdrawalGwei,
+			Amount:    hexutil.Uint64(withdrawalGwei),
 		})
 	})
 	require.NoError(t, err)
@@ -226,7 +230,7 @@ func TestBlockWithdrawalTraceEntries(t *testing.T) {
 	withdrawalAddr := common.HexToAddress("0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef")
 
 	m, blk := chainWithWithdrawal(t, withdrawalAddr, withdrawalGwei)
-	api := NewTraceAPI(newBaseApiForTest(m), m.DB, &httpcfg.HttpCfg{})
+	api := newTraceApiForTest(m)
 	n := rpc.BlockNumber(blk.NumberU64())
 
 	traces, err := api.Block(context.Background(), n, new(bool), traceConfigWithWithdrawals())
@@ -263,7 +267,7 @@ func TestBlockWithdrawalNoEntriesWithoutFlag(t *testing.T) {
 	withdrawalAddr := common.HexToAddress("0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef")
 
 	m, blk := chainWithWithdrawal(t, withdrawalAddr, withdrawalGwei)
-	api := NewTraceAPI(newBaseApiForTest(m), m.DB, &httpcfg.HttpCfg{})
+	api := newTraceApiForTest(m)
 	n := rpc.BlockNumber(blk.NumberU64())
 
 	traces, err := api.Block(context.Background(), n, new(bool), nil)
@@ -276,7 +280,7 @@ func TestBlockWithdrawalNoEntriesWithoutFlag(t *testing.T) {
 func TestBlockWithdrawalNoEntriesPreShanghai(t *testing.T) {
 	// Default test chain uses TestChainBerlinConfig which has no ShanghaiTime.
 	m, _, _ := rpcdaemontest.CreateTestExecModule(t)
-	api := NewTraceAPI(newBaseApiForTest(m), m.DB, &httpcfg.HttpCfg{})
+	api := newTraceApiForTest(m)
 
 	// Block 1 is pre-Shanghai on the default test chain.
 	n := rpc.BlockNumber(1)
@@ -293,7 +297,7 @@ func TestReplayBlockTransactionsWithdrawalStateDiff(t *testing.T) {
 	withdrawalAddr := common.HexToAddress("0xcafecafecafecafecafecafecafecafecafecafe")
 
 	m, blk := chainWithWithdrawal(t, withdrawalAddr, withdrawalGwei)
-	api := NewTraceAPI(newBaseApiForTest(m), m.DB, &httpcfg.HttpCfg{})
+	api := newTraceApiForTest(m)
 
 	n := rpc.BlockNumber(blk.NumberU64())
 	bnOrHash := rpc.BlockNumberOrHash{BlockNumber: &n}
@@ -340,16 +344,16 @@ func TestReplayBlockTransactionsMultiWithdrawalSameAddr(t *testing.T) {
 		Alloc:  types.GenesisAlloc{withdrawalAddr: {Balance: testBankFunds()}},
 	}
 	m := execmoduletester.New(t, execmoduletester.WithGenesisSpec(gspec))
-	generated, err := blockgen.GenerateChain(m.ChainConfig, m.Genesis, m.Engine, m.DB, 1, func(_ int, b *blockgen.BlockGen) {
-		b.AddWithdrawal(&types.Withdrawal{Index: 0, Validator: 42, Address: withdrawalAddr, Amount: wd1Gwei})
-		b.AddWithdrawal(&types.Withdrawal{Index: 1, Validator: 43, Address: withdrawalAddr, Amount: wd2Gwei})
+	generated, err := m.GenerateChain(1, func(_ int, b *blockgen.BlockGen) {
+		b.AddWithdrawal(&types.Withdrawal{Index: 0, Validator: 42, Address: withdrawalAddr, Amount: hexutil.Uint64(wd1Gwei)})
+		b.AddWithdrawal(&types.Withdrawal{Index: 1, Validator: 43, Address: withdrawalAddr, Amount: hexutil.Uint64(wd2Gwei)})
 	})
 	require.NoError(t, err)
 	err = m.InsertChain(generated)
 	require.NoError(t, err)
 	blk := generated.Blocks[0]
 
-	api := NewTraceAPI(newBaseApiForTest(m), m.DB, &httpcfg.HttpCfg{})
+	api := newTraceApiForTest(m)
 	n := rpc.BlockNumber(blk.NumberU64())
 	bnOrHash := rpc.BlockNumberOrHash{BlockNumber: &n}
 	results, err := api.ReplayBlockTransactions(context.Background(), bnOrHash, []string{"stateDiff"}, new(bool), traceConfigWithWithdrawals())
@@ -387,13 +391,13 @@ func TestReplayBlockTransactionsWithdrawalNewAddress(t *testing.T) {
 	newAddr := common.HexToAddress("0xaaaabbbbccccddddeeeeffffaaaabbbbccccdddd")
 	gspec := &types.Genesis{Config: chain.AllProtocolChanges}
 	m := execmoduletester.New(t, execmoduletester.WithGenesisSpec(gspec))
-	generated, err := blockgen.GenerateChain(m.ChainConfig, m.Genesis, m.Engine, m.DB, 1, func(_ int, b *blockgen.BlockGen) {
-		b.AddWithdrawal(&types.Withdrawal{Index: 0, Validator: 42, Address: newAddr, Amount: withdrawalGwei})
+	generated, err := m.GenerateChain(1, func(_ int, b *blockgen.BlockGen) {
+		b.AddWithdrawal(&types.Withdrawal{Index: 0, Validator: 42, Address: newAddr, Amount: hexutil.Uint64(withdrawalGwei)})
 	})
 	require.NoError(t, err)
 	require.NoError(t, m.InsertChain(generated))
 
-	api := NewTraceAPI(newBaseApiForTest(m), m.DB, &httpcfg.HttpCfg{})
+	api := newTraceApiForTest(m)
 	n := rpc.BlockNumber(generated.Blocks[0].NumberU64())
 	bnOrHash := rpc.BlockNumberOrHash{BlockNumber: &n}
 	results, err := api.ReplayBlockTransactions(context.Background(), bnOrHash, []string{"stateDiff"}, new(bool), traceConfigWithWithdrawals())
@@ -406,8 +410,8 @@ func TestReplayBlockTransactionsWithdrawalNewAddress(t *testing.T) {
 	wdDiff, ok := last.StateDiff[internedAddress(newAddr.Hex())]
 	require.True(t, ok, "withdrawal address not found in synthetic stateDiff entry")
 
-	balMap, ok := wdDiff.Balance.(map[string]*hexutil.Big)
-	require.True(t, ok, "expected creation balance map[string]*hexutil.Big, got %T", wdDiff.Balance)
+	balMap, ok := wdDiff.Balance.(map[string]*hexutil.U256)
+	require.True(t, ok, "expected creation balance map[string]*hexutil.U256, got %T", wdDiff.Balance)
 	finalBal := balMap["+"]
 	require.NotNil(t, finalBal, "balance missing \"+\" key")
 
@@ -431,14 +435,14 @@ func TestReplayBlockTransactionsMultiWithdrawalNewAddress(t *testing.T) {
 	newAddr := common.HexToAddress("0x1111222233334444555566667777888899990000")
 	gspec := &types.Genesis{Config: chain.AllProtocolChanges}
 	m := execmoduletester.New(t, execmoduletester.WithGenesisSpec(gspec))
-	generated, err := blockgen.GenerateChain(m.ChainConfig, m.Genesis, m.Engine, m.DB, 1, func(_ int, b *blockgen.BlockGen) {
-		b.AddWithdrawal(&types.Withdrawal{Index: 0, Validator: 1, Address: newAddr, Amount: wd1Gwei})
-		b.AddWithdrawal(&types.Withdrawal{Index: 1, Validator: 2, Address: newAddr, Amount: wd2Gwei})
+	generated, err := m.GenerateChain(1, func(_ int, b *blockgen.BlockGen) {
+		b.AddWithdrawal(&types.Withdrawal{Index: 0, Validator: 1, Address: newAddr, Amount: hexutil.Uint64(wd1Gwei)})
+		b.AddWithdrawal(&types.Withdrawal{Index: 1, Validator: 2, Address: newAddr, Amount: hexutil.Uint64(wd2Gwei)})
 	})
 	require.NoError(t, err)
 	require.NoError(t, m.InsertChain(generated))
 
-	api := NewTraceAPI(newBaseApiForTest(m), m.DB, &httpcfg.HttpCfg{})
+	api := newTraceApiForTest(m)
 	n := rpc.BlockNumber(generated.Blocks[0].NumberU64())
 	bnOrHash := rpc.BlockNumberOrHash{BlockNumber: &n}
 	results, err := api.ReplayBlockTransactions(context.Background(), bnOrHash, []string{"stateDiff"}, new(bool), traceConfigWithWithdrawals())
@@ -452,8 +456,8 @@ func TestReplayBlockTransactionsMultiWithdrawalNewAddress(t *testing.T) {
 	wdDiff, ok := last.StateDiff[internedAddress(newAddr.Hex())]
 	require.True(t, ok, "withdrawal address not found in synthetic stateDiff entry")
 
-	balMap, ok := wdDiff.Balance.(map[string]*hexutil.Big)
-	require.True(t, ok, "expected creation balance map[string]*hexutil.Big, got %T", wdDiff.Balance)
+	balMap, ok := wdDiff.Balance.(map[string]*hexutil.U256)
+	require.True(t, ok, "expected creation balance map[string]*hexutil.U256, got %T", wdDiff.Balance)
 	finalBal := balMap["+"]
 	require.NotNil(t, finalBal, "balance missing \"+\" key")
 
@@ -469,7 +473,7 @@ func TestReplayBlockTransactionsWithdrawalNoEntriesWithoutFlag(t *testing.T) {
 	withdrawalAddr := common.HexToAddress("0xcafecafecafecafecafecafecafecafecafecafe")
 
 	m, blk := chainWithWithdrawal(t, withdrawalAddr, withdrawalGwei)
-	api := NewTraceAPI(newBaseApiForTest(m), m.DB, &httpcfg.HttpCfg{})
+	api := newTraceApiForTest(m)
 	n := rpc.BlockNumber(blk.NumberU64())
 	bnOrHash := rpc.BlockNumberOrHash{BlockNumber: &n}
 
@@ -483,4 +487,125 @@ func TestReplayBlockTransactionsWithdrawalNoEntriesWithoutFlag(t *testing.T) {
 		_, ok := r.StateDiff[internedAddr]
 		require.False(t, ok, "withdrawal stateDiff entry emitted without IncludeWithdrawals flag")
 	}
+}
+
+// TestTraceGetResolvesTraceAddressPath pins trace_get selector semantics: the
+// selector is a call-tree path matched against traceAddress, not a position in
+// the flat trace list.
+func TestTraceGetResolvesTraceAddressPath(t *testing.T) {
+	m := rpcdaemontest.CreateTestExecModuleForTraces(t)
+	api := newTraceApiForTest(m)
+	ctx := context.Background()
+	txHash := common.HexToHash("0xb42edc1d46932ef34be0ba49402dc94e3d2319c066f02945f6828cd344fcfa7b")
+
+	for _, path := range [][]int{{}, {0}, {1}, {0, 0}, {1, 0}} {
+		t.Run(fmt.Sprintf("found %v", path), func(t *testing.T) {
+			selector := common.SliceMap(path, func(level int) hexutil.Uint64 { return hexutil.Uint64(level) })
+			trace, err := api.Get(ctx, txHash, selector, nil, nil)
+			require.NoError(t, err)
+			require.NotNil(t, trace)
+			require.Equal(t, path, trace.TraceAddress)
+		})
+	}
+
+	for _, selector := range [][]hexutil.Uint64{
+		{2},
+		{0, 0, 0},
+		{1, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+		{math.MaxUint64},
+		{1, math.MaxUint64},
+	} {
+		t.Run(fmt.Sprintf("null %v", selector), func(t *testing.T) {
+			trace, err := api.Get(ctx, txHash, selector, nil, nil)
+			require.NoError(t, err)
+			require.Nil(t, trace)
+		})
+	}
+
+	t.Run("nil selector returns root", func(t *testing.T) {
+		trace, err := api.Get(ctx, txHash, nil, nil, nil)
+		require.NoError(t, err)
+		require.NotNil(t, trace)
+		require.Empty(t, trace.TraceAddress)
+	})
+}
+
+func TestTraceGetUnknownTxReturnsNull(t *testing.T) {
+	m := rpcdaemontest.CreateTestExecModuleForTraces(t)
+	api := newTraceApiForTest(m)
+
+	trace, err := api.Get(context.Background(), common.HexToHash("0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"), []hexutil.Uint64{0}, nil, nil)
+	require.NoError(t, err)
+	require.Nil(t, trace)
+}
+
+func TestParityTracesMarshalFastJSONMatchesReflection(t *testing.T) {
+	m, _, _ := rpcdaemontest.CreateTestExecModule(t)
+	api := newTraceApiForTest(m)
+	for n := rpc.BlockNumber(1); n <= 10; n++ {
+		traces, err := api.Block(context.Background(), n, new(bool), &config.TraceConfig{})
+		require.NoError(t, err)
+		requireFastJSONMatchesReflection(t, fmt.Sprintf("block %d", n), traces)
+	}
+
+	hash := common.HexToHash("0xab")
+	num, pos := uint64(7), uint64(2)
+	addr := common.HexToAddress("0xc0de")
+	u := func(v uint64) hexutil.U256 { return hexutil.U256(*uint256.NewInt(v)) }
+	gasUsed := u(21000)
+	for name, ts := range map[string]ParityTraces{
+		"nil":   nil,
+		"empty": {},
+		"state gas": {
+			{
+				Action: &CreateTraceAction{StateGas: new(hexutil.Uint64(100))},
+				Result: &CreateTraceResult{StateGasUsed: new(hexutil.Int64(50))}, Type: "create",
+			},
+			{Action: &CallTraceAction{}, Result: &TraceResult{StateGasUsed: new(hexutil.Int64(-50))}, Type: "call"},
+		},
+		"zero state gas": {
+			{
+				Action: &CreateTraceAction{StateGas: new(hexutil.Uint64)},
+				Result: &CreateTraceResult{StateGasUsed: new(hexutil.Int64)}, Type: "create",
+			},
+			{Action: &CallTraceAction{}, Result: &TraceResult{StateGasUsed: new(hexutil.Int64)}, Type: "call"},
+		},
+		"all kinds": {
+			{
+				Action:    &CallTraceAction{From: addr, CallType: "delegatecall", Gas: u(1), Input: hexutil.Bytes{1}, To: addr, Value: u(2)},
+				BlockHash: &hash, BlockNumber: &num, Result: &TraceResult{GasUsed: &gasUsed, Output: hexutil.Bytes{3}},
+				Subtraces: 2, TraceAddress: []int{}, TransactionHash: &hash, TransactionPosition: &pos, Type: "call",
+			},
+			{
+				Action: &CreateTraceAction{From: addr, CreationMethod: "create2", Gas: u(5)},
+				Result: &CreateTraceResult{Address: &addr, Code: hexutil.Bytes{0x60}, GasUsed: &gasUsed}, TraceAddress: []int{0, 1}, Type: "create",
+			},
+			{Action: &CreateTraceAction{}, Error: "Out of gas", Type: "create"},
+			{Action: &CreateTraceAction{}, Error: "Reverted", Result: &TraceResult{GasUsed: &gasUsed, Output: hexutil.Bytes{0xde}}, Type: "create"},
+			{Action: &SuicideTraceAction{Address: addr, RefundAddress: addr, Balance: u(9)}, TraceAddress: []int{3}, Type: "suicide"},
+			{Action: &RewardTraceAction{Author: addr, RewardType: "block", Value: u(2e18)}, BlockHash: &hash, BlockNumber: &num, Type: "reward"},
+			{Action: (*CallTraceAction)(nil), Result: (*TraceResult)(nil), Error: "Reverted", Type: "call"},
+			{},
+		},
+	} {
+		requireFastJSONMatchesReflection(t, name, ts)
+		for i := range ts {
+			requireFastJSONMatchesReflection(t, fmt.Sprintf("%s trace %d", name, i), &ts[i])
+		}
+	}
+
+	stream := jsonstream.Get(nil)
+	defer jsonstream.Put(stream)
+	err := ParityTraces{{Action: CallTraceAction{}}}.MarshalFastJSONTo(stream)
+	require.ErrorContains(t, err, "has no JSON writer")
+	require.Empty(t, stream.Buffer(), "an unsupported action fails before the first write")
+}
+
+func requireFastJSONMatchesReflection(t *testing.T, name string, ts jsonstream.Marshaler) {
+	t.Helper()
+	want, err := json.Marshal(ts)
+	require.NoError(t, err, name)
+	got, err := jsonstream.Marshal(ts)
+	require.NoError(t, err, name)
+	require.Equal(t, string(want), string(got), name)
 }

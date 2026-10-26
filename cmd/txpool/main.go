@@ -26,7 +26,6 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/erigontech/erigon/cmd/rpcdaemon/rpcdaemontest"
 	"github.com/erigontech/erigon/cmd/utils"
 	"github.com/erigontech/erigon/cmd/utils/flags"
 	"github.com/erigontech/erigon/common"
@@ -201,8 +200,8 @@ func doTxpool(ctx context.Context, logger log.Logger) error {
 		return err
 	}
 
-	miningGrpcServer := privateapi.NewMiningServer(ctx, &rpcdaemontest.IsMiningMock{}, nil, logger)
-	grpcServer, err := txpool.StartGrpc(txpoolGrpcServer, miningGrpcServer, txpoolApiAddr, nil, logger)
+	miningGrpcServer := privateapi.NewMiningServer(ctx, privateapi.NoMining{}, nil, logger)
+	grpcServer, err := txpool.StartGrpc(ctx, txpoolGrpcServer, miningGrpcServer, txpoolApiAddr, nil, logger)
 	if err != nil {
 		return err
 	}
@@ -217,11 +216,14 @@ func doTxpool(ctx context.Context, logger log.Logger) error {
 }
 
 func main() {
-	ctx, cancel := common.RootContext()
-	defer cancel()
-
-	if err := rootCmd.ExecuteContext(ctx); err != nil {
+	if err := run(); err != nil {
 		fmt.Println(err)
 		os.Exit(1)
 	}
+}
+
+func run() error {
+	ctx, cancel := common.RootContext()
+	defer cancel()
+	return rootCmd.ExecuteContext(ctx)
 }

@@ -32,6 +32,21 @@ const (
 	ProtocolWS   SubProtocol = "ws"
 )
 
+// Shared is one event handed to every subscriber. The first to encode it caches the bytes,
+// so the encoding runs once however many subscribers there are.
+type Shared[T any] struct {
+	Value T
+	once  sync.Once
+	enc   []byte
+	err   error
+}
+
+// Encode returns the bytes encode produced on the first call; callers must not modify them.
+func (s *Shared[T]) Encode(encode func(T) ([]byte, error)) ([]byte, error) {
+	s.once.Do(func() { s.enc, s.err = encode(s.Value) })
+	return s.enc, s.err
+}
+
 // a simple interface for subscriptions for rpc helper
 type Sub[T any] interface {
 	Send(T)
@@ -71,6 +86,7 @@ func newChanSub[T any](size int, protocol SubProtocol) *chan_sub[T] {
 	}
 	return s
 }
+
 func (s *chan_sub[T]) Send(x T) {
 	s.lock.Lock()
 	defer s.lock.Unlock()
@@ -80,6 +96,33 @@ func (s *chan_sub[T]) Send(x T) {
 	select {
 	case s.ch <- x:
 	default: // the sub is overloaded, dispose message
+	}
+}
+
+// SendLatest delivers with latest-value semantics: when the subscriber is
+// overloaded the oldest buffered message is dropped to make room, so the most
+// recent value always survives. For subscriptions where only the current
+// state matters, not the history.
+func (s *chan_sub[T]) SendLatest(x T) {
+	s.lock.Lock()
+	defer s.lock.Unlock()
+	if s.closed {
+		return
+	}
+	for {
+		select {
+		case s.ch <- x:
+			return
+		default:
+		}
+		if cap(s.ch) == 0 {
+			// nothing to evict: deliver only if a reader was ready
+			return
+		}
+		select {
+		case <-s.ch:
+		default:
+		}
 	}
 }
 
