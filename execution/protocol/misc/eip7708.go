@@ -31,10 +31,8 @@ import (
 	"github.com/erigontech/erigon/execution/vm/evmtypes"
 )
 
-var (
-	// keccak256('Transfer(address,address,uint256)')
-	EthTransferLogEvent = common.HexToHash("0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef")
-)
+// keccak256('Transfer(address,address,uint256)')
+var EthTransferLogEvent = common.HexToHash("0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef")
 
 // EthTransferLog creates and ETH transfer log according to EIP-7708.
 // Specification: https://eips.ethereum.org/EIPS/eip-7708
@@ -63,7 +61,7 @@ func Transfer(db evmtypes.IntraBlockState, sender, recipient accounts.Address, a
 	if err != nil {
 		return err
 	}
-	if rules.IsAmsterdam && !rules.IsEIPDisabled(7708) && !amount.IsZero() && sender != recipient { // EIP-7708
+	if rules.IsEIPEnabled(7708) && !amount.IsZero() && sender != recipient { // EIP-7708
 		db.AddLog(EthTransferLog(sender.Value(), recipient.Value(), amount))
 	}
 	return nil

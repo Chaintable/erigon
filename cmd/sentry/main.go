@@ -51,7 +51,6 @@ var (
 	maxPendPeers int
 	healthCheck  bool
 	metrics      bool
-	witProtocol  bool // Enable/disable WIT protocol
 )
 
 func init() {
@@ -71,8 +70,6 @@ func init() {
 	rootCmd.Flags().IntVar(&maxPendPeers, utils.MaxPendingPeersFlag.Name, utils.MaxPendingPeersFlag.Value, utils.MaxPendingPeersFlag.Usage)
 	rootCmd.Flags().BoolVar(&healthCheck, utils.HealthCheckFlag.Name, false, utils.HealthCheckFlag.Usage)
 	rootCmd.Flags().BoolVar(&metrics, utils.MetricsEnabledFlag.Name, false, utils.MetricsEnabledFlag.Usage)
-	rootCmd.Flags().BoolVar(&witProtocol, utils.PolygonPosWitProtocolFlag.Name, false, utils.PolygonPosWitProtocolFlag.Usage)
-
 	if err := rootCmd.MarkFlagDirname(utils.DataDirFlag.Name); err != nil {
 		panic(err)
 	}
@@ -104,7 +101,6 @@ var rootCmd = &cobra.Command{
 			uint(port),
 			protocol,
 			metrics,
-			witProtocol,
 		)
 		if err != nil {
 			return err
@@ -116,10 +112,14 @@ var rootCmd = &cobra.Command{
 }
 
 func main() {
-	ctx, cancel := common.RootContext()
-	defer cancel()
-	if err := rootCmd.ExecuteContext(ctx); err != nil {
+	if err := run(); err != nil {
 		fmt.Println(err)
 		os.Exit(1)
 	}
+}
+
+func run() error {
+	ctx, cancel := common.RootContext()
+	defer cancel()
+	return rootCmd.ExecuteContext(ctx)
 }

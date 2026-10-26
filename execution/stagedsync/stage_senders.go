@@ -36,14 +36,12 @@ import (
 	"github.com/erigontech/erigon/db/etl"
 	"github.com/erigontech/erigon/db/kv"
 	"github.com/erigontech/erigon/db/kv/dbutils"
-	"github.com/erigontech/erigon/db/kv/prune"
 	"github.com/erigontech/erigon/execution/chain"
 	"github.com/erigontech/erigon/execution/exec"
 	"github.com/erigontech/erigon/execution/protocol/rules"
 	"github.com/erigontech/erigon/execution/stagedsync/stages"
 	"github.com/erigontech/erigon/execution/types"
 	"github.com/erigontech/erigon/execution/types/accounts"
-	"github.com/erigontech/erigon/node/ethconfig"
 )
 
 type SendersCfg struct {
@@ -56,7 +54,7 @@ type SendersCfg struct {
 	readAheader     *exec.BlockReadAheader
 }
 
-func StageSendersCfg(chainCfg *chain.Config, syncCfg ethconfig.Sync, badBlockHalt bool, tmpdir string, prune prune.Mode, blockReader dbservices.FullBlockReader, readAheader *exec.BlockReadAheader) SendersCfg {
+func StageSendersCfg(chainCfg *chain.Config, badBlockHalt bool, tmpdir string, blockReader dbservices.FullBlockReader, readAheader *exec.BlockReadAheader) SendersCfg {
 	const sendersBatchSize = 1000
 	return SendersCfg{
 		batchSize:       sendersBatchSize,
@@ -81,7 +79,7 @@ func SpawnRecoverSendersStage(cfg SendersCfg, s *StageState, u Unwinder, tx kv.R
 		return errStart
 	}
 
-	var to = prevStageProgress
+	to := prevStageProgress
 	if toBlock > 0 {
 		to = min(prevStageProgress, toBlock)
 	}
@@ -329,7 +327,7 @@ Loop:
 		}); err != nil {
 			return err
 		}
-		if err = s.Update(tx, to); err != nil {
+		if err := s.Update(tx, to); err != nil {
 			return err
 		}
 		log.Debug(fmt.Sprintf("[%s] Recovery done", logPrefix), "from", startFrom, "to", to, "blocks", to-startFrom+1, "took", time.Since(recoveryStart))
@@ -375,7 +373,7 @@ func recoverSenders(ctx context.Context, cryptoContext *secp256k1.Context, confi
 		signer := types.MakeSigner(config, job.blockNumber, job.blockTime)
 		from, err := signer.SenderWithContext(cryptoContext, job.txn)
 		if err != nil {
-			job.err = fmt.Errorf("%w: error recovering sender for tx=%x, %v",
+			job.err = fmt.Errorf("%w: error recovering sender for tx=%x, %w",
 				rules.ErrInvalidBlock, job.txn.Hash(), err)
 		} else {
 			job.from = from
@@ -398,7 +396,7 @@ func recoverSenders(ctx context.Context, cryptoContext *secp256k1.Context, confi
 
 func UnwindSendersStage(u *UnwindState, tx kv.RwTx, cfg SendersCfg, ctx context.Context) (err error) {
 	u.UnwindPoint = max(u.UnwindPoint, cfg.blockReader.FrozenBlocks()) // protect from unwind behind files
-	if err = u.Done(tx); err != nil {
+	if err := u.Done(tx); err != nil {
 		return err
 	}
 	return nil

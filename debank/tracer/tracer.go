@@ -9,11 +9,11 @@ import (
 
 	"github.com/erigontech/erigon/common"
 	"github.com/erigontech/erigon/common/crypto"
+	"github.com/erigontech/erigon/common/empty"
 	"github.com/erigontech/erigon/common/hexutil"
 	dtypes "github.com/erigontech/erigon/debank/types"
 	"github.com/erigontech/erigon/debank/util"
 	"github.com/erigontech/erigon/execution/abi"
-	"github.com/erigontech/erigon/execution/commitment/trie"
 	"github.com/erigontech/erigon/execution/tracing"
 	"github.com/erigontech/erigon/execution/types"
 	"github.com/erigontech/erigon/execution/types/accounts"
@@ -452,7 +452,7 @@ func OnGenesisBlock(block *types.Block, alloc types.GenesisAlloc) (*dtypes.Deban
 	header := BuildPilelineBlockHeader(block)
 	blockDiff := GenesisAllocToStateDiff(alloc)
 	blockDiff.Hash = block.Root()
-	blockDiff.ParentHash = trie.EmptyRoot
+	blockDiff.ParentHash = empty.RootHash
 
 	blockFile := &dtypes.BlockFile{
 		Block:            BuildPipelineBlock(block),

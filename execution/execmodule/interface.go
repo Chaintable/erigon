@@ -74,6 +74,7 @@ type ForkChoiceResult struct {
 	Status          ExecutionStatus
 	LatestValidHash common.Hash
 	ValidationError string
+	MissingHash     common.Hash
 }
 
 // ForkChoiceState is the native return type for GetForkChoice.
@@ -128,7 +129,7 @@ type ExecutionModule interface {
 	// InsertBlocks stores one or more blocks in the execution layer.
 	// Returns ExecutionStatusSuccess on success or a non-success status on
 	// rejection (e.g. ExecutionStatusTooFarAway).
-	InsertBlocks(ctx context.Context, blocks []*types.RawBlock) (ExecutionStatus, error)
+	InsertBlocks(ctx context.Context, blocks []*types.Block) (ExecutionStatus, error)
 
 	// --- Chain validation -------------------------------------------------
 
@@ -219,4 +220,7 @@ type ExecutionModule interface {
 	// and whether there is a gap between the snapshot tip and the live
 	// database.
 	FrozenBlocks(ctx context.Context) (frozenBlocks uint64, hasGap bool, err error)
+
+	// InclusionList builds an inclusion list for EIP-7805 from its view of the mempool.
+	InclusionList(ctx context.Context) (types.Transactions, error)
 }

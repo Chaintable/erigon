@@ -99,12 +99,6 @@ func (f *SnapshotRepo) IntegrateDirtyFiles(files []*FilesItem) {
 	}
 }
 
-func (f *SnapshotRepo) IntegrateMergedFiles(dfs []*FilesItem, mergedFile *FilesItem) {
-	if mergedFile != nil {
-		f.dirtyFiles.Set(mergedFile)
-	}
-}
-
 // DeleteFilesAfterMerge files are removed from repo and marked for deletion
 // from file system.
 func (f *SnapshotRepo) DeleteFilesAfterMerge(files []*FilesItem) {
@@ -123,10 +117,8 @@ func (f *SnapshotRepo) DeleteFilesAfterMerge(files []*FilesItem) {
 			if f.schema.DataTag() == traceFileLife && file.decompressor != nil {
 				f.logger.Warn("[agg.dbg] DeleteFilesAfterMerge: remove", "f", file.decompressor.FileName())
 			}
-		} else {
-			if f.schema.DataTag() == traceFileLife && file.decompressor != nil {
-				f.logger.Warn("[agg.dbg] DeleteFilesAfterMerge: mark as canDelete=true", "f", file.decompressor.FileName())
-			}
+		} else if f.schema.DataTag() == traceFileLife && file.decompressor != nil {
+			f.logger.Warn("[agg.dbg] DeleteFilesAfterMerge: mark as canDelete=true", "f", file.decompressor.FileName())
 		}
 	}
 }
@@ -315,27 +307,24 @@ func (f *SnapshotRepo) CleanAfterMerge(merged *FilesItem, vf visibleFiles) {
 func (f *SnapshotRepo) FilesWithMissedAccessors() *MissedFilesMap {
 	mf := make(map[statecfg.Accessors][]*FilesItem)
 	if f.accessors.Has(statecfg.AccessorBTree) {
-		mf[statecfg.AccessorBTree] =
-			fileItemsWithMissedAccessors(f.dirtyFiles.Items(), f.stepSize, func(fromStep, toStep kv.Step) []string {
-				file, _ := f.schema.BtIdxFile(version.V1_0, RootNum(fromStep*kv.Step(f.stepSize)), RootNum(toStep*kv.Step(f.stepSize)))
-				return []string{file}
-			})
+		mf[statecfg.AccessorBTree] = fileItemsWithMissedAccessors(f.dirtyFiles.Items(), f.stepSize, func(fromStep, toStep kv.Step) []string {
+			file, _ := f.schema.BtIdxFile(version.V1_0, RootNum(fromStep*kv.Step(f.stepSize)), RootNum(toStep*kv.Step(f.stepSize)))
+			return []string{file}
+		})
 	}
 
 	if f.accessors.Has(statecfg.AccessorHashMap) {
-		mf[statecfg.AccessorHashMap] =
-			fileItemsWithMissedAccessors(f.dirtyFiles.Items(), f.stepSize, func(fromStep, toStep kv.Step) []string {
-				file, _ := f.schema.AccessorIdxFile(version.V1_0, RootNum(fromStep*kv.Step(f.stepSize)), RootNum(toStep*kv.Step(f.stepSize)), 0)
-				return []string{file}
-			})
+		mf[statecfg.AccessorHashMap] = fileItemsWithMissedAccessors(f.dirtyFiles.Items(), f.stepSize, func(fromStep, toStep kv.Step) []string {
+			file, _ := f.schema.AccessorIdxFile(version.V1_0, RootNum(fromStep*kv.Step(f.stepSize)), RootNum(toStep*kv.Step(f.stepSize)), 0)
+			return []string{file}
+		})
 	}
 
 	if f.accessors.Has(statecfg.AccessorExistence) {
-		mf[statecfg.AccessorExistence] =
-			fileItemsWithMissedAccessors(f.dirtyFiles.Items(), f.stepSize, func(fromStep, toStep kv.Step) []string {
-				file, _ := f.schema.ExistenceFile(version.V1_0, RootNum(fromStep*kv.Step(f.stepSize)), RootNum(toStep*kv.Step(f.stepSize)))
-				return []string{file}
-			})
+		mf[statecfg.AccessorExistence] = fileItemsWithMissedAccessors(f.dirtyFiles.Items(), f.stepSize, func(fromStep, toStep kv.Step) []string {
+			file, _ := f.schema.ExistenceFile(version.V1_0, RootNum(fromStep*kv.Step(f.stepSize)), RootNum(toStep*kv.Step(f.stepSize)))
+			return []string{file}
+		})
 	}
 
 	return (*MissedFilesMap)(&mf)
@@ -392,7 +381,7 @@ func (f *SnapshotRepo) openDirtyFiles(dirEntries []string) error {
 				f.logger.Error("SnapshotRepo.openDirtyFiles btindex path", "err", err, "f", fPath)
 			} else {
 				r := seg.NewReader(item.decompressor.MakeGetter(), p.DataFileCompression())
-				if item.bindex, err = btindex.OpenBtreeIndexWithDecompressor(fPath, btindex.DefaultBtreeM, r); err != nil {
+				if item.bindex, err = btindex.OpenBtreeIndexWithDecompressor(fPath, r); err != nil {
 					_, fName := filepath.Split(fPath)
 					f.logger.Error("SnapshotRepo.openDirtyFiles", "err", err, "f", fName)
 					// don't interrupt on error. other files maybe good

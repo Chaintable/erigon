@@ -2,9 +2,7 @@ package stages
 
 import (
 	"context"
-	"math"
 
-	"github.com/erigontech/erigon/cl/clparams"
 	"github.com/erigontech/erigon/cl/persistence/beacon_indicies"
 	"github.com/erigontech/erigon/common/log/v3"
 )
@@ -19,7 +17,7 @@ func cleanupAndPruning(ctx context.Context, logger log.Logger, cfg *Cfg, args Ar
 	const blockPruneDistance = uint64(1_000_000)
 
 	if !cfg.caplinConfig.ArchiveBlocks && args.seenSlot > blockPruneDistance {
-		if err := beacon_indicies.PruneBlocks(ctx, tx, args.seenSlot-blockPruneDistance); err != nil {
+		if err := beacon_indicies.PruneBlocks(tx, args.seenSlot-blockPruneDistance); err != nil {
 			return err
 		}
 	}
@@ -27,33 +25,30 @@ func cleanupAndPruning(ctx context.Context, logger log.Logger, cfg *Cfg, args Ar
 	if err := tx.Commit(); err != nil {
 		return err
 	}
-	cfg.blobStore.Prune()
-	columnKeepSlots := cfg.caplinConfig.ColumnKeepSlots
-	if columnKeepSlots == 0 {
-		columnKeepSlots = specColumnKeepSlots(cfg.beaconCfg)
+
+	// Sidecar retention cuts against wall-clock, not the stage head, so a stalled
+	// stage does not retain data forever.
+	currentSlot := cfg.ethClock.GetCurrentSlot()
+	blobFloor := cfg.beaconCfg.BlobSidecarServeRangeStartSlot(currentSlot)
+	if cfg.caplinConfig.ArchiveBlobs || cfg.caplinConfig.BlobPruningDisabled {
+		blobFloor = 0
 	}
-	cfg.peerDas.Prune(columnKeepSlots)
+	if err := cfg.blobStore.PruneBelow(blobFloor); err != nil {
+		logger.Warn("failed to prune blob sidecars", "err", err)
+	}
+	columnFloor := cfg.beaconCfg.DataColumnSidecarServeRangeStartSlot(currentSlot)
+	if keep := cfg.caplinConfig.ColumnKeepSlots; keep > 0 {
+		columnFloor = floorFor(currentSlot, keep)
+	}
+	if err := cfg.peerDas.PruneBelow(columnFloor); err != nil {
+		logger.Warn("failed to prune data column sidecars", "err", err)
+	}
 	return nil
 }
 
-// specColumnKeepSlots is the retention distance for MIN_EPOCHS_FOR_DATA_COLUMN_SIDECARS_REQUESTS.
-// The window is stated in epochs and measured from the start of current_epoch - MIN_EPOCHS, so an
-// exact epochs * SLOTS_PER_EPOCH distance cuts above that boundary whenever the head sits inside
-// an epoch. The extra epoch keeps the cut at or below it, which matters because this distance also
-// sets the earliest slot we advertise as servable.
-//
-// A custom chain config supplies both inputs unchecked, and zero here means "keep nothing", so
-// anything unrepresentable saturates to keeping everything rather than wrapping into a distance
-// that prunes the whole store.
-func specColumnKeepSlots(beaconCfg *clparams.BeaconChainConfig) uint64 {
-	epochs := beaconCfg.MinEpochsForDataColumnSidecarsRequests
-	slotsPerEpoch := beaconCfg.SlotsPerEpoch
-	if slotsPerEpoch == 0 || epochs == math.MaxUint64 {
-		return math.MaxUint64
+func floorFor(head, keep uint64) uint64 {
+	if head <= keep {
+		return 0
 	}
-	epochs++
-	if epochs > math.MaxUint64/slotsPerEpoch {
-		return math.MaxUint64
-	}
-	return epochs * slotsPerEpoch
+	return head - keep
 }

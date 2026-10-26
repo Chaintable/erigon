@@ -50,7 +50,6 @@ var emptyBlock = cltypes.NewSignedBeaconBlock(&clparams.MainnetBeaconConfig, clp
 
 // obtain the test blocks
 func getTestBlocks(t *testing.T) []*cltypes.SignedBeaconBlock {
-
 	emptyBlock.EncodingSizeSSZ()
 
 	denebBlock := cltypes.NewSignedBeaconBlock(&clparams.MainnetBeaconConfig, clparams.DenebVersion)
@@ -176,5 +175,5 @@ func (p *panicOnCallBlockReader) Withdrawals(number uint64, hash common.Hash) (*
 
 func (p *panicOnCallBlockReader) SetBeaconChainConfig(*clparams.BeaconChainConfig) {}
 
-func (p *panicOnCallBlockReader) CacheBody(blockNumber uint64, transactions [][]byte, withdrawals []*types.Withdrawal) {
+func (p *panicOnCallBlockReader) CacheBody(blockNumber uint64, blockHash common.Hash, transactions [][]byte, withdrawals []*types.Withdrawal) {
 }

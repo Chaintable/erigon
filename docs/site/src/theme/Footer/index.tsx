@@ -25,12 +25,6 @@ const IconLinkedIn = () => (
   </svg>
 );
 
-/* Brand stack per DESIGN-SPEC.md §7: Nunito Sans for body/UI text,
-   Quantify 700 for the wordmark only. Colours live in custom.css as --footer-*
-   vars so the surface can invert between light and dark mode.
-   Interactive states (hover, focus-visible, the accent tint) are CSS classes —
-   .footer-brand / .footer-social / .footer-legal — not handlers here. See
-   "Footer interactive states" in custom.css for why. */
 const BODY = 'var(--ifm-font-family-base)';
 const SURFACE = 'var(--footer-bg)';
 const FOREGROUND = 'var(--footer-fg)';
@@ -63,7 +57,6 @@ export default function Footer(): React.ReactElement {
       borderTop: `1px solid ${TOP_EDGE}`,
       fontFamily: BODY,
     }}>
-      {/* Top section — single horizontal row */}
       <div className="footer-top-grid" style={{
         maxWidth: '1280px',
         margin: '0 auto',
@@ -74,19 +67,11 @@ export default function Footer(): React.ReactElement {
         gap: '1.25rem',
         flexWrap: 'wrap',
       }}>
-
-        {/* Brand lockup — one anchor around logo + wordmark, so it is a single
-            hit target. The aria-label opens with the visible wordmark text:
-            an aria-label replaces the whole accessible name, so a label that
-            omitted "erigon.tech" would leave the name not containing the
-            visible one, failing WCAG 2.5.3 Label in Name (A). */}
         <a href="https://erigon.tech" target="_blank" rel="noopener noreferrer"
           aria-label="erigon.tech home page" className="footer-brand">
           <img src={logoUrl} alt="Erigon" style={{height: '32px', width: 'auto'}} />
           <span style={{fontFamily: "'Quantify', sans-serif", fontWeight: 700, fontSize: '1rem', letterSpacing: '0.04em'}}>erigon.tech</span>
         </a>
-
-        {/* Tagline */}
         <p style={{
           fontSize: '0.875rem',
           color: TAGLINE,
@@ -96,8 +81,6 @@ export default function Footer(): React.ReactElement {
         }}>
           Building the future on the efficient software frontier.
         </p>
-
-        {/* Social icons — right aligned */}
         <div className="footer-socials">
           {SOCIALS.map(({label, href, Icon}) => (
             <a key={label} href={href} target="_blank" rel="noopener noreferrer" aria-label={label} title={label}
@@ -107,11 +90,8 @@ export default function Footer(): React.ReactElement {
           ))}
         </div>
       </div>
-
-      {/* Divider */}
       <div style={{borderTop: `1px solid ${DIVIDER}`, margin: '0.25rem 2rem'}} />
 
-      {/* Bottom bar */}
       <div className="footer-bottom-bar" style={{
         maxWidth: '1280px',
         margin: '0 auto',

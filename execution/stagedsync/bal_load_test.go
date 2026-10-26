@@ -18,7 +18,6 @@ package stagedsync
 
 import (
 	"bytes"
-	"math"
 	"testing"
 
 	"github.com/holiman/uint256"
@@ -31,67 +30,6 @@ import (
 	"github.com/erigontech/erigon/execution/types"
 	"github.com/erigontech/erigon/execution/types/accounts"
 )
-
-// finalChange returns the last (block-end) change; BAL change lists reach it
-// already validated strictly-increasing by tx Index.
-func TestFinalChange(t *testing.T) {
-	t.Parallel()
-
-	if _, ok := finalChangeUpTo([]*types.BalanceChange(nil), math.MaxUint32); ok {
-		t.Fatal("finalChangeUpTo on an empty list returned ok=true")
-	}
-
-	single, ok := finalChangeUpTo([]*types.BalanceChange{
-		{Index: 7, Value: *uint256.NewInt(70)},
-	}, math.MaxUint32)
-	require.True(t, ok)
-	assert.Equal(t, uint64(70), single.Value.Uint64())
-
-	ascending, ok := finalChangeUpTo([]*types.BalanceChange{
-		{Index: 0, Value: *uint256.NewInt(10)},
-		{Index: 2, Value: *uint256.NewInt(20)},
-		{Index: 9, Value: *uint256.NewInt(90)},
-	}, math.MaxUint32)
-	require.True(t, ok)
-	assert.Equal(t, uint64(90), ascending.Value.Uint64())
-}
-
-// finalChangeUpTo returns the field's value as of a mid-block tx index — the
-// primitive that lets the fold checkpoint at a step boundary from the per-tx BAL.
-func TestFinalChangeUpTo(t *testing.T) {
-	t.Parallel()
-
-	changes := []*types.BalanceChange{
-		{Index: 0, Value: *uint256.NewInt(10)},
-		{Index: 2, Value: *uint256.NewInt(20)},
-		{Index: 9, Value: *uint256.NewInt(90)},
-	}
-
-	if _, ok := finalChangeUpTo([]*types.BalanceChange{{Index: 5, Value: *uint256.NewInt(1)}}, 4); ok {
-		t.Fatal("ceiling below the only change must return ok=false")
-	}
-
-	// Exactly at, and between, change indices → latest change ≤ ceiling.
-	at2, ok := finalChangeUpTo(changes, 2)
-	require.True(t, ok)
-	assert.Equal(t, uint64(20), at2.Value.Uint64(), "ceiling==Index returns that change")
-
-	between, ok := finalChangeUpTo(changes, 5)
-	require.True(t, ok)
-	assert.Equal(t, uint64(20), between.Value.Uint64(), "ceiling between changes returns the earlier one")
-
-	// At/above the last index → whole-block value (== finalChange).
-	whole, ok := finalChangeUpTo(changes, 9)
-	require.True(t, ok)
-	assert.Equal(t, uint64(90), whole.Value.Uint64())
-	all, ok := finalChangeUpTo(changes, ^uint32(0))
-	require.True(t, ok)
-	assert.Equal(t, uint64(90), all.Value.Uint64(), "MaxUint32 ceiling == finalChange")
-
-	if _, ok := finalChangeUpTo([]*types.BalanceChange(nil), 100); ok {
-		t.Fatal("finalChangeUpTo on an empty list returned ok=true")
-	}
-}
 
 // TestLoadFromBAL_MatchesApplyWrites is a differential test:
 // loading calcState from a BAL must produce exactly the same accumulated
@@ -115,7 +53,7 @@ func TestLoadFromBAL_MatchesApplyWrites(t *testing.T) {
 
 	bal := types.BlockAccessList{
 		{
-			Address: addrA,
+			Address: addrA.Value(),
 			BalanceChanges: []*types.BalanceChange{
 				{Index: 0, Value: *uint256.NewInt(10)},
 				{Index: 3, Value: *uint256.NewInt(99)}, // final
@@ -125,8 +63,8 @@ func TestLoadFromBAL_MatchesApplyWrites(t *testing.T) {
 			},
 		},
 		{
-			Address: addrB,
-			StorageChanges: []*types.SlotChanges{
+			Address: addrB.Value(),
+			StorageChanges: []types.SlotChanges{
 				{Slot: slotS1, Changes: []*types.StorageChange{
 					{Index: 0, Value: *uint256.NewInt(1)},
 					{Index: 2, Value: *uint256.NewInt(77)}, // final
@@ -137,7 +75,7 @@ func TestLoadFromBAL_MatchesApplyWrites(t *testing.T) {
 			},
 		},
 		{
-			Address: addrC,
+			Address: addrC.Value(),
 			BalanceChanges: []*types.BalanceChange{
 				{Index: 0, Value: *uint256.NewInt(1000)},
 			},
@@ -146,11 +84,11 @@ func TestLoadFromBAL_MatchesApplyWrites(t *testing.T) {
 			},
 		},
 		{
-			Address:      addrD,
+			Address:      addrD.Value(),
 			StorageReads: []accounts.StorageKey{slotS1}, // pure read — ignored
 		},
 		{
-			Address: addrE,
+			Address: addrE.Value(),
 			BalanceChanges: []*types.BalanceChange{
 				{Index: 2, Value: *uint256.NewInt(200)},
 				{Index: 5, Value: *uint256.NewInt(500)}, // final
@@ -203,8 +141,8 @@ func TestLoadFromBAL_EmptyAccountBecomesDelete(t *testing.T) {
 	emptied := accounts.InternAddress([20]byte{0xab})
 	live := accounts.InternAddress([20]byte{0xcd})
 	bal := types.BlockAccessList{
-		{Address: emptied, BalanceChanges: []*types.BalanceChange{{Index: 0, Value: *uint256.NewInt(0)}}},
-		{Address: live, BalanceChanges: []*types.BalanceChange{{Index: 0, Value: *uint256.NewInt(100)}}},
+		{Address: emptied.Value(), BalanceChanges: []*types.BalanceChange{{Index: 0, Value: *uint256.NewInt(0)}}},
+		{Address: live.Value(), BalanceChanges: []*types.BalanceChange{{Index: 0, Value: *uint256.NewInt(100)}}},
 	}
 
 	cs := newTestCalcState()
@@ -228,7 +166,7 @@ func TestLoadFromBAL_EmptyAccountBecomesDelete(t *testing.T) {
 	// (pre-fork a touched empty account is created and persists).
 	csPre := newTestCalcState()
 	csPre.LoadFromBAL(types.BlockAccessList{
-		{Address: emptied, BalanceChanges: []*types.BalanceChange{{Index: 0, Value: *uint256.NewInt(0)}}},
+		{Address: emptied.Value(), BalanceChanges: []*types.BalanceChange{{Index: 0, Value: *uint256.NewInt(0)}}},
 	}, false, false, false)
 	require.False(t, csPre.accounts[emptied].Deleted,
 		"pre-SpuriousDragon, an empty touched account is not removed")
@@ -248,7 +186,7 @@ func TestLoadFromBAL_SelfDestructKeepsCodeNotDeleted(t *testing.T) {
 	code := []byte{0x60, 0x00, 0x60, 0x00, 0xf3}
 	bal := types.BlockAccessList{
 		{
-			Address:        contract,
+			Address:        contract.Value(),
 			BalanceChanges: []*types.BalanceChange{{Index: 0, Value: *uint256.NewInt(0)}},
 			CodeChanges:    []*types.CodeChange{{Index: 0, Bytecode: code}},
 		},
@@ -278,7 +216,7 @@ func TestLoadFromBAL_CreatedThenDestroyedHasNoLeaf(t *testing.T) {
 	live := accounts.InternAddress([20]byte{0xcd})
 	// The transient (created-then-destroyed) account is absent from the BAL.
 	bal := types.BlockAccessList{
-		{Address: live, BalanceChanges: []*types.BalanceChange{{Index: 0, Value: *uint256.NewInt(100)}}},
+		{Address: live.Value(), BalanceChanges: []*types.BalanceChange{{Index: 0, Value: *uint256.NewInt(100)}}},
 	}
 
 	cs := newTestCalcState()

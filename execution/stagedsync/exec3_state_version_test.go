@@ -17,8 +17,6 @@
 package stagedsync
 
 import (
-	"os"
-	"os/exec"
 	"testing"
 
 	"github.com/holiman/uint256"
@@ -33,20 +31,8 @@ import (
 )
 
 func TestComputeAndCheckCommitmentDoesNotAdvanceStateVersionInOverlay(t *testing.T) {
-	const childProcess = "ERIGON_TEST_STATE_VERSION_CHILD"
-	if os.Getenv(childProcess) == "" {
-		// DiscardCommitment is initialized before tests run, so use a child
-		// process to exercise that early-return path.
-		t.Setenv("DISCARD_COMMITMENT", "true")
-		cmd := exec.Command(os.Args[0], "-test.run=^TestComputeAndCheckCommitmentDoesNotAdvanceStateVersionInOverlay$")
-		cmd.Env = append(os.Environ(), childProcess+"=1")
-		output, err := cmd.CombinedOutput()
-		require.NoError(t, err, "%s", output)
-		return
-	}
-
 	_, tx := temporaltest.NewTestTx(t)
-	overlay, err := membatchwithdb.NewMemoryBatch(tx, t.TempDir(), log.New())
+	overlay, err := membatchwithdb.NewMemoryBatch(tx)
 	require.NoError(t, err)
 	defer overlay.Close()
 
@@ -59,7 +45,7 @@ func TestComputeAndCheckCommitmentDoesNotAdvanceStateVersionInOverlay(t *testing
 		&types.Header{Number: *uint256.NewInt(1)},
 		overlay,
 		nil,
-		ExecuteBlockCfg{},
+		ExecuteBlockCfg{discardCommitment: true},
 		stage,
 		false,
 		log.New(),

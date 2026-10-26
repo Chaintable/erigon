@@ -17,6 +17,8 @@
 package cache
 
 import (
+	"bytes"
+
 	"github.com/erigontech/erigon/db/kv"
 )
 
@@ -102,7 +104,9 @@ type ReadView struct {
 // View creates a ReadView vouched for by f. If the cache has a durable state
 // version, f must report the same version when it is bound. A stale or
 // versionless frontier is not retried automatically. A nil frontier,
-// publication in progress, or a cache behind f may be retried later.
+// publication in progress, or a cache behind f may be retried later. A cache
+// without a version counts as behind any versioned f: it missed the commits
+// before its first initialization.
 func (c *StateCache) View(f Frontier) ReadView {
 	if c == nil {
 		return ReadView{}
@@ -140,10 +144,13 @@ func (c *StateCache) bindFrontierLocked(frontier Frontier) Frontier {
 	if frontier == nil || c.publishing {
 		return nil
 	}
+	versioned, ok := frontier.(stateVersionFrontier)
 	if !c.stateVersionKnown {
+		if ok {
+			return nil
+		}
 		return frontier
 	}
-	versioned, ok := frontier.(stateVersionFrontier)
 	if !ok {
 		return rejectedFrontier{}
 	}
@@ -176,6 +183,26 @@ func (v ReadView) GetWithTxNum(domain kv.Domain, key []byte) ([]byte, uint64, bo
 	return v.c.getWithTxNum(domain, key)
 }
 
+// GetVisible is GetWithTxNum limited to the bound view's own state: a value
+// written at or above its frontier, or any value once an unwind revoked the
+// view, is a miss.
+func (v ReadView) GetVisible(domain kv.Domain, key []byte) ([]byte, uint64, bool) {
+	if v.c == nil || v.frontier == nil {
+		return nil, 0, false
+	}
+	end, ok := v.frontier.DomainVisibleEnd(domain)
+	if !ok {
+		return nil, 0, false
+	}
+	val, txNum, hit := v.c.getWithTxNum(domain, key)
+	// The epoch is loaded after the entry: an unwind bumps it before it installs
+	// the replacement fork's entries.
+	if !hit || txNum >= end || v.readViewEpoch != v.c.readViewEpoch.Load() {
+		return nil, 0, false
+	}
+	return val, txNum, true
+}
+
 // GetCodeByHash retrieves code bytes by their Ethereum codeHash (keccak256),
 // bypassing the addr-keyed CodeDomain lookup. Returns (nil, false) on miss.
 func (v ReadView) GetCodeByHash(codeHash []byte) ([]byte, bool) {
@@ -200,6 +227,41 @@ func (v ReadView) GetAddrCodeHash(addr []byte) ([32]byte, bool) {
 		return [32]byte{}, false
 	}
 	return v.c.getAddrCodeHash(addr)
+}
+
+// GetCodeByAddressHash resolves the durable addr→codeHash mapping and then
+// probes the content-addressed code cache. On a hit it also fills the
+// addr-keyed code binding with the mapping's original txNum, avoiding both a
+// database read and a redundant keccak of the cached code.
+func (v ReadView) GetCodeByAddressHash(addr []byte) ([]byte, bool) {
+	if v.c == nil {
+		return nil, false
+	}
+	codeHash, readTxNum, ok := v.c.getAddrCodeHashWithTxNum(addr)
+	if !ok || codeHash == ([32]byte{}) {
+		return nil, false
+	}
+	code, ok := v.c.getCodeByHash(codeHash[:])
+	if !ok {
+		return nil, false
+	}
+	v.fillCodeWithHash(addr, code, codeHash[:], readTxNum)
+	return code, true
+}
+
+func (v ReadView) fillCodeWithHash(addr, code, codeHash []byte, readTxNum uint64) {
+	if v.c == nil || v.c.disableFills || v.frontier == nil {
+		return
+	}
+	visibleEnd, ok := v.frontier.DomainVisibleEnd(kv.CodeDomain)
+	if !ok {
+		return
+	}
+	accountsEnd, ok := v.frontier.DomainVisibleEnd(kv.AccountsDomain)
+	if !ok {
+		return
+	}
+	v.c.fillCodeWithHashIfFresh(addr, code, codeHash, readTxNum, visibleEnd, accountsEnd, v.readViewEpoch)
 }
 
 // CanFill reports whether this view carries an accepted frontier, i.e. Fill and
@@ -240,6 +302,13 @@ func (v ReadView) Fill(domain kv.Domain, key []byte, value []byte, readTxNum uin
 	v.c.fillIfFresh(domain, key, value, readTxNum, visibleEnd, v.readViewEpoch)
 }
 
+// FillCode offers code to the cache and returns a copy the caller may keep.
+func (v ReadView) FillCode(addr, code, codeHash []byte, readTxNum uint64) []byte {
+	stored := bytes.Clone(code)
+	v.fillCodeWithHash(addr, stored, codeHash, readTxNum)
+	return stored
+}
+
 // SeedAddrCodeHash offers an addr → codeHash mapping derived from an account
 // record read from this view, so admission checks the accounts frontier even
 // though the mapping lives in the code cache.
@@ -250,6 +319,14 @@ func (v ReadView) SeedAddrCodeHash(addr []byte, h [32]byte, txNum uint64) {
 	visibleEnd, ok := v.frontier.DomainVisibleEnd(kv.AccountsDomain)
 	if !ok {
 		return
+	}
+	// A negative mapping describes committed state observed by this view, not
+	// the executing transaction that requested the lookup.
+	if h == ([32]byte{}) {
+		txNum = 0
+		if visibleEnd > 0 {
+			txNum = visibleEnd - 1
+		}
 	}
 	v.c.seedAddrCodeHash(addr, h, txNum, visibleEnd, v.readViewEpoch)
 }

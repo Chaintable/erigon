@@ -25,9 +25,7 @@ import (
 	"github.com/erigontech/erigon/common/length"
 )
 
-var (
-	bytes64T = reflect.TypeFor[Bytes64]()
-)
+var bytes64T = reflect.TypeFor[Bytes64]()
 
 type Bytes64 [length.Bytes64]byte
 
@@ -46,6 +44,9 @@ func (b *Bytes64) UnmarshalText(input []byte) error {
 
 // MarshalText returns the hex representation of a.
 func (b Bytes64) MarshalText() ([]byte, error) { return hexutil.Bytes(b[:]).MarshalText() }
+
+// AppendText implements encoding.TextAppender (alloc-free MarshalText).
+func (b Bytes64) AppendText(dst []byte) ([]byte, error) { return hexutil.Bytes(b[:]).AppendText(dst) }
 
 // Format implements fmt.Formatter.
 // Hash supports the %v, %s, %v, %x, %X and %d format verbs.

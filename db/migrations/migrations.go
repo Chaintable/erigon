@@ -57,16 +57,19 @@ var migrations = map[kv.Label][]Migration{
 		dbSchemaVersion6,
 		dbSchemaVersion7,
 		dropLegacyE2Tables,
+		createPtcWindowEpochTable,
 	},
 	dbcfg.TxPoolDB: {},
 	dbcfg.SentryDB: {},
 }
 
-type Callback func(tx kv.RwTx, progress []byte, isDone bool) error
-type Migration struct {
-	Name string
-	Up   func(db kv.RwDB, dirs datadir.Dirs, progress []byte, BeforeCommit Callback, logger log.Logger) error
-}
+type (
+	Callback  func(tx kv.RwTx, progress []byte, isDone bool) error
+	Migration struct {
+		Name string
+		Up   func(db kv.RwDB, dirs datadir.Dirs, progress []byte, BeforeCommit Callback, logger log.Logger) error
+	}
+)
 
 var (
 	ErrMigrationNonUniqueName   = errors.New("please provide unique migration name")
@@ -174,17 +177,19 @@ func (m *Migrator) VerifyVersion(db kv.RwDB, chaindata string) error {
 			return fmt.Errorf("reading DB schema version: %w", err)
 		}
 		if ok {
-			if major > kv.DBSchemaVersion.Major {
+			switch {
+			case major > kv.DBSchemaVersion.Major:
 				return fmt.Errorf("cannot downgrade major DB version from %d to %d", major, kv.DBSchemaVersion.Major)
-			} else if major == kv.DBSchemaVersion.Major {
+			case major == kv.DBSchemaVersion.Major:
 				if minor > kv.DBSchemaVersion.Minor {
 					return fmt.Errorf("cannot downgrade minor DB version from %d.%d to %d.%d", major, minor, kv.DBSchemaVersion.Major, kv.DBSchemaVersion.Major)
 				}
-			} else {
+			default:
 				if kv.DBSchemaVersion.Major != major {
 					return fmt.Errorf(
 						"cannot switch major DB version, db: %d, erigon: %d, try \"rm -rf %s\" if you are sure that you are running right version of erigon on right datadir",
-						major, kv.DBSchemaVersion.Major, chaindata)
+						major, kv.DBSchemaVersion.Major, chaindata,
+					)
 				}
 			}
 		}

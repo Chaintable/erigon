@@ -30,6 +30,7 @@ import (
 	"testing"
 
 	"github.com/holiman/uint256"
+	"github.com/stretchr/testify/require"
 
 	"github.com/erigontech/erigon/common"
 )
@@ -996,9 +997,7 @@ func runTests(t *testing.T, decode func([]byte, any) error) {
 }
 
 func TestDecodeWithByteReader(t *testing.T) {
-	runTests(t, func(input []byte, into any) error {
-		return DecodeBytes(input, into)
-	})
+	runTests(t, DecodeBytes)
 }
 
 func testDecodeWithEncReader(t *testing.T, n int) {
@@ -1189,7 +1188,6 @@ func TestInvalidOptionalField(t *testing.T) {
 			t.Errorf("wrong error for %T: %v", test.v, err.Error())
 		}
 	}
-
 }
 
 func ExampleDecode() {
@@ -1268,32 +1266,6 @@ func ExampleStream() {
 	// [102 111 111 98 97 114] <nil>
 }
 
-func BenchmarkDecode(b *testing.B) {
-	enc := encodeTestSlice(90000)
-	b.SetBytes(int64(len(enc)))
-	b.ReportAllocs()
-
-	for b.Loop() {
-		var s []uint
-		if err := DecodeBytes(enc, &s); err != nil {
-			b.Fatalf("Decode error: %v", err)
-		}
-	}
-}
-
-func BenchmarkDecodeIntSliceReuse(b *testing.B) {
-	enc := encodeTestSlice(100000)
-	b.SetBytes(int64(len(enc)))
-	b.ReportAllocs()
-
-	var s []uint
-	for b.Loop() {
-		if err := DecodeBytes(enc, &s); err != nil {
-			b.Fatalf("Decode error: %v", err)
-		}
-	}
-}
-
 func encodeTestSlice(n uint) []byte {
 	s := make([]uint, n)
 	for i := range n {
@@ -1312,4 +1284,175 @@ func unhex(str string) []byte {
 		panic(fmt.Sprintf("invalid hex string: %q", str))
 	}
 	return b
+}
+
+// TestStreamResetAfterBytesStream pins that Reset to a different reader fully
+// detaches a stream from its NewBytesStream buffer: reads must come from the new
+// reader, not leftover slice bytes.
+func TestStreamResetAfterBytesStream(t *testing.T) {
+	valA1 := bytes.Repeat([]byte{0x11}, 32)
+	valA2 := bytes.Repeat([]byte{0x22}, 32)
+	valB := bytes.Repeat([]byte{0xbb}, 32)
+
+	encode := func(v []byte) []byte {
+		enc, err := EncodeToBytes(v)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return enc
+	}
+	encB := encode(valB)
+
+	s := NewBytesStream(append(encode(valA1), encode(valA2)...))
+	defer PutStream(s)
+	if got, err := s.Bytes(); err != nil || !bytes.Equal(got, valA1) {
+		t.Fatalf("got %x err=%v, want %x", got, err, valA1)
+	}
+
+	s.Reset(bytes.NewReader(encB), uint64(len(encB)))
+	got, err := s.Bytes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, valB) {
+		t.Fatalf("got %x, want %x: read served from stale bytes-stream buffer", got, valB)
+	}
+}
+
+// TestStreamResetSliceRdrCoherency pins the invariant readFull's fast path
+// relies on: after any Reset, sliceRdr is non-nil if and only if s.r points at
+// it, so the field and the reader can never be different cursors.
+func TestStreamResetSliceRdrCoherency(t *testing.T) {
+	data := []byte{0x82, 0xaa, 0xbb}
+	check := func(t *testing.T, s *Stream, wantSlice bool) {
+		t.Helper()
+		if wantSlice {
+			if s.sliceRdr == nil {
+				t.Fatal("sliceRdr not set")
+			}
+			if s.r != &s.sliceRdr {
+				t.Fatal("s.r does not point at s.sliceRdr")
+			}
+		} else {
+			if s.sliceRdr != nil {
+				t.Fatal("stale sliceRdr")
+			}
+			if _, ok := s.r.(*sliceReader); ok {
+				t.Fatal("s.r is a sliceReader but sliceRdr is nil")
+			}
+		}
+	}
+
+	t.Run("bytes-stream", func(t *testing.T) {
+		s := NewBytesStream(data)
+		defer PutStream(s)
+		check(t, s, true)
+	})
+
+	t.Run("bytes-stream-rearm", func(t *testing.T) {
+		s := NewBytesStream(data)
+		defer PutStream(s)
+		if _, err := s.Bytes(); err != nil {
+			t.Fatal(err)
+		}
+		s.sliceRdr = data
+		s.Reset(&s.sliceRdr, uint64(len(data)))
+		check(t, s, true)
+	})
+
+	t.Run("foreign-slice-reader-adopted", func(t *testing.T) {
+		s := NewStream(bytes.NewReader(data), uint64(len(data)))
+		foreign := sliceReader(data)
+		s.Reset(&foreign, uint64(len(data)))
+		check(t, s, true)
+		if got, err := s.Bytes(); err != nil || !bytes.Equal(got, data[1:]) {
+			t.Fatalf("got %x err=%v, want %x", got, err, data[1:])
+		}
+	})
+
+	t.Run("byte-reader", func(t *testing.T) {
+		s := NewBytesStream(data)
+		defer PutStream(s)
+		s.Reset(bytes.NewReader(data), uint64(len(data)))
+		check(t, s, false)
+	})
+
+	t.Run("plain-reader-wrapped", func(t *testing.T) {
+		s := NewBytesStream(data)
+		defer PutStream(s)
+		s.Reset(struct{ io.Reader }{bytes.NewReader(data)}, uint64(len(data)))
+		check(t, s, false)
+	})
+}
+
+func TestDecodeListSliceNoAmplification(t *testing.T) {
+	t.Parallel()
+	type big struct{ A, B, C, D, E, F, G, H uint64 } // 64 bytes
+	elem := reflect.TypeFor[big]()
+	items := 4 * maxSliceHintBytes / 64 // enough that the budget must bind
+	list := append([]byte{0xfa, byte(items >> 16), byte(items >> 8), byte(items)},
+		make([]byte, items)...)
+	s := NewBytesStream(list)
+	defer PutStream(s)
+	size, err := s.List()
+	require.NoError(t, err)
+	require.Equal(t, items, CountItems(s.Peek()[:size]), "payload really is one-byte items")
+	require.LessOrEqual(t, sliceHint(s, elem, size)*int(elem.Size()), maxSliceHintBytes,
+		"a pre-allocation must stay within the hint budget")
+}
+
+func TestSliceHintDoesNotChangeDecoding(t *testing.T) {
+	t.Parallel()
+	type item struct {
+		A uint64
+		B []byte
+		C []uint
+	}
+	for _, tc := range []any{
+		[]uint{},
+		[]uint{0, 1, 127, 128, 1 << 20},
+		[]string{"", "a", string(make([]byte, 300))},
+		[][]uint{{}, {1}, {2, 3, 4}},
+		[]item{{1, []byte("x"), []uint{1, 2}}, {}, {1 << 40, nil, []uint{9}}},
+	} {
+		enc, err := EncodeToBytes(tc)
+		require.NoError(t, err)
+
+		hinted := reflect.New(reflect.TypeOf(tc))
+		require.NoError(t, DecodeBytes(enc, hinted.Interface()))
+
+		// Pre-seeded capacity makes the top-level slice skip the hint. Nested
+		// slices are still allocated during the decode and take it, so the arms
+		// contrast a hinted outer slice against an unhinted one, not hint
+		// against no hint.
+		control := reflect.New(reflect.TypeOf(tc))
+		control.Elem().Set(reflect.MakeSlice(reflect.TypeOf(tc), 0, 1))
+		require.NoError(t, DecodeBytes(enc, control.Interface()))
+
+		require.Equal(t, control.Elem().Interface(), hinted.Elem().Interface())
+	}
+}
+
+func TestSliceHintOnCorruptInput(t *testing.T) {
+	t.Parallel()
+	enc, err := EncodeToBytes([][]uint{{1, 2}, {3}, {}})
+	require.NoError(t, err)
+	for i := range enc {
+		for _, b := range []byte{0x00, 0x7f, 0x80, 0xb8, 0xc0, 0xf7, 0xf8, 0xff} {
+			corrupt := append([]byte(nil), enc...)
+			corrupt[i] = b
+
+			var hinted [][]uint
+			errHint := DecodeBytes(corrupt, &hinted)
+
+			control := make([][]uint, 0, 1) // has capacity, so the outer hint is skipped
+			errCtl := DecodeBytes(corrupt, &control)
+
+			require.Equal(t, errCtl == nil, errHint == nil,
+				"byte %d = %#x: hint and control disagree on success", i, b)
+			if errHint == nil {
+				require.Equal(t, control, hinted, "byte %d = %#x", i, b)
+			}
+		}
+	}
 }

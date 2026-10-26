@@ -87,6 +87,7 @@ func MakeApp(name string, action cli.ActionFunc, cliFlags []cli.Flag) *cli.Comma
 		&initCommand,
 		&importCommand,
 		&snapshotCommand,
+		&dbCommand,
 		&backtestCommitmentCommand,
 		//&backupCommand,
 	}
@@ -95,8 +96,9 @@ func MakeApp(name string, action cli.ActionFunc, cliFlags []cli.Flag) *cli.Comma
 }
 
 func appFlags(cliFlags []cli.Flag) []cli.Flag {
-
-	flags := append(cliFlags, debug.Flags...) // debug flags are required
+	flags := make([]cli.Flag, 0, len(cliFlags)+len(debug.Flags)+len(utils.MetricFlags)+len(logging.Flags)+1)
+	flags = append(flags, cliFlags...)
+	flags = append(flags, debug.Flags...) // debug flags are required
 	flags = append(flags, utils.MetricFlags...)
 	flags = append(flags, logging.Flags...)
 	flags = append(flags, &utils.ConfigFlag)
@@ -142,7 +144,7 @@ func MigrateFlags(action cli.ActionFunc) cli.ActionFunc {
 func doMigrateFlags(cmd *cli.Command) {
 	// Figure out if there are any aliases of commands. If there are, we want
 	// to ignore them when iterating over the flags.
-	var aliases = make(map[string]bool)
+	aliases := make(map[string]bool)
 	for _, fl := range cmd.Flags {
 		for _, alias := range fl.Names()[1:] {
 			aliases[alias] = true

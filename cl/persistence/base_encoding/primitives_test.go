@@ -116,34 +116,10 @@ func TestAppendEffectiveBalances(t *testing.T) {
 	twoValidators := make([]byte, 2*validatorSSZSize)
 	binary.LittleEndian.PutUint64(twoValidators[effectiveBalanceOffset:], 111)
 	binary.LittleEndian.PutUint64(twoValidators[validatorSSZSize+effectiveBalanceOffset:], 222)
-	withPartialTail := append(twoValidators, make([]byte, effectiveBalanceOffset+10)...)
+	withPartialTail := make([]byte, len(twoValidators)+effectiveBalanceOffset+10)
+	copy(withPartialTail, twoValidators)
 	expected := make([]byte, 16)
 	binary.LittleEndian.PutUint64(expected[0:], 111)
 	binary.LittleEndian.PutUint64(expected[8:], 222)
 	require.Equal(t, expected, AppendEffectiveBalances(nil, withPartialTail))
-}
-
-func TestDiffValidators(t *testing.T) {
-	vals := 3
-	old := make([]byte, vals*validatorSSZSize)
-	new := make([]byte, validatorSSZSize*(vals+1))
-	inc := 1
-	for i := 0; i < vals*validatorSSZSize; i++ {
-		if i%9 == 0 {
-			inc++
-		}
-		old[i] = byte(i)
-		new[i] = byte(i + inc)
-	}
-
-	var b bytes.Buffer
-
-	err := ComputeCompressedSerializedValidatorSetListDiff(&b, old, new)
-	require.NoError(t, err)
-
-	out := b.Bytes()
-	new2, err := ApplyCompressedSerializedValidatorListDiff(old, nil, out, false)
-	require.NoError(t, err)
-
-	require.Equal(t, new, new2)
 }

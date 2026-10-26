@@ -74,7 +74,7 @@ func TestDebugBeaconHeadsReportsSelectedHeadOptimistic(t *testing.T) {
 				forkchoiceStore:         fcu,
 			}
 
-			response, err := a.GetEthV2DebugBeaconHeads(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/eth/v2/debug/beacon/heads", nil))
+			response, err := a.GetEthV2DebugBeaconHeads(httptest.NewRecorder(), httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/eth/v2/debug/beacon/heads", nil))
 			require.NoError(t, err)
 			heads := response.Data.([]any)
 			require.Len(t, heads, 1)
@@ -139,14 +139,14 @@ func TestHeadBlockIDUsesSelectedHead(t *testing.T) {
 		forkchoiceStore:         fcu,
 	}
 
-	request := httptest.NewRequest(http.MethodGet, "/eth/v1/beacon/blocks/head/root", nil)
+	request := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/eth/v1/beacon/blocks/head/root", nil)
 	routeContext := chi.NewRouteContext()
 	routeContext.URLParams.Add("block_id", "head")
 	request = request.WithContext(context.WithValue(request.Context(), chi.RouteCtxKey, routeContext))
 	blockID, err := beaconhttp.BlockIdFromRequest(request)
 	require.NoError(t, err)
 
-	root, err := a.rootFromBlockId(request.Context(), nil, blockID)
+	root, err := a.rootFromBlockId(nil, blockID)
 	require.NoError(t, err)
 	require.Equal(t, common.Hash{0xaa}, root)
 }
@@ -172,6 +172,7 @@ func TestSelectedHeadStateUsesWinningSideBranch(t *testing.T) {
 	selectedRoot := common.Hash{0xbb}
 	submittedState := state.New(&clparams.MainnetBeaconConfig)
 	selectedState := state.New(&clparams.MainnetBeaconConfig)
+	require.NoError(t, selectedState.SetSlot(98))
 	fcu := mock_services2.NewForkChoiceStorageMock(t)
 	fcu.HeadVal = selectedRoot
 	fcu.HeadSlotVal = 99
@@ -183,7 +184,8 @@ func TestSelectedHeadStateUsesWinningSideBranch(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, selectedRoot, root)
 	require.Equal(t, uint64(99), slot)
-	require.Same(t, selectedState, headState)
+	require.NotSame(t, selectedState, headState)
+	require.Equal(t, uint64(98), headState.Slot())
 }
 
 func TestSelectedHeadStateReportsMissingAuxiliaryRoot(t *testing.T) {
@@ -239,7 +241,7 @@ func TestViewHeadStateWithIdentityReportsSyncing(t *testing.T) {
 	a := &ApiHandler{syncedData: syncedData}
 
 	err := a.viewHeadStateWithIdentity(func(*state.CachingBeaconState, common.Hash, uint64) error { return nil })
-	endpointErr, ok := err.(*beaconhttp.EndpointError)
-	require.True(t, ok)
+	var endpointErr *beaconhttp.EndpointError
+	require.ErrorAs(t, err, &endpointErr)
 	require.Equal(t, http.StatusServiceUnavailable, endpointErr.Code)
 }

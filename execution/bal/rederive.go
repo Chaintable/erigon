@@ -14,8 +14,6 @@
 // You should have received a copy of the GNU Lesser General Public License
 // along with Erigon. If not, see <http://www.gnu.org/licenses/>.
 
-// Package bal regenerates EIP-7928 Block Access Lists for blocks whose stored
-// copy has been pruned, by re-executing the block against historical state.
 package bal
 
 import (
@@ -47,7 +45,6 @@ func RederiveBlockAccessList(
 	cfg *chain.Config,
 	engine rules.Engine,
 	chainReader rules.ChainReader,
-	stateReader state.StateReader,
 	getHeader GetHeaderFunc,
 	header *types.Header,
 	txns types.Transactions,
@@ -67,8 +64,14 @@ func RederiveBlockAccessList(
 	if err != nil {
 		return nil, fmt.Errorf("bal.RederiveBlockAccessList: initialize block %d: %w", blockNum, err)
 	}
-	initWrites := ibs.FinalizedWrites(blockRules, false)
+	initWrites := ibs.FinalizedWrites(blockRules)
 	ibs.MergeTxIOInto(balIO, initWrites)
+	// Publish this phase's writes to the versionMap so the next phase observes
+	// them across the ResetVersionedIO below — the cross-tx carrier the parallel
+	// executor and block builder also use. Without it a later tx's balance write
+	// (e.g. the accumulating coinbase fee) can't see the running value and the
+	// per-tx BAL change is lost.
+	ibs.FlushWritesToVersionMap(initWrites)
 	ibs.ResetVersionedIO()
 	gasUsed := new(protocol.GasUsed)
 	gp := new(protocol.GasPool).AddGas(header.GasLimit).AddBlobGas(cfg.GetMaxBlobGasPerBlock(header.Time))
@@ -92,8 +95,9 @@ func RederiveBlockAccessList(
 		if evm.Cancelled() {
 			return nil, fmt.Errorf("bal.RederiveBlockAccessList: execution aborted replaying tx %d of block %d: %w", i, blockNum, ctx.Err())
 		}
-		txWrites := ibs.FinalizedWrites(blockRules, false)
+		txWrites := ibs.FinalizedWrites(blockRules)
 		ibs.MergeTxIOInto(balIO, txWrites)
+		ibs.FlushWritesToVersionMap(txWrites)
 		ibs.ResetVersionedIO()
 		receipts = append(receipts, receipt)
 	}
@@ -104,11 +108,11 @@ func RederiveBlockAccessList(
 	}
 	ibs.SetTxContext(blockNum, len(txns))
 	ibs.ResetVersionedIO()
-	_, _, err = protocol.FinalizeBlockExecution(engine, stateReader, header, txns, uncles, noopWriter, cfg, ibs, receipts, withdrawals, chainReader, false, logger, nil)
+	_, _, err = protocol.FinalizeBlockExecution(engine, header, txns, uncles, noopWriter, cfg, ibs, receipts, withdrawals, chainReader, false, logger)
 	if err != nil {
 		return nil, fmt.Errorf("bal.RederiveBlockAccessList: finalize block %d: %w", blockNum, err)
 	}
-	finalWrites := ibs.FinalizedWrites(blockRules, false)
+	finalWrites := ibs.FinalizedWrites(blockRules)
 	ibs.MergeTxIOInto(balIO, finalWrites)
 	return balIO.AsBlockAccessList(), nil
 }

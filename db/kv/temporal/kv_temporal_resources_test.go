@@ -9,7 +9,7 @@ import (
 	"github.com/erigontech/erigon/db/datadir"
 	"github.com/erigontech/erigon/db/kv"
 	"github.com/erigontech/erigon/db/kv/dbcfg"
-	"github.com/erigontech/erigon/db/kv/memdb"
+	"github.com/erigontech/erigon/db/kv/mdbx/mdbxtest"
 	"github.com/erigontech/erigon/db/kv/order"
 	"github.com/erigontech/erigon/db/state"
 )
@@ -21,9 +21,9 @@ func TestTemporalTx_AbandonedIteratorsRollbackCleanly(t *testing.T) {
 	t.Parallel()
 	ctx := t.Context()
 
-	mdbxDb := memdb.NewTestDB(t, dbcfg.ChainDB)
+	mdbxDb := mdbxtest.NewTestDB(t, dbcfg.ChainDB)
 	dirs := datadir.New(t.TempDir())
-	agg := state.NewTest(dirs).StepSize(1).MustOpen(ctx, mdbxDb)
+	agg := state.NewTest(dirs).StepSize(1).MustOpen(ctx)
 	defer agg.Close()
 
 	temporalDb, err := New(mdbxDb, agg, nil)
@@ -52,5 +52,5 @@ func TestTemporalTx_AbandonedIteratorsRollbackCleanly(t *testing.T) {
 	// The db is still usable, so nothing was left pinned by the abandoned iterators.
 	ttx2, err := temporalDb.BeginTemporalRo(ctx)
 	require.NoError(t, err)
-	defer ttx2.Rollback()
+	defer ttx2.Rollback() //nolint:gocritic // ruleguard requires defer
 }

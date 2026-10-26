@@ -31,7 +31,7 @@ var (
 // see https://calver.org
 const (
 	Major                    = 3             // Major version component of the current release
-	Minor                    = 6             // Minor version component of the current release
+	Minor                    = 8             // Minor version component of the current release
 	Micro                    = 1             // Patch version component of the current release
 	Modifier                 = ""            // Modifier component of the current release
 	DefaultSnapshotGitBranch = "release/3.6" // Branch of erigontech/erigon-snapshot to use in OtterSync.

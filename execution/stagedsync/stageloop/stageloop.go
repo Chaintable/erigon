@@ -55,6 +55,10 @@ type NotificationSender interface {
 	Dispatch(ctx context.Context, tx kv.Tx, stateVersion uint64, accumulator *shards.Accumulator, recentReceipts *shards.RecentReceipts, finishProgressBefore, finishProgressAfter uint64, prevUnwindPoint *uint64) error
 }
 
+type FrozenBlocksReader interface {
+	FrozenBlocks() uint64
+}
+
 type Hook struct {
 	ctx                                 context.Context
 	notifications                       *shards.Notifications
@@ -65,6 +69,7 @@ type Hook struct {
 	updateHead                          func(ctx context.Context)
 	statusDataGetter                    sentry_multi_client.StatusGetter
 	blockRangePublisher                 *execp2p.Publisher
+	frozenBlocksReader                  FrozenBlocksReader
 	lastAnnouncedBlockRangeLatestNumber uint64
 	lastAnnouncedBlockRangeTime         time.Time
 }
@@ -79,6 +84,7 @@ func NewHook(
 	updateHead func(ctx context.Context),
 	statusDataGetter sentry_multi_client.StatusGetter,
 	blockRangePublisher *execp2p.Publisher,
+	frozenBlocksReader FrozenBlocksReader,
 ) *Hook {
 	return &Hook{
 		ctx:                 ctx,
@@ -90,6 +96,7 @@ func NewHook(
 		updateHead:          updateHead,
 		statusDataGetter:    statusDataGetter,
 		blockRangePublisher: blockRangePublisher,
+		frozenBlocksReader:  frozenBlocksReader,
 	}
 }
 
@@ -116,6 +123,9 @@ func (h *Hook) BeforeRun(tx kv.Tx, inSync bool) error {
 	if h == nil {
 		return nil
 	}
+	// Cycle start is where a node that fell behind first sees it; waiting for
+	// a cycle to end while still behind would miss fast catch-ups entirely.
+	h.NotifySyncState(tx)
 	return h.beforeRun(tx, inSync)
 }
 
@@ -169,7 +179,42 @@ func (h *Hook) UpdateHead(tx kv.Tx, finishProgressBefore uint64, isSynced bool) 
 		return err
 	}
 	h.maybeAnnounceBlockRange(finishProgressBefore, finishStageAfterSync, isSynced)
+	h.NotifySyncState(tx)
 	return nil
+}
+
+// ClearSnapshotDownloadPin drops the download-completion pin from the sync
+// state; see Notifications.ClearSnapshotDownloadPin.
+func (h *Hook) ClearSnapshotDownloadPin() bool {
+	if h == nil || h.notifications == nil {
+		return false
+	}
+	return h.notifications.ClearSnapshotDownloadPin()
+}
+
+// NotifySyncState publishes the sync status on the event bus if it changed;
+// dedup and ordering live in Notifications.PublishSyncState.
+func (h *Hook) NotifySyncState(tx kv.Tx) {
+	if h == nil || h.notifications == nil || h.notifications.Events == nil || h.frozenBlocksReader == nil {
+		return
+	}
+	if err := h.notifications.PublishSyncState(tx, h.frozenBlocksReader.FrozenBlocks()); err != nil {
+		h.logger.Warn("[hook] sync state notification skipped", "err", err)
+	}
+}
+
+func (h *Hook) NotifyStateRetirementStart(started bool) {
+	if h == nil || h.notifications == nil || h.notifications.Events == nil {
+		return
+	}
+	h.notifications.Events.OnStateRetirementStart(started)
+}
+
+func (h *Hook) NotifyStateRetirementDone() {
+	if h == nil || h.notifications == nil || h.notifications.Events == nil {
+		return
+	}
+	h.notifications.Events.OnStateRetirementDone()
 }
 
 func (h *Hook) maybeAnnounceBlockRange(finishStageBeforeSync, finishStageAfterSync uint64, isSynced bool) {
@@ -221,11 +266,11 @@ func addAndVerifyBlockStep(batch kv.RwTx, engine rules.Engine, chainReader rules
 	if chainReader != nil {
 		if err := engine.VerifyHeader(chainReader, currentHeader, true); err != nil {
 			log.Warn("Header Verification Failed", "number", currentHeight, "hash", currentHash, "reason", err)
-			return fmt.Errorf("%w: %v", rules.ErrInvalidBlock, err)
+			return fmt.Errorf("%w: %w", rules.ErrInvalidBlock, err)
 		}
 		if err := engine.VerifyUncles(chainReader, currentHeader, currentBody.Uncles); err != nil {
 			log.Warn("Unlcles Verification Failed", "number", currentHeight, "hash", currentHash, "reason", err)
-			return fmt.Errorf("%w: %v", rules.ErrInvalidBlock, err)
+			return fmt.Errorf("%w: %w", rules.ErrInvalidBlock, err)
 		}
 	}
 	// Prepare memory state for block execution
@@ -278,7 +323,7 @@ func cleanupProgressIfNeeded(batch kv.RwTx, header *types.Header) error {
 	return nil
 }
 
-func StateStep(ctx context.Context, chainReader rules.ChainReader, engine rules.Engine, sd *execctx.SharedDomains, tx kv.TemporalRwTx, stateSync *stagedsync.Sync, unwindPoint uint64, headersChain []*types.Header, bodiesChain []*types.RawBody) (err error) {
+func StateStep(chainReader rules.ChainReader, engine rules.Engine, sd *execctx.SharedDomains, tx kv.TemporalRwTx, stateSync *stagedsync.Sync, unwindPoint uint64, headersChain []*types.Header, bodiesChain []*types.RawBody) (err error) {
 	defer func() {
 		if rec := recover(); rec != nil {
 			err = fmt.Errorf("%+v, trace: %s", rec, dbg.Stack())
@@ -291,12 +336,12 @@ func StateStep(ctx context.Context, chainReader rules.ChainReader, engine rules.
 		if err := stateSync.UnwindTo(unwindPoint, stagedsync.StagedUnwind, nil); err != nil {
 			return err
 		}
-		if err = stateSync.RunUnwind(sd, tx); err != nil {
+		if err := stateSync.RunUnwind(sd, tx); err != nil {
 			return err
 		}
 	}
 	lastNum := headersChain[len(headersChain)-1].Number.Uint64()
-	if err := rawdb.TruncateCanonicalChain(ctx, tx, lastNum+1); err != nil {
+	if err := rawdb.TruncateCanonicalChain(tx, lastNum+1); err != nil {
 		return err
 	}
 	// Once we unwound we can start constructing the chain (assumption: len(headersChain) == len(bodiesChain))
@@ -345,9 +390,8 @@ func NewDefaultStages(ctx context.Context,
 		ctx,
 		stagedsync.StageSnapshotsCfg(db, controlServer.ChainConfig, cfg.Sync, dirs, blockRetire, snapDownloader, blockReader, notifications, cfg.InternalCL && cfg.CaplinConfig.ArchiveBlocks, cfg.CaplinConfig.ArchiveBlobs, cfg.CaplinConfig.ArchiveStates, cfg.Prune, afterSnapshotDownload, cfg.Snapshot.ManifestReady),
 		stagedsync.StageHeadersCfg(blockReader),
-		stagedsync.StageBlockHashesCfg(dirs.Tmp, blockWriter),
 		stagedsync.StageBodiesCfg(blockReader, blockWriter),
-		stagedsync.StageSendersCfg(controlServer.ChainConfig, cfg.Sync, dbg.BadBlockHalt, dirs.Tmp, cfg.Prune, blockReader, readAheader),
+		stagedsync.StageSendersCfg(controlServer.ChainConfig, dbg.BadBlockHalt, dirs.Tmp, blockReader, readAheader),
 		stagedsync.StageExecuteBlocksCfg(db, cfg.Prune, cfg.BatchSize, controlServer.ChainConfig, controlServer.Engine, &vm.Config{Tracer: tracingHooks}, notifications, cfg.StateStream, dbg.BadBlockHalt, dirs, blockReader, cfg.Genesis, cfg.Sync, cfg.ExperimentalBAL, readAheader),
 		stagedsync.StageTxLookupCfg(cfg.Prune, dirs.Tmp, blockReader),
 		stagedsync.StageFinishCfg(),
@@ -371,7 +415,6 @@ func NewPipelineStages(ctx context.Context,
 		tracingHooks = tracer.Hooks
 	}
 	dirs := cfg.Dirs
-	blockWriter := blockio.NewBlockWriter()
 
 	var depositContract common.Address
 	if cfg.Genesis != nil {
@@ -379,14 +422,13 @@ func NewPipelineStages(ctx context.Context,
 	}
 	_ = depositContract
 
-	return stagedsync.PipelineStages(ctx,
+	return stagedsync.PipelineStages(
+		ctx,
 		stagedsync.StageSnapshotsCfg(db, controlServer.ChainConfig, cfg.Sync, dirs, blockRetire, snapDownloader, blockReader, notifications, cfg.InternalCL && cfg.CaplinConfig.ArchiveBlocks, cfg.CaplinConfig.ArchiveBlobs, cfg.CaplinConfig.ArchiveStates, cfg.Prune, afterSnapshotDownload, cfg.Snapshot.ManifestReady),
-		stagedsync.StageBlockHashesCfg(dirs.Tmp, blockWriter),
-		stagedsync.StageSendersCfg(controlServer.ChainConfig, cfg.Sync, dbg.BadBlockHalt, dirs.Tmp, cfg.Prune, blockReader, readAheader),
+		stagedsync.StageSendersCfg(controlServer.ChainConfig, dbg.BadBlockHalt, dirs.Tmp, blockReader, readAheader),
 		stagedsync.StageExecuteBlocksCfg(db, cfg.Prune, cfg.BatchSize, controlServer.ChainConfig, controlServer.Engine, &vm.Config{Tracer: tracingHooks}, notifications, cfg.StateStream, dbg.BadBlockHalt, dirs, blockReader, cfg.Genesis, cfg.Sync, cfg.ExperimentalBAL, readAheader),
 		stagedsync.StageTxLookupCfg(cfg.Prune, dirs.Tmp, blockReader),
 		stagedsync.StageFinishCfg(),
-		stagedsync.StageWitnessProcessingCfg(controlServer.ChainConfig, controlServer.WitnessBuffer),
 	)
 }
 
@@ -403,11 +445,11 @@ func NewInMemoryExecution(
 ) *stagedsync.Sync {
 	return stagedsync.New(
 		cfg.Sync,
-		stagedsync.StateStages(ctx,
+		stagedsync.StateStages(
+			ctx,
 			stagedsync.StageHeadersCfg(blockReader),
 			stagedsync.StageBodiesCfg(blockReader, blockWriter),
-			stagedsync.StageBlockHashesCfg(cfg.Dirs.Tmp, blockWriter),
-			stagedsync.StageSendersCfg(controlServer.ChainConfig, cfg.Sync, true /* badBlockHalt */, cfg.Dirs.Tmp, cfg.Prune, blockReader, readAheader),
+			stagedsync.StageSendersCfg(controlServer.ChainConfig, true /* badBlockHalt */, cfg.Dirs.Tmp, blockReader, readAheader),
 			stagedsync.StageExecuteBlocksCfg(db, cfg.Prune, cfg.BatchSize, controlServer.ChainConfig, controlServer.Engine, &vm.Config{}, notifications, cfg.StateStream, true, cfg.Dirs, blockReader, cfg.Genesis, cfg.Sync, cfg.ExperimentalBAL, readAheader),
 		),
 		stagedsync.StateUnwindOrder,
