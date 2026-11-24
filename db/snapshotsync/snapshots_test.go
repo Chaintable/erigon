@@ -19,6 +19,7 @@ package snapshotsync
 import (
 	"bytes"
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"slices"
@@ -159,6 +160,15 @@ func TestFindMergeRange(t *testing.T) {
 
 		require.Equal(t, expect.String(), Ranges(found).String())
 	})
+
+	t.Run("lowest range above a span start", func(t *testing.T) {
+		var ranges Ranges
+		for from := uint64(610_000); from < 1_000_000; from += 10_000 {
+			ranges = append(ranges, NewRange(from, from+10_000))
+		}
+		expect := Ranges{NewRange(700_000, 800_000), NewRange(800_000, 900_000), NewRange(900_000, 1_000_000)}
+		require.Equal(t, expect.String(), Ranges(merger.FindMergeRanges(ranges)).String())
+	})
 }
 
 func TestMergeSnapshots(t *testing.T) {
@@ -269,6 +279,82 @@ func TestMergeSnapshots(t *testing.T) {
 	// defer d.Close()
 	// a = d.Count()
 	// require.Equal(10, a)
+}
+
+func TestMergeKeepsFinishedRangesOnLaterFailure(t *testing.T) {
+	logger := log.New()
+	dir, require := t.TempDir(), require.New(t)
+	for i := range uint64(4) {
+		for _, snT := range snaptype2.BlockSnapshotTypes {
+			createTestSegmentFile(t, i*10_000, (i+1)*10_000, snT.Enum(), dir, version.V1_0, logger)
+		}
+	}
+	s := NewBaseRoSnapshots(ethconfig.BlocksFreezing{ChainName: networkname.Mainnet}, dir, snaptype2.BlockSnapshotTypes, snaptype2.Transactions, true, logger)
+	defer s.Close()
+	require.NoError(s.OpenFolder())
+
+	errSecond := errors.New("second range failed")
+	merges := 0
+	onMerge := func([]string) error {
+		if merges++; merges == 2 {
+			return errSecond
+		}
+		return nil
+	}
+	merger := NewMerger(dir, 1, log.LvlInfo, nil, chainspec.Mainnet.Config, logger)
+	merger.DisableFsync()
+	err := merger.Merge(t.Context(), s, snaptype2.BlockSnapshotTypes, []Range{NewRange(0, 20_000), NewRange(20_000, 40_000)}, s.Dir(), false, onMerge, nil)
+	require.ErrorIs(err, errSecond)
+
+	s.dirtyLock.RLock()
+	defer s.dirtyLock.RUnlock()
+	for _, snT := range snaptype2.BlockSnapshotTypes {
+		ok := false
+		s.dirty[snT.Enum()].Scan(func(seg *DirtySegment) bool {
+			ok = ok || seg.from == 0 && seg.to == 20_000
+			return true
+		})
+		require.True(ok, "merged %s [0, 20000) must be integrated, not left open and untracked", snT.Name())
+	}
+}
+
+func TestMergeSubSegmentClosesOutputOnIndexFailure(t *testing.T) {
+	logger := log.New()
+	dir := t.TempDir()
+	for i := range uint64(2) {
+		createTestSegmentFile(t, i*10_000, (i+1)*10_000, snaptype2.Enums.Headers, dir, version.V1_0, logger)
+	}
+	s := NewBaseRoSnapshots(ethconfig.BlocksFreezing{ChainName: networkname.Mainnet}, dir, snaptype2.BlockSnapshotTypes, snaptype2.Transactions, true, logger)
+	defer s.Close()
+	require.NoError(t, s.OpenFolder())
+	var toMerge []*DirtySegment
+	s.dirty[snaptype2.Enums.Headers].Scan(func(seg *DirtySegment) bool {
+		toMerge = append(toMerge, seg)
+		return true
+	})
+
+	merger := NewMerger(dir, 1, log.LvlInfo, nil, chainspec.Mainnet.Config, logger)
+	merger.DisableFsync()
+	seg, err := merger.mergeSubSegment(t.Context(), snaptype2.Headers.FileInfo(dir, 0, 20_000), toMerge, dir, true, nil)
+	require.ErrorContains(t, err, "salt not found") // the index build fails without salt-blocks.txt
+	require.NotNil(t, seg)
+	require.Nil(t, seg.Decompressor, "a failed merge output must be closed")
+}
+
+// A frozen merge output retires only the non-frozen segments it covers, not ones below its range.
+func TestIntegrateFrozenMergeKeepsSegmentsBelowItsRange(t *testing.T) {
+	logger := log.New()
+	s := NewBaseRoSnapshots(ethconfig.BlocksFreezing{ChainName: networkname.Mainnet}, t.TempDir(), snaptype2.BlockSnapshotTypes, snaptype2.Transactions, true, logger)
+	defer s.Close()
+	below := &DirtySegment{Range: NewRange(0, 100_000), segType: snaptype2.Headers}
+	s.dirty[snaptype2.Headers.Enum()].Set(below)
+
+	merger := NewMerger(t.TempDir(), 1, log.LvlInfo, nil, chainspec.Mainnet.Config, logger)
+	frozen := &DirtySegment{Range: NewRange(100_000, 600_000), segType: snaptype2.Headers, frozen: true}
+	merger.integrateMergedDirtyFiles(s, map[snaptype.Enum][]*DirtySegment{snaptype2.Headers.Enum(): {frozen}}, map[snaptype.Enum][]*DirtySegment{})
+
+	_, ok := s.dirty[snaptype2.Headers.Enum()].Get(below)
+	require.True(t, ok, "segment below the frozen output must stay")
 }
 
 func TestMergeSkipsPreClaimedRange(t *testing.T) {
@@ -728,6 +814,34 @@ func TestRemoveOverlapsLeavesAnotherCollectionsIdxAlone(t *testing.T) {
 	require.NoFileExists(t, ownedOldIdx, "an owned superseded index is still reclaimed")
 	require.FileExists(t, foreignOldIdx, "another collection's index is not this collection's to unlink")
 	require.FileExists(t, foreignNewIdx)
+}
+
+func TestRemoveOverlapsReportsOnlyOwnTypes(t *testing.T) {
+	logger := log.New()
+	dir := t.TempDir()
+	headers, beacon := snaptype2.Enums.Headers, snaptype.BeaconBlocks.Enum()
+
+	createTestSegmentFile(t, 0, 500_000, headers, dir, version.V1_0, logger)
+	createTestSegmentFile(t, 0, 1_000_000, headers, dir, version.V1_0, logger)
+	createTestSegmentFile(t, 0, 500_000, beacon, dir, version.V1_0, logger)
+	createTestSegmentFile(t, 0, 1_000_000, beacon, dir, version.V1_0, logger)
+	createTestSegmentFile(t, 1_000_000, 1_500_000, beacon, dir, version.V1_0, logger)
+	createTestSegmentFile(t, 1_000_000, 1_500_000, beacon, dir, version.V1_1, logger)
+
+	s := NewBaseRoSnapshots(ethconfig.BlocksFreezing{ChainName: networkname.Mainnet}, dir, []snaptype.Type{snaptype2.Headers}, snaptype2.Headers, true, logger)
+	defer s.Close()
+	require.NoError(t, s.OpenFolder())
+
+	var reported []string
+	require.NoError(t, s.RemoveOverlaps(func(l []string) error {
+		reported = append(reported, l...)
+		return nil
+	}))
+
+	require.ElementsMatch(t, []string{
+		snaptype.SegmentFileName(version.V1_0, 0, 500_000, headers),
+		snaptype.IdxFileName(version.V1_0, 0, 500_000, headers.String()),
+	}, reported, "only overlaps of the collection's own types may reach the seeder")
 }
 
 func TestCanRetire(t *testing.T) {
