@@ -72,6 +72,8 @@ type Cfg struct {
 	attestationDataProducer      attestation_producer.AttestationDataProducer
 	caplinConfig                 clparams.CaplinConfig
 	hasDownloaded                bool
+	forwardSyncTipRoot           common.Hash
+	forwardSyncTipSlot           uint64
 	gloasPayloadRetryOffset      atomic.Uint32
 	gloasEnvelopeRecoveryCursor  common.Hash
 	gloasEnvelopeRecoveryHead    common.Hash
@@ -88,7 +90,11 @@ type Cfg struct {
 	gloasSkippedAnchorValidation skippedAnchorValidation
 	sleepForSlotLastWake         sleepForSlotWake
 	sleepForSlotHeadChanged      bool
-	chainTipRejections           *chainTipRejections
+	// executionHead tracks the canonical execution-head decision for wake detection, not confirmed
+	// EL adoption. Tolerated FCU timeouts still update it; an FCU the EL turned away as busy does not.
+	executionHead            common.Hash
+	chainTipRejections       *chainTipRejections
+	ancestorLookupFailedSlot uint64
 }
 
 type Args struct {
@@ -100,6 +106,8 @@ type Args struct {
 	hasDownloaded bool
 	// headUnpublished is set while the fork choice head differs from the head the beacon API serves.
 	headUnpublished bool
+	// atForwardSyncTip is set for less than an epoch after ForwardSync imported a Gloas tip without a successor, while no newer block is seen.
+	atForwardSyncTip bool
 }
 
 func ClStagesCfg(
@@ -184,6 +192,9 @@ func MetaCatchingUp(args Args) StageName {
 	if !args.hasDownloaded {
 		return DownloadHistoricalBlocks
 	}
+	if args.atForwardSyncTip {
+		return ""
+	}
 	// ForwardSync can work without peers via the beacon API HTTP fallback,
 	// so allow it even when peers == 0.
 	if args.seenEpoch < args.targetEpoch {
@@ -220,6 +231,8 @@ func processBlock(ctx context.Context, cfg *Cfg, db kv.RwDB, block *cltypes.Sign
 	}); err != nil {
 		return err
 	}
+	// Deferred because OnBlock below runs after the index write.
+	defer cfg.emitter.NotifyBlockIndicesChanged()
 
 	blockRoot, err := block.Block.HashSSZ()
 	if err != nil {
@@ -283,6 +296,9 @@ func ConsensusClStages() *clstages.StageGraph[*Cfg, Args] {
 			args.seenSlot = cfg.forkChoice.HighestSeen()
 			args.seenEpoch = args.seenSlot / cfg.beaconCfg.SlotsPerEpoch
 			args.targetSlot = cfg.ethClock.GetCurrentSlot()
+			args.atForwardSyncTip = cfg.forwardSyncTipRoot != (common.Hash{}) &&
+				cfg.forwardSyncTipRoot == cfg.forkChoice.HighestSeenRoot() &&
+				args.targetSlot < cfg.forwardSyncTipSlot+cfg.beaconCfg.SlotsPerEpoch
 			cfg.forkChoice.OnTick(utils.SecondsToMilliseconds(cfg.ethClock.GenesisTime() + args.targetSlot*cfg.beaconCfg.SecondsPerSlot))
 			if head, _, err := cfg.forkChoice.GetHead(nil); err == nil {
 				args.headUnpublished = head != cfg.syncedData.HeadRoot()
@@ -345,6 +361,7 @@ func ConsensusClStages() *clstages.StageGraph[*Cfg, Args] {
 					downloader := network2.NewBackwardBeaconDownloader(ctx, cfg.rpc, cfg.sn, cfg.executionClient, cfg.indiciesDB, cfg.beaconCfg)
 					downloader.SetCurrentSlotSampler(cfg.ethClock.GetCurrentSlot)
 					downloader.SetGloasSuccessorValidator(network2.NewGloasSuccessorValidator(cfg.state, startingRoot))
+					downloader.SetGloasEnvelopeSignatureValidator(cfg.state)
 					if checkpoint_sync.RemoteCheckpointSyncEnabled(cfg.caplinConfig) {
 						if urls := clparams.GetAllCheckpointSyncEndpoints(cfg.caplinConfig.NetworkId); len(urls) > 0 {
 							downloader.SetHTTPFallbackURL(urls[0])
@@ -366,6 +383,9 @@ func ConsensusClStages() *clstages.StageGraph[*Cfg, Args] {
 					// so gossip can deliver blocks that range requests cannot.
 					if errors.Is(err, ErrForwardSyncStale) {
 						return ChainTipSync
+					}
+					if args.atForwardSyncTip {
+						return ForkChoice
 					}
 					if x := catchUpAfterImport(args); x != "" {
 						return x
@@ -440,7 +460,7 @@ func ConsensusClStages() *clstages.StageGraph[*Cfg, Args] {
 				ActionFunc: func(ctx context.Context, logger log.Logger, cfg *Cfg, args Args) error {
 					nextSlot := args.seenSlot + 1
 					wake, headChanged, err := waitForNextSlotOrHeadChange(
-						ctx, nextSlot, cfg.beaconCfg, cfg.forkChoice, cfg.syncedData, cfg.ethClock, cfg.sleepForSlotLastWake,
+						ctx, nextSlot, cfg.beaconCfg, cfg.forkChoice, cfg.syncedData, cfg.ethClock, cfg.sleepForSlotLastWake, cfg.executionHead,
 					)
 					cfg.sleepForSlotHeadChanged = headChanged
 					if headChanged {

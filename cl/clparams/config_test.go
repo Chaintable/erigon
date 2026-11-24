@@ -74,7 +74,7 @@ func TestAttestationDueMs(t *testing.T) {
 		postGloas uint64
 	}{
 		{name: "mainnet", config: MainnetBeaconConfig, preGloas: 3999, postGloas: 3000},
-		{name: "6 second slots", config: BeaconChainConfig{SecondsPerSlot: 6}, preGloas: 1999, postGloas: 1500},
+		{name: "6 second slots", config: BeaconChainConfig{SecondsPerSlot: 6, AttestationDueBps: AttestationDueBps, AttestationDueBpsGloas: AttestationDueBpsGloas}, preGloas: 1999, postGloas: 1500},
 		{name: "gnosis", config: BeaconConfigs[chainspec.GnosisChainID], preGloas: 1666, postGloas: 1250},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -419,6 +419,25 @@ func TestMaxBlobsPerBlockUpperBound(t *testing.T) {
 	// With no schedule it falls back to the larger of the base limits.
 	noSchedule := &BeaconChainConfig{MaxBlobsPerBlock: 6, MaxBlobsPerBlockElectra: 9}
 	require.EqualValues(t, 9, noSchedule.MaxBlobsPerBlockUpperBound())
+}
+
+func TestMaxRequestBlobSidecarsByVersion(t *testing.T) {
+	cfg := BeaconChainConfig{MaxRequestBlobSidecars: 768, MaxRequestBlobSidecarsElectra: 1152}
+	for _, tc := range []struct {
+		version StateVersion
+		want    int
+	}{
+		{DenebVersion, 768},
+		{ElectraVersion, 1152},
+		{FuluVersion, 1152},
+		{GloasVersion, 1152},
+		{HezeVersion, 1152},
+	} {
+		t.Run(tc.version.String(), func(t *testing.T) {
+			require.Equal(t, tc.want, cfg.MaxRequestBlobSidecarsByVersion(tc.version))
+		})
+	}
+	require.Panics(t, func() { cfg.MaxRequestBlobSidecarsByVersion(CapellaVersion) })
 }
 
 func TestForkSchemaMatchesSlot(t *testing.T) {

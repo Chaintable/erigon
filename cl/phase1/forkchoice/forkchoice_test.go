@@ -177,6 +177,7 @@ func TestNewForkChoiceStoreAnchorCheckpointEpoch(t *testing.T) {
 			want := solid.Checkpoint{Epoch: tc.wantEpoch, Root: anchorRoot}
 			require.Equal(t, want, store.FinalizedCheckpoint())
 			require.Equal(t, want, store.JustifiedCheckpoint())
+			require.Equal(t, tc.wantEpoch*cfg.SlotsPerEpoch, store.FinalizedSlot())
 		})
 	}
 }
@@ -608,6 +609,21 @@ type headerOnlyAnchorForkGraph struct {
 	slot uint64
 }
 
+type stateReadCountingForkGraph struct {
+	fork_graph.ForkGraph
+	reads int
+}
+
+func (g *stateReadCountingForkGraph) CurrentStateLocked(root common.Hash) *state.CachingBeaconState {
+	g.reads++
+	return g.ForkGraph.CurrentStateLocked(root)
+}
+
+func (g *stateReadCountingForkGraph) ReplayState(root common.Hash) (*state.CachingBeaconState, error) {
+	g.reads++
+	return g.ForkGraph.ReplayState(root)
+}
+
 func (g headerOnlyAnchorForkGraph) AnchorRoot() common.Hash { return g.root }
 func (g headerOnlyAnchorForkGraph) AnchorSlot() uint64      { return g.slot }
 func (g headerOnlyAnchorForkGraph) GetHeader(root common.Hash) (*cltypes.BeaconBlockHeader, bool) {
@@ -674,6 +690,174 @@ func TestGetHeadNodeDoesNotFailDuringCacheInvalidation(t *testing.T) {
 		require.Equal(t, anchorRoot, node.Root)
 		require.Equal(t, uint64(42), slot)
 	}
+}
+
+func TestGetHeadOnceReusesCachedHead(t *testing.T) {
+	store, graph := newHeadSnapshotTestStore()
+	store.beaconCfg.GloasForkEpoch = store.beaconCfg.FarFutureEpoch
+	store.beaconCfg.InitializeForkSchedule()
+
+	root := common.HexToHash("0xbb")
+	graph.headers[root] = &cltypes.BeaconBlockHeader{Slot: 10}
+	wantHead := ForkChoiceNode{Root: root, PayloadStatus: cltypes.PayloadStatusFull}
+	store.headHash = root
+	store.headSlot = 10
+	store.headPayloadStatus = cltypes.PayloadStatusFull
+	store.weights = map[common.Hash]uint64{root: 17}
+
+	head, slot, ok, err := store.getHeadOnce(nil, store.JustifiedCheckpoint(), false)
+
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, wantHead, head)
+	require.Equal(t, uint64(10), slot)
+	require.Equal(t, map[common.Hash]uint64{root: 17}, store.weights)
+	require.Equal(t, &wantHead, store.selectedHead.Load())
+}
+
+func TestTryGetHeadNodeDoesNotWaitForStoreLock(t *testing.T) {
+	store, _ := newHeadSnapshotTestStore()
+	want := ForkChoiceNode{Root: common.HexToHash("0xbb"), PayloadStatus: cltypes.PayloadStatusFull}
+	store.headHash = want.Root
+	store.headSlot = 10
+	store.headPayloadStatus = want.PayloadStatus
+
+	store.mu.Lock()
+	ok := tryGetHeadNodeWhileLockHeld(t, store, store.mu.Unlock)
+	require.False(t, ok)
+
+	got, ok := store.TryGetHeadNode()
+	require.True(t, ok)
+	require.Equal(t, want, got)
+
+	store.mu.Lock()
+	store.headHash = common.Hash{}
+	ok = tryGetHeadNodeWhileLockHeld(t, store, store.mu.Unlock)
+	require.False(t, ok)
+
+	store.mu.RLock()
+	ok = tryGetHeadNodeWhileLockHeld(t, store, store.mu.RUnlock)
+	require.False(t, ok)
+}
+
+func tryGetHeadNodeWhileLockHeld(t *testing.T, store *ForkChoiceStore, unlock func()) bool {
+	t.Helper()
+	done := make(chan bool, 1)
+	go func() {
+		_, ok := store.TryGetHeadNode()
+		done <- ok
+	}()
+	select {
+	case ok := <-done:
+		unlock()
+		return ok
+	case <-time.After(100 * time.Millisecond):
+		unlock()
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Fatal("TryGetHeadNode did not return after the lock was released")
+		}
+		t.Fatal("TryGetHeadNode waited for the store lock")
+		return false
+	}
+}
+
+func TestTryGetHeadNodeDoesNotWaitForPreGloasRecomputeLock(t *testing.T) {
+	store, _ := newHeadSnapshotTestStore()
+	store.beaconCfg.GloasForkEpoch = store.beaconCfg.FarFutureEpoch
+	store.beaconCfg.InitializeForkSchedule()
+	store.mu.RLock()
+
+	ok := tryGetHeadNodeWhileLockHeld(t, store, store.mu.RUnlock)
+
+	require.False(t, ok)
+}
+
+func TestTryGetHeadNodeDoesNotWaitForAnchorLock(t *testing.T) {
+	anchorRoot := common.HexToHash("0xa1")
+	store := &ForkChoiceStore{
+		forkGraph: headerOnlyAnchorForkGraph{root: anchorRoot, slot: 42},
+		beaconCfg: &clparams.MainnetBeaconConfig,
+	}
+	store.justifiedCheckpoint.Store(solid.Checkpoint{Root: common.HexToHash("0xb2")})
+	store.mu.RLock()
+
+	ok := tryGetHeadNodeWhileLockHeld(t, store, store.mu.RUnlock)
+
+	require.False(t, ok)
+}
+
+func TestTryGetHeadNodeRequiresCachedCheckpointState(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		preGloas bool
+	}{
+		{name: "Gloas"},
+		{name: "pre-Gloas", preGloas: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store, graph := newHeadSnapshotTestStore()
+			if tc.preGloas {
+				store.beaconCfg.GloasForkEpoch = store.beaconCfg.FarFutureEpoch
+				store.beaconCfg.InitializeForkSchedule()
+			}
+			countingGraph := &stateReadCountingForkGraph{ForkGraph: graph}
+			store.forkGraph = countingGraph
+			checkpoint := store.JustifiedCheckpoint()
+			store.checkpointStates.Delete(checkpoint)
+
+			_, ok := store.TryGetHeadNode()
+
+			require.False(t, ok)
+			require.Zero(t, countingGraph.reads)
+			_, cached := store.checkpointStates.Load(checkpoint)
+			require.False(t, cached)
+		})
+	}
+}
+
+func TestTryGetHeadNodeRecomputesFromCachedCheckpointState(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		preGloas bool
+	}{
+		{name: "Gloas"},
+		{name: "pre-Gloas", preGloas: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store, _ := newHeadSnapshotTestStore()
+			if tc.preGloas {
+				store.beaconCfg.GloasForkEpoch = store.beaconCfg.FarFutureEpoch
+				store.beaconCfg.InitializeForkSchedule()
+			}
+			want, _, err := store.GetHeadNode()
+			require.NoError(t, err)
+			store.mu.Lock()
+			store.headHash = common.Hash{}
+			store.mu.Unlock()
+
+			got, ok := store.TryGetHeadNode()
+
+			require.True(t, ok)
+			require.Equal(t, want, got)
+		})
+	}
+}
+
+func TestTryGetHeadNodeRecomputesAnchorFallback(t *testing.T) {
+	anchorRoot := common.HexToHash("0xa1")
+	store := &ForkChoiceStore{
+		forkGraph: headerOnlyAnchorForkGraph{root: anchorRoot, slot: 42},
+		beaconCfg: &clparams.MainnetBeaconConfig,
+	}
+	store.justifiedCheckpoint.Store(solid.Checkpoint{Root: common.HexToHash("0xb2")})
+
+	head, ok := store.TryGetHeadNode()
+
+	require.True(t, ok)
+	require.Equal(t, anchorRoot, head.Root)
+	require.Equal(t, cltypes.PayloadStatusPending, head.PayloadStatus)
 }
 
 func TestBlockProcessingTracksQueuedAndOverlappingImports(t *testing.T) {
@@ -785,7 +969,7 @@ func TestAddChainSegmentDoesNotQueueLightClientEventsOnError(t *testing.T) {
 }
 
 func TestAddChainSegmentQueuesLightClientEventsOnSuccess(t *testing.T) {
-	update := &cltypes.LightClientUpdate{}
+	update := cltypes.NewLightClientUpdate(clparams.AltairVersion, &clparams.MainnetBeaconConfig)
 	store := &ForkChoiceStore{
 		forkGraph: &getFinalizedExecutionHashForkGraph{
 			afterUpdate:           update,
@@ -800,6 +984,85 @@ func TestAddChainSegmentQueuesLightClientEventsOnSuccess(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, fork_graph.Success, status)
 	require.Len(t, store.queuedEmits, 1)
+}
+
+// Light client events take the fork of the update's attested header, which at a fork boundary is older than the
+// block's.
+func TestLightClientEventsTakeTheAttestedHeaderFork(t *testing.T) {
+	update := cltypes.NewLightClientUpdate(clparams.DenebVersion, &clparams.MainnetBeaconConfig)
+	store := &ForkChoiceStore{
+		forkGraph: &getFinalizedExecutionHashForkGraph{
+			afterUpdate:           update,
+			afterFinalityUpdate:   update,
+			addChainSegmentStatus: fork_graph.Success,
+		},
+		emitters: beaconevents.NewEventEmitter(),
+	}
+	events := make(chan *beaconevents.EventStream, 2)
+	subscription := store.emitters.State().Subscribe(events)
+	defer subscription.Unsubscribe()
+	block := cltypes.NewSignedBeaconBlock(&clparams.MainnetBeaconConfig, clparams.ElectraVersion)
+
+	_, _, err := store.addChainSegmentAndQueueLightClientEvents(block, true)
+	require.NoError(t, err)
+	require.Len(t, store.queuedEmits, 1)
+	store.queuedEmits[0]()
+
+	finality := (<-events).Data.(*beaconevents.LightClientFinalityUpdateData)
+	optimistic := (<-events).Data.(*beaconevents.LightClientOptimisticUpdateData)
+	require.Equal(t, clparams.DenebVersion.String(), finality.Version)
+	require.Equal(t, clparams.DenebVersion.String(), optimistic.Version)
+}
+
+// An update without finality is only an optimistic update: no finality event is sent for it.
+func TestLightClientUpdateWithoutFinalitySendsOnlyTheOptimisticEvent(t *testing.T) {
+	update := cltypes.NewLightClientUpdate(clparams.DenebVersion, &clparams.MainnetBeaconConfig)
+	store := &ForkChoiceStore{
+		forkGraph: &getFinalizedExecutionHashForkGraph{
+			afterUpdate:           update,
+			addChainSegmentStatus: fork_graph.Success,
+		},
+		emitters: beaconevents.NewEventEmitter(),
+	}
+	events := make(chan *beaconevents.EventStream, 2)
+	subscription := store.emitters.State().Subscribe(events)
+	defer subscription.Unsubscribe()
+	block := cltypes.NewSignedBeaconBlock(&clparams.MainnetBeaconConfig, clparams.ElectraVersion)
+
+	_, _, err := store.addChainSegmentAndQueueLightClientEvents(block, true)
+	require.NoError(t, err)
+	require.Len(t, store.queuedEmits, 1)
+	store.queuedEmits[0]()
+
+	require.IsType(t, &beaconevents.LightClientOptimisticUpdateData{}, (<-events).Data)
+	require.Empty(t, events)
+}
+
+// A newer finalized checkpoint settles the fork graph's light client update candidates, once.
+func TestUpdateCheckpointsKeepsFinalizedLightClientUpdates(t *testing.T) {
+	cfg := clparams.MainnetBeaconConfig
+	finalizedRoot := common.Hash{0x51}
+	graph := &getFinalizedExecutionHashForkGraph{headers: map[common.Hash]*cltypes.BeaconBlockHeader{finalizedRoot: {}}}
+	store := &ForkChoiceStore{forkGraph: graph, beaconCfg: &cfg, emitters: beaconevents.NewEventEmitter()}
+	store.justifiedCheckpoint.Store(solid.Checkpoint{})
+	store.finalizedCheckpoint.Store(solid.Checkpoint{})
+
+	store.updateCheckpoints(solid.Checkpoint{}, solid.Checkpoint{Epoch: 2, Root: finalizedRoot})
+	store.updateCheckpoints(solid.Checkpoint{}, solid.Checkpoint{Epoch: 2, Root: finalizedRoot})
+
+	require.Equal(t, []common.Hash{finalizedRoot}, graph.keptLightClientRoots)
+}
+
+// The updates are looked up on the selected head's chain, and only among settled updates without a selected head.
+func TestGetLightClientUpdatesUsesTheSelectedHead(t *testing.T) {
+	graph := &getFinalizedExecutionHashForkGraph{}
+	store := &ForkChoiceStore{forkGraph: graph}
+
+	store.GetLightClientUpdates(1, 3)
+	store.selectedHead.Store(&ForkChoiceNode{Root: common.Hash{0x61}})
+	store.GetLightClientUpdates(1, 3)
+
+	require.Equal(t, []common.Hash{{}, {0x61}}, graph.lightClientHeads)
 }
 
 func TestUpdateCheckpointsPrunesOperationsWithExactFinalizedState(t *testing.T) {
@@ -1666,6 +1929,8 @@ type getFinalizedExecutionHashForkGraph struct {
 	blocks                map[common.Hash]*cltypes.SignedBeaconBlock
 	headers               map[common.Hash]*cltypes.BeaconBlockHeader
 	states                map[common.Hash]*state.CachingBeaconState
+	getHeaderCalls        int
+	getBlockCalls         int
 	getStateMu            sync.Mutex
 	getStateRoots         []common.Hash
 	getStateStarted       chan common.Hash
@@ -1676,6 +1941,8 @@ type getFinalizedExecutionHashForkGraph struct {
 	currentStateRelease   chan struct{}
 	beforeUpdate          *cltypes.LightClientUpdate
 	afterUpdate           *cltypes.LightClientUpdate
+	afterFinalityUpdate   *cltypes.LightClientUpdate
+	lightClientHeads      []common.Hash
 	addChainSegmentStatus fork_graph.ChainSegmentInsertionResult
 	addChainSegmentErr    error
 	addChainSegmentCalled bool
@@ -1683,6 +1950,11 @@ type getFinalizedExecutionHashForkGraph struct {
 	anchorSlot            uint64
 	currentJustified      solid.Checkpoint
 	hasBlockEquivocation  bool
+	keptLightClientRoots  []common.Hash
+}
+
+func (g *getFinalizedExecutionHashForkGraph) KeepFinalizedLightClientUpdates(finalized common.Hash) {
+	g.keptLightClientRoots = append(g.keptLightClientRoots, finalized)
 }
 
 func (g *getFinalizedExecutionHashForkGraph) HasBlockEquivocation(uint64, uint64, common.Hash) bool {
@@ -1709,12 +1981,21 @@ func (g *getFinalizedExecutionHashForkGraph) AddChainSegment(*cltypes.SignedBeac
 	return nil, g.addChainSegmentStatus, g.addChainSegmentErr
 }
 
+func (g *getFinalizedExecutionHashForkGraph) SetNextEpochState(common.Hash, *state.CachingBeaconState) {
+}
+
 func (g *getFinalizedExecutionHashForkGraph) GetHeader(blockRoot common.Hash) (*cltypes.BeaconBlockHeader, bool) {
+	g.getStateMu.Lock()
+	g.getHeaderCalls++
+	g.getStateMu.Unlock()
 	header := g.headers[blockRoot]
 	return header, header != nil
 }
 
 func (g *getFinalizedExecutionHashForkGraph) GetBlock(blockRoot common.Hash) (*cltypes.SignedBeaconBlock, bool) {
+	g.getStateMu.Lock()
+	g.getBlockCalls++
+	g.getStateMu.Unlock()
 	block := g.blocks[blockRoot]
 	return block, block != nil
 }
@@ -1764,6 +2045,12 @@ func (g *getFinalizedExecutionHashForkGraph) stateRoots() []common.Hash {
 	g.getStateMu.Lock()
 	defer g.getStateMu.Unlock()
 	return slices.Clone(g.getStateRoots)
+}
+
+func (g *getFinalizedExecutionHashForkGraph) forkGraphCalls() (int, int) {
+	g.getStateMu.Lock()
+	defer g.getStateMu.Unlock()
+	return g.getHeaderCalls, g.getBlockCalls
 }
 
 func (g *getFinalizedExecutionHashForkGraph) GetCurrentJustifiedCheckpoint(common.Hash) (solid.Checkpoint, bool) {
@@ -1821,6 +2108,13 @@ func (g *getFinalizedExecutionHashForkGraph) GetLightClientBootstrap(common.Hash
 	panic("not used")
 }
 
+func (g *getFinalizedExecutionHashForkGraph) NewestLightClientFinalityUpdate() *cltypes.LightClientUpdate {
+	if g.addChainSegmentCalled {
+		return g.afterFinalityUpdate
+	}
+	return nil
+}
+
 func (g *getFinalizedExecutionHashForkGraph) NewestLightClientUpdate() *cltypes.LightClientUpdate {
 	if g.addChainSegmentCalled {
 		return g.afterUpdate
@@ -1828,8 +2122,9 @@ func (g *getFinalizedExecutionHashForkGraph) NewestLightClientUpdate() *cltypes.
 	return g.beforeUpdate
 }
 
-func (g *getFinalizedExecutionHashForkGraph) GetLightClientUpdate(uint64) (*cltypes.LightClientUpdate, bool) {
-	panic("not used")
+func (g *getFinalizedExecutionHashForkGraph) GetLightClientUpdates(_, _ uint64, head common.Hash) []*cltypes.LightClientUpdate {
+	g.lightClientHeads = append(g.lightClientHeads, head)
+	return nil
 }
 
 func (g *getFinalizedExecutionHashForkGraph) GetBalances(common.Hash) (solid.Uint64ListSSZ, error) {

@@ -60,9 +60,10 @@ import (
 )
 
 const (
-	minBlobBundleCacheSize             = 48
-	maxPendingBuilderPayloads          = 4
-	maxExecutionPayloadEnvelopeRetries = 1024
+	minBlobBundleCacheSize                = 48
+	maxPendingBuilderPayloads             = 4
+	maxExecutionPayloadEnvelopeRetries    = 1024
+	maxExecutionPayloadEnvelopeBroadcasts = 4096
 )
 
 // BlobBundle holds a blob with its commitment and KZG proofs: one blob proof before Fulu, one proof
@@ -198,8 +199,9 @@ type executionPayloadEnvelopeGossipKey struct {
 }
 
 type executionPayloadEnvelopeRetry struct {
-	EnvelopeRoot   [32]byte
-	GossipRequired bool
+	EnvelopeRoot     [32]byte
+	GossipRequired   bool
+	ContentsRequired bool
 }
 
 type ApiHandler struct {
@@ -243,19 +245,20 @@ type ApiHandler struct {
 	validatorParams *validator_params.ValidatorParams
 	// unregisteredProposers remembers which proposers have already been warned about, so the
 	// warning is once per proposer rather than once per proposal.
-	unregisteredProposers              *lru.Cache[uint64, struct{}]
-	blobBundles                        blobBundleCache // Keep recent bundled blobs from the execution layer.
-	engine                             execution_client.ExecutionEngine
-	elClientVersion                    atomic.Pointer[engine_types.ClientVersionV1] // Cached execution client version for default graffiti.
-	elClientVersionFetching            atomic.Bool                                  // Guards a single in-flight background elClientVersion fetch.
-	justifiedDescent                   atomic.Pointer[justifiedDescent]             // Last resolved descendsFromJustified answer.
-	elIdentificationLogOnce            sync.Once                                    // Logs the resolved default graffiti identification exactly once.
-	graffitiTruncatedWarnOnce          sync.Once                                    // Warns that graffiti was truncated exactly once.
-	syncMessagePool                    sync_contribution_pool.SyncContributionPool
-	committeeSub                       committee_subscription.CommitteeSubscribe
-	attestationProducer                attestation_producer.AttestationDataProducer
-	slotWaitedForAttestationProduction *lru.Cache[uint64, struct{}]
-	aggregatePool                      aggregation.AggregationPool
+	unregisteredProposers     *lru.Cache[uint64, struct{}]
+	blobBundles               blobBundleCache // Keep recent bundled blobs from the execution layer.
+	engine                    execution_client.ExecutionEngine
+	elClientVersion           atomic.Pointer[engine_types.ClientVersionV1] // Cached execution client version for default graffiti.
+	elClientVersionFetching   atomic.Bool                                  // Guards a single in-flight background elClientVersion fetch.
+	justifiedDescent          atomic.Pointer[justifiedDescent]             // Last resolved descendsFromJustified answer.
+	elIdentificationLogOnce   sync.Once                                    // Logs the resolved default graffiti identification exactly once.
+	graffitiTruncatedWarnOnce sync.Once                                    // Warns that graffiti was truncated exactly once.
+	syncMessagePool           sync_contribution_pool.SyncContributionPool
+	committeeSub              committee_subscription.CommitteeSubscribe
+	attestationProducer       attestation_producer.AttestationDataProducer
+	attestationDataImportWait time.Duration
+	attestationDataWaitedSlot atomic.Uint64
+	aggregatePool             aggregation.AggregationPool
 
 	// services
 	syncCommitteeMessagesService     services.SyncCommitteeMessagesService
@@ -287,6 +290,8 @@ type ApiHandler struct {
 	executionPayloadEnvelopeRetries         *lru.Cache[executionPayloadEnvelopeGossipKey, executionPayloadEnvelopeRetry]
 	executionPayloadEnvelopeRetriesInFlight map[executionPayloadEnvelopeGossipKey]struct{}
 	builderRoutes                           *builderRouteStore
+	// Keyed by envelope root: it covers the block root and builder index, so a second envelope for the same block and builder does not hide the first.
+	executionPayloadEnvelopeBroadcasts *lru.Cache[[32]byte, struct{}]
 }
 
 func NewApiHandler(
@@ -344,10 +349,6 @@ func NewApiHandler(
 	if err != nil {
 		panic(err)
 	}
-	slotWaitedForAttestationProduction, err := lru.New[uint64, struct{}]("slotWaitedForAttestationProduction", 1024)
-	if err != nil {
-		panic(err)
-	}
 	selfBuildPayloads, err := lru.New[common.Hash, *selfBuildPayload]("selfBuildPayloads", 4)
 	if err != nil {
 		panic(err)
@@ -360,62 +361,67 @@ func NewApiHandler(
 	if err != nil {
 		panic(err)
 	}
+	executionPayloadEnvelopeBroadcasts, err := lru.New[[32]byte, struct{}]("executionPayloadEnvelopeBroadcasts", maxExecutionPayloadEnvelopeBroadcasts)
+	if err != nil {
+		panic(err)
+	}
 	builderRoutes := newBuilderRouteStore(builderRouteCapacity, builderRouteTTL, time.Now)
 	parentExecutionRequests := commonlru.NewCache[common.Hash, *cltypes.ExecutionRequests](maxCachedParentExecutionRequests)
 	return &ApiHandler{
-		logger:                             logger,
-		validatorParams:                    validatorParams,
-		o:                                  sync.Once{},
-		netConfig:                          netConfig,
-		ethClock:                           ethClock,
-		beaconChainCfg:                     beaconChainConfig,
-		indiciesDB:                         indiciesDB,
-		forkchoiceStore:                    forkchoiceStore,
-		operationsPool:                     operationsPool,
-		blockReader:                        rcsn,
-		syncedData:                         syncedData,
-		stateReader:                        stateReader,
-		caplinStateSnapshots:               caplinStateSnapshots,
-		peerDas:                            peerDas,
-		slotWaitedForAttestationProduction: slotWaitedForAttestationProduction,
-		unregisteredProposers:              unregisteredProposers,
+		logger:                logger,
+		validatorParams:       validatorParams,
+		o:                     sync.Once{},
+		netConfig:             netConfig,
+		ethClock:              ethClock,
+		beaconChainCfg:        beaconChainConfig,
+		indiciesDB:            indiciesDB,
+		forkchoiceStore:       forkchoiceStore,
+		operationsPool:        operationsPool,
+		blockReader:           rcsn,
+		syncedData:            syncedData,
+		stateReader:           stateReader,
+		caplinStateSnapshots:  caplinStateSnapshots,
+		peerDas:               peerDas,
+		unregisteredProposers: unregisteredProposers,
 		randaoMixesPool: sync.Pool{New: func() any {
 			return solid.NewHashVector(int(beaconChainConfig.EpochsPerHistoricalVector))
 		}},
-		sentinel:                         sentinel,
-		version:                          version,
-		routerCfg:                        routerCfg,
-		emitters:                         emitters,
-		blobStoage:                       blobStoage,
-		columnStorage:                    columnStorage,
-		caplinSnapshots:                  blobSnapshots,
-		attestationProducer:              attestationProducer,
-		blobBundles:                      blobBundles,
-		engine:                           engine,
-		syncMessagePool:                  syncMessagePool,
-		committeeSub:                     committeeSub,
-		aggregatePool:                    aggregatePool,
-		syncCommitteeMessagesService:     syncCommitteeMessagesService,
-		syncContributionAndProofsService: syncContributionAndProofs,
-		aggregateAndProofsService:        aggregateAndProofs,
-		attestationService:               attestationService,
-		voluntaryExitService:             voluntaryExitService,
-		blsToExecutionChangeService:      blsToExecutionChangeService,
-		proposerSlashingService:          proposerSlashingService,
-		blockService:                     blockService,
-		builderClient:                    builderClient,
-		gossipManager:                    gossipManager,
-		enableMemoizedHeadState:          enableMemoizedHeadState,
-		epbsPool:                         epbsPool,
-		executionPayloadBidService:       executionPayloadBidService,
-		payloadAttestationService:        payloadAttestationService,
-		proposerPreferencesService:       proposerPreferencesService,
-		selfBuildPayloads:                selfBuildPayloads,
-		pendingBuilderPayloads:           newPendingBuilderPayloadStore(maxPendingBuilderPayloads),
-		selfBuildEnvelopes:               selfBuildEnvelopes,
-		executionPayloadEnvelopeRetries:  executionPayloadEnvelopeRetries,
-		builderRoutes:                    builderRoutes,
-		parentExecutionRequests:          parentExecutionRequests,
+		sentinel:                           sentinel,
+		version:                            version,
+		routerCfg:                          routerCfg,
+		emitters:                           emitters,
+		blobStoage:                         blobStoage,
+		columnStorage:                      columnStorage,
+		caplinSnapshots:                    blobSnapshots,
+		attestationProducer:                attestationProducer,
+		attestationDataImportWait:          defaultAttestationDataImportWait,
+		blobBundles:                        blobBundles,
+		engine:                             engine,
+		syncMessagePool:                    syncMessagePool,
+		committeeSub:                       committeeSub,
+		aggregatePool:                      aggregatePool,
+		syncCommitteeMessagesService:       syncCommitteeMessagesService,
+		syncContributionAndProofsService:   syncContributionAndProofs,
+		aggregateAndProofsService:          aggregateAndProofs,
+		attestationService:                 attestationService,
+		voluntaryExitService:               voluntaryExitService,
+		blsToExecutionChangeService:        blsToExecutionChangeService,
+		proposerSlashingService:            proposerSlashingService,
+		blockService:                       blockService,
+		builderClient:                      builderClient,
+		gossipManager:                      gossipManager,
+		enableMemoizedHeadState:            enableMemoizedHeadState,
+		epbsPool:                           epbsPool,
+		executionPayloadBidService:         executionPayloadBidService,
+		payloadAttestationService:          payloadAttestationService,
+		proposerPreferencesService:         proposerPreferencesService,
+		selfBuildPayloads:                  selfBuildPayloads,
+		pendingBuilderPayloads:             newPendingBuilderPayloadStore(maxPendingBuilderPayloads),
+		selfBuildEnvelopes:                 selfBuildEnvelopes,
+		executionPayloadEnvelopeRetries:    executionPayloadEnvelopeRetries,
+		builderRoutes:                      builderRoutes,
+		parentExecutionRequests:            parentExecutionRequests,
+		executionPayloadEnvelopeBroadcasts: executionPayloadEnvelopeBroadcasts,
 	}
 }
 
@@ -439,6 +445,28 @@ func (a *ApiHandler) claimExecutionPayloadEnvelopeRetry(
 	return retry, true, true
 }
 
+func (a *ApiHandler) executionPayloadEnvelopeContentsRequired(key executionPayloadEnvelopeGossipKey, envelope *cltypes.SignedExecutionPayloadEnvelope) bool {
+	a.executionPayloadEnvelopeRetryMu.Lock()
+	retry, ok := a.executionPayloadEnvelopeRetries.Peek(key)
+	a.executionPayloadEnvelopeRetryMu.Unlock()
+	if !ok || !retry.ContentsRequired {
+		return false
+	}
+	envelopeRoot, err := envelope.HashSSZ()
+	return err == nil && envelopeRoot == retry.EnvelopeRoot
+}
+
+func (a *ApiHandler) executionPayloadEnvelopeBroadcastOnly(key executionPayloadEnvelopeGossipKey, envelope *cltypes.SignedExecutionPayloadEnvelope) bool {
+	envelopeRoot, err := envelope.HashSSZ()
+	if err != nil || !a.executionPayloadEnvelopeBroadcasts.Contains(envelopeRoot) {
+		return false
+	}
+	a.executionPayloadEnvelopeRetryMu.Lock()
+	retry, ok := a.executionPayloadEnvelopeRetries.Peek(key)
+	a.executionPayloadEnvelopeRetryMu.Unlock()
+	return !ok || retry.EnvelopeRoot != envelopeRoot
+}
+
 func (a *ApiHandler) finishExecutionPayloadEnvelopeRetry(key executionPayloadEnvelopeGossipKey) {
 	a.executionPayloadEnvelopeRetryMu.Lock()
 	defer a.executionPayloadEnvelopeRetryMu.Unlock()
@@ -449,6 +477,15 @@ func (a *ApiHandler) recordExecutionPayloadEnvelopeRetry(key executionPayloadEnv
 	a.executionPayloadEnvelopeRetryMu.Lock()
 	defer a.executionPayloadEnvelopeRetryMu.Unlock()
 	a.executionPayloadEnvelopeRetries.Add(key, retry)
+}
+
+func (a *ApiHandler) clearExecutionPayloadEnvelopeContentsRequired(key executionPayloadEnvelopeGossipKey) {
+	a.executionPayloadEnvelopeRetryMu.Lock()
+	defer a.executionPayloadEnvelopeRetryMu.Unlock()
+	if retry, ok := a.executionPayloadEnvelopeRetries.Peek(key); ok && retry.ContentsRequired {
+		retry.ContentsRequired = false
+		a.executionPayloadEnvelopeRetries.Add(key, retry)
+	}
 }
 
 func (a *ApiHandler) clearExecutionPayloadEnvelopeRetry(key executionPayloadEnvelopeGossipKey) {
@@ -508,7 +545,7 @@ func (a *ApiHandler) init() {
 			}
 			if a.routerCfg.Beacon {
 				r.Route("/beacon", func(r chi.Router) {
-					if a.routerCfg.Builder {
+					if a.builderRelayEnabled() {
 						r.Post("/blinded_blocks", beaconhttp.HandleEndpointFunc(a.PostEthV1BlindedBlocks))
 					}
 					r.Get("/blobs/{block_id}", beaconhttp.HandleEndpointFunc(a.GetEthV1BeaconBlobs))
@@ -613,7 +650,7 @@ func (a *ApiHandler) init() {
 					r.Get("/execution_payload_envelope/{slot}/{builder_index}", beaconhttp.HandleEndpointFunc(a.GetEthV1ValidatorExecutionPayloadEnvelope))
 					r.Get("/execution_payload_envelopes/{slot}/{beacon_block_root}", beaconhttp.HandleEndpointFunc(a.GetEthV1ValidatorExecutionPayloadEnvelopeByBlockRoot))
 					r.Get("/execution_payload_envelopes/{slot}", beaconhttp.HandleEndpointFunc(a.GetEthV1ValidatorExecutionPayloadEnvelopeBySlot))
-					if a.routerCfg.Builder {
+					if a.builderRelayEnabled() {
 						r.Post("/register_validator", beaconhttp.HandleEndpointFunc(a.PostEthV1BuilderRegisterValidator))
 					}
 				})
@@ -641,7 +678,7 @@ func (a *ApiHandler) init() {
 						r.Get("/attester_slashings", beaconhttp.HandleEndpointFunc(a.GetEthV1BeaconPoolAttesterSlashings)) // reuse
 						r.Post("/attester_slashings", a.PostEthV1BeaconPoolAttesterSlashings)                              // resue
 					})
-					if a.routerCfg.Builder {
+					if a.builderRelayEnabled() {
 						r.Post("/blinded_blocks", beaconhttp.HandleEndpointFunc(a.PostEthV2BlindedBlocks))
 					}
 				})
@@ -670,6 +707,10 @@ func (a *ApiHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		a.init()
 	})
 	a.mux.ServeHTTP(w, r)
+}
+
+func (a *ApiHandler) builderRelayEnabled() bool {
+	return a.routerCfg.Builder && a.builderClient != nil && a.builderClient.RelayConfigured()
 }
 
 func (a *ApiHandler) getStateHead() (common.Hash, uint64, int, error) {

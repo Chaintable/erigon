@@ -29,6 +29,7 @@ import (
 	"math/big"
 	"math/bits"
 	"net/http"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -38,6 +39,7 @@ import (
 
 	goethkzg "github.com/crate-crypto/go-eth-kzg"
 	"github.com/go-chi/chi/v5"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/erigontech/erigon/cl/abstract"
 	"github.com/erigontech/erigon/cl/beacon/beaconhttp"
@@ -100,8 +102,8 @@ const (
 const (
 	minPayloadPollingWindow     = 100 * time.Millisecond
 	builderHandoffRetryInterval = 500 * time.Millisecond
-	// A published block is normally stored within one block service tick (50 ms) plus OnBlock; the bound only caps
-	// how long a stalled store can delay the block's data columns.
+	// A published block is normally imported within one block service tick (50 ms) plus OnBlock; the bound caps how
+	// long a stalled store can delay the block's data columns and a publish response without the integration wait.
 	publishedBlockStoreWaitBeforeColumns = time.Second
 )
 
@@ -348,8 +350,8 @@ func preparedGrabOffset(due time.Duration) time.Duration {
 	return due - payloadPublicationMargin(due)
 }
 
-// Gloas preparation stands down on a FULL parent, the usual case, so the builder starts only with the
-// proposal; collecting at a third of the window leaves two thirds for the block to reach attesters.
+// The unprepared Gloas collection target leaves two thirds of the attestation window for
+// block processing, signing, and gossip.
 func unpreparedGrabOffset(due time.Duration, stateVersion clparams.StateVersion) time.Duration {
 	if stateVersion.AfterOrEqual(clparams.GloasVersion) {
 		return due / gloasPayloadCollectionDivisor
@@ -605,30 +607,34 @@ func attemptsMade(attempts int) string {
 	return fmt.Sprintf("%d attempts", attempts)
 }
 
-func (a *ApiHandler) waitForHeadSlot(slot uint64) {
-	stopCh := time.After(time.Second)
+const (
+	defaultAttestationDataImportWait  = time.Second
+	attestationDataImportPollInterval = 5 * time.Millisecond
+)
+
+func (a *ApiHandler) waitForAttestationHead(ctx context.Context, slot uint64) (forkchoice.ForkChoiceNode, bool) {
+	waitedSlot := slot + 1
+	deadline := time.Now().Add(a.attestationDataImportWait)
 	for {
-		headSlot := a.syncedData.HeadSlot()
-		if headSlot >= slot || a.slotWaitedForAttestationProduction.Contains(slot) {
-			return
+		waitSpent := a.attestationDataWaitedSlot.Load() == waitedSlot
+		if !waitSpent && !time.Now().Before(deadline) {
+			a.attestationDataWaitedSlot.Store(waitedSlot)
+			waitSpent = true
 		}
-		_, ok, err := a.attestationProducer.CachedAttestationData(slot)
-		if err != nil {
-			log.Warn("Failed to get attestation data", "err", err)
+		importInProgress := a.forkchoiceStore.HighestSeen() < slot && a.forkchoiceStore.PayloadImportInProgress(slot)
+		if !importInProgress || waitSpent {
+			if head, ok := a.forkchoiceStore.TryGetHeadNode(); ok {
+				return head, true
+			}
+			if waitSpent {
+				return forkchoice.ForkChoiceNode{}, false
+			}
 		}
-		if ok {
-			a.slotWaitedForAttestationProduction.Add(slot, struct{}{})
-			return
-		}
-
-		time.Sleep(1 * time.Millisecond)
 		select {
-		case <-stopCh:
-			a.slotWaitedForAttestationProduction.Add(slot, struct{}{})
-			return
-		default:
+		case <-ctx.Done():
+			return forkchoice.ForkChoiceNode{}, false
+		case <-time.After(attestationDataImportPollInterval):
 		}
-
 	}
 }
 
@@ -645,12 +651,6 @@ func (a *ApiHandler) GetEthV1ValidatorAttestationData(
 	}
 	start := time.Now()
 
-	tx, err := a.indiciesDB.BeginRo(r.Context())
-	if err != nil {
-		return nil, err
-	}
-	defer tx.Rollback()
-
 	committeeIndex, err := beaconhttp.Uint64FromQueryParams(r, "committee_index")
 	if err != nil {
 		return nil, beaconhttp.NewEndpointError(http.StatusBadRequest, err)
@@ -664,12 +664,23 @@ func (a *ApiHandler) GetEthV1ValidatorAttestationData(
 	if *slot > a.ethClock.GetCurrentSlot() {
 		return nil, beaconhttp.NewEndpointError(http.StatusBadRequest, errors.New("slot is in the future"))
 	}
+	head, haveHead := a.waitForAttestationHead(r.Context(), *slot)
+	if err := r.Context().Err(); err != nil {
+		return nil, err
+	}
 
-	a.waitForHeadSlot(*slot)
-
-	attestationData, ok, err := a.attestationProducer.CachedAttestationData(*slot)
-	if err != nil {
-		log.Warn("Failed to get attestation data", "err", err)
+	var attestationData solid.AttestationData
+	var ok, cached bool
+	if haveHead {
+		attestationData, ok = a.forkchoiceStore.AttestationData(head.Root, *slot)
+	}
+	forkChoiceData := ok
+	if !ok {
+		attestationData, ok, err = a.attestationProducer.CachedAttestationData(*slot)
+		cached = ok
+		if err != nil {
+			log.Warn("Failed to get attestation data", "err", err)
+		}
 	}
 
 	defer func() {
@@ -683,7 +694,7 @@ func (a *ApiHandler) GetEthV1ValidatorAttestationData(
 			a.beaconChainCfg.SlotsPerEpoch, 64,
 		)
 		a.logger.Debug("Produced Attestation", "slot", *slot,
-			"committee_index", *committeeIndex, "subnet", subnet, "cached", ok, "beacon_block_root",
+			"committee_index", *committeeIndex, "subnet", subnet, "cached", cached, "beacon_block_root",
 			attestationData.BeaconBlockRoot, "duration", time.Since(start))
 	}()
 
@@ -700,6 +711,11 @@ func (a *ApiHandler) GetEthV1ValidatorAttestationData(
 	}
 
 	if !ok {
+		tx, err := a.indiciesDB.BeginRo(r.Context())
+		if err != nil {
+			return nil, err
+		}
+		defer tx.Rollback()
 		if err := a.viewHeadStateWithIdentity(func(headState *state.CachingBeaconState, headRoot common.Hash, _ uint64) error {
 			attestationData, err = a.attestationProducer.ProduceAndCacheAttestationData(
 				tx,
@@ -725,7 +741,7 @@ func (a *ApiHandler) GetEthV1ValidatorAttestationData(
 	// The cached attestation data has CommitteeIndex=0 (shared across all committees for the same slot), but the VC
 	// expects it to match the requested committee_index. In Gloas the field signals payload presence instead.
 	if clversion.AfterOrEqual(clparams.GloasVersion) {
-		attestationData.CommitteeIndex, err = a.gloasAttestationIndex(*slot, attestationData.BeaconBlockRoot)
+		attestationData.CommitteeIndex, err = a.gloasAttestationIndex(*slot, attestationData.BeaconBlockRoot, head, forkChoiceData)
 		if err != nil {
 			return nil, err
 		}
@@ -745,21 +761,26 @@ func (a *ApiHandler) GetEthV1ValidatorAttestationData(
 // gloasAttestationIndex returns attestation_data.index for Gloas: 0 when the attested block is from the attestation
 // slot, otherwise 1 if the head's chain has the block FULL and 0 if not. A FULL block whose payload is not verified
 // is optimistic, so it gets a 503 instead, as does a fork-choice head that cannot be read.
-func (a *ApiHandler) gloasAttestationIndex(slot uint64, root common.Hash) (uint64, error) {
+func (a *ApiHandler) gloasAttestationIndex(slot uint64, root common.Hash, head forkchoice.ForkChoiceNode, haveHead bool) (uint64, error) {
 	header, ok := a.forkchoiceStore.GetHeader(root)
 	if !ok || header.Slot == slot {
 		return 0, nil
 	}
-	node, _, err := a.forkchoiceStore.GetHeadNode()
-	if err != nil {
-		return 0, beaconhttp.NewEndpointError(http.StatusServiceUnavailable, err)
+	if !haveHead {
+		head, haveHead = a.forkchoiceStore.TryGetHeadNode()
+		if !haveHead {
+			return 0, beaconhttp.NewEndpointError(
+				http.StatusServiceUnavailable,
+				errors.New("fork-choice head unavailable"),
+			)
+		}
 	}
 	// Attestation data is cached per slot, so the served root can be an ancestor of the head; take the payload status
 	// the head's chain gives it.
-	if node.Root != root {
-		node = a.forkchoiceStore.Ancestor(node.Root, header.Slot)
+	if head.Root != root {
+		head = a.forkchoiceStore.Ancestor(head.Root, header.Slot)
 	}
-	if node.Root != root || node.PayloadStatus != cltypes.PayloadStatusFull {
+	if head.Root != root || head.PayloadStatus != cltypes.PayloadStatusFull {
 		return 0, nil
 	}
 	if !a.forkchoiceStore.IsPayloadVerified(root) {
@@ -820,6 +841,9 @@ func (a *ApiHandler) GetEthV3ValidatorBlock(
 				fmt.Errorf("invalid builder_boost_factor: %w", err),
 			)
 		}
+	}
+	if targetSlot < a.ethClock.GetCurrentSlot() {
+		return nil, beaconhttp.NewEndpointError(http.StatusBadRequest, errors.New("cannot produce a block for a historic slot"))
 	}
 	if err := a.refuseLaggingHead(); err != nil {
 		return nil, err
@@ -1145,7 +1169,7 @@ func (a *ApiHandler) produceBlock(
 		ParentRoot:    baseBlockRoot,
 		Cfg:           a.beaconChainCfg,
 	}
-	if builderHeader == nil || !a.routerCfg.Builder || builderErr != nil || stateVersion.AfterOrEqual(clparams.GloasVersion) {
+	if builderHeader == nil || !a.builderRelayEnabled() || builderErr != nil || stateVersion.AfterOrEqual(clparams.GloasVersion) {
 		// Gloas compares P2P and configured builder bids against the local value.
 		if stateVersion.AfterOrEqual(clparams.GloasVersion) {
 			selfBid := beaconBody.SignedExecutionPayloadBid.Message
@@ -1575,7 +1599,7 @@ func (a *ApiHandler) getBuilderPayload(
 	baseState *state.CachingBeaconState,
 	targetSlot uint64,
 ) (*builder.ExecutionHeader, *big.Int, error) {
-	if !a.routerCfg.Builder || a.builderClient == nil {
+	if !a.builderRelayEnabled() {
 		return nil, nil, errBuilderNotEnabled
 	}
 
@@ -1765,14 +1789,7 @@ func (a *ApiHandler) produceBeaconBody(
 	if payloadSource.parentExecutionRequests != nil {
 		beaconBody.ParentExecutionRequests = payloadSource.parentExecutionRequests
 	}
-	finalizedHash := a.forkchoiceStore.GetFinalizedExecutionHash(baseState.FinalizedCheckpoint().Root)
-	if finalizedHash == (common.Hash{}) {
-		finalizedHash = head
-	}
-	safeHash := a.forkchoiceStore.GetFinalizedExecutionHash(baseState.CurrentJustifiedCheckpoint().Root)
-	if safeHash == (common.Hash{}) {
-		safeHash = head
-	}
+	finalizedHash, safeHash := a.payloadBuildFinalityHashes(baseState, head)
 	proposerIndex, err := baseState.GetBeaconProposerIndexForSlot(targetSlot)
 	if err != nil {
 		return nil, nil, err
@@ -2118,6 +2135,18 @@ func (a *ApiHandler) produceBeaconBody(
 	return beaconBody, executionValue, nil
 }
 
+func (a *ApiHandler) payloadBuildFinalityHashes(baseState *state.CachingBeaconState, parentHash common.Hash) (common.Hash, common.Hash) {
+	finalizedHash := a.forkchoiceStore.GetFinalizedExecutionHash(baseState.FinalizedCheckpoint().Root)
+	if finalizedHash == (common.Hash{}) {
+		finalizedHash = parentHash
+	}
+	safeHash := a.forkchoiceStore.GetFinalizedExecutionHash(baseState.CurrentJustifiedCheckpoint().Root)
+	if safeHash == (common.Hash{}) {
+		safeHash = parentHash
+	}
+	return finalizedHash, safeHash
+}
+
 func (a *ApiHandler) getBlockOperations(s *state.CachingBeaconState, targetSlot uint64) (
 	*solid.ListSSZ[*cltypes.AttesterSlashing],
 	*solid.ListSSZ[*cltypes.ProposerSlashing],
@@ -2301,9 +2330,7 @@ func (a *ApiHandler) postBeaconBlocks(r *http.Request, apiVersion int) (*beaconh
 }
 
 // requestBlobBundles returns the blob bundles for every commitment of a published block, so that a
-// beacon node that did not produce the block can still build its sidecars. Bundles this node already
-// has are taken from its cache; the rest come from the request and are KZG-verified. Nothing is
-// written to the cache, since the block itself is validated only later.
+// beacon node that did not produce the block can still build its sidecars.
 func (a *ApiHandler) requestBlobBundles(block *cltypes.DenebSignedBeaconBlock) (map[common.Bytes48]BlobBundle, error) {
 	if block == nil || block.SignedBlock == nil || block.SignedBlock.Block == nil || block.SignedBlock.Block.Body == nil ||
 		block.Blobs == nil || block.Blobs.Len() == 0 {
@@ -2331,19 +2358,43 @@ func (a *ApiHandler) requestBlobBundles(block *cltypes.DenebSignedBeaconBlock) (
 	if commitments.Len() != block.Blobs.Len() || block.KZGProofs == nil || block.KZGProofs.Len() != block.Blobs.Len()*proofsPerBlob {
 		return nil, errors.New("blobs and kzg_proofs do not match the block's blob commitments")
 	}
-	bundles := make(map[common.Bytes48]BlobBundle, block.Blobs.Len())
+	return a.blobBundlesFor(commitments, block.Blobs, block.KZGProofs, proofsPerBlob, cellProofs)
+}
+
+// blobBundlesFor returns a bundle for every commitment. A bundle this node already has is taken from
+// its cache; the rest come from blobs and proofs and are KZG-verified. Nothing is written to the cache,
+// since the caller accepts the data only later. The callers check that the list lengths agree.
+func (a *ApiHandler) blobBundlesFor(
+	commitments *solid.ListSSZ[*cltypes.KZGCommitment],
+	blobs *solid.ListSSZ[*cltypes.Blob],
+	proofs *solid.ListSSZ[*cltypes.KZGProof],
+	proofsPerBlob int,
+	cellProofs bool,
+) (map[common.Bytes48]BlobBundle, error) {
+	requested := make([]BlobBundle, blobs.Len())
+	for i := range requested {
+		commitment, blob := commitments.Get(i), blobs.Get(i)
+		if commitment == nil || blob == nil {
+			return nil, fmt.Errorf("commitment or blob %d is nil", i)
+		}
+		blobProofs := make([]common.Bytes48, proofsPerBlob)
+		for j := range blobProofs {
+			proof := proofs.Get(i*proofsPerBlob + j)
+			if proof == nil {
+				return nil, fmt.Errorf("proof %d of blob %d is nil", j, i)
+			}
+			blobProofs[j] = common.Bytes48(*proof)
+		}
+		requested[i] = BlobBundle{Commitment: common.Bytes48(*commitment), Blob: blob, KzgProofs: blobProofs}
+	}
+	bundles := make(map[common.Bytes48]BlobBundle, len(requested))
 	var unverified []BlobBundle
-	for i := range block.Blobs.Len() {
-		commitment := common.Bytes48(*commitments.Get(i))
-		if cached, ok := a.blobBundles.Get(commitment); ok && len(cached.KzgProofs) == proofsPerBlob {
-			bundles[commitment] = cached
+	for _, bundle := range requested {
+		if cached, ok := a.blobBundles.Get(bundle.Commitment); ok && len(cached.KzgProofs) == proofsPerBlob && cached.Blob != nil {
+			bundles[bundle.Commitment] = cached
 			continue
 		}
-		proofs := make([]common.Bytes48, proofsPerBlob)
-		for j := range proofs {
-			proofs[j] = common.Bytes48(*block.KZGProofs.Get(i*proofsPerBlob + j))
-		}
-		unverified = append(unverified, BlobBundle{Commitment: commitment, Blob: block.Blobs.Get(i), KzgProofs: proofs})
+		unverified = append(unverified, bundle)
 	}
 	if err := verifyBlobBundles(unverified, cellProofs); err != nil {
 		return nil, fmt.Errorf("invalid blob kzg proofs: %w", err)
@@ -2354,8 +2405,9 @@ func (a *ApiHandler) requestBlobBundles(block *cltypes.DenebSignedBeaconBlock) (
 	return bundles, nil
 }
 
-// verifyBlobBundles checks the bundles' KZG proofs. From Fulu on it also keeps each blob's cells on
-// its bundle, so the column build does not compute them again.
+// verifyBlobBundles checks the bundles' KZG proofs. From Fulu on it verifies one cell-proof batch per
+// blob, the blobs in parallel, and keeps each blob's cells on its bundle, so the column build does not
+// compute them again.
 func verifyBlobBundles(bundles []BlobBundle, cellProofs bool) error {
 	if len(bundles) == 0 {
 		return nil
@@ -2371,26 +2423,36 @@ func verifyBlobBundles(bundles []BlobBundle, cellProofs bool) error {
 		}
 		return kzg.Ctx().VerifyBlobKZGProofBatch(blobs, commitments, proofs)
 	}
-	var (
-		commitments []goethkzg.KZGCommitment
-		cellIndices []uint64
-		cells       []*goethkzg.Cell
-		proofs      []goethkzg.KZGProof
-	)
+	g, ctx := errgroup.WithContext(context.Background())
+	g.SetLimit(runtime.GOMAXPROCS(0))
 	for i := range bundles {
-		blobCells, err := das.ComputeCells(bundles[i].Blob)
-		if err != nil {
-			return err
-		}
-		bundles[i].Cells = blobCells
-		for j := range blobCells {
-			commitments = append(commitments, goethkzg.KZGCommitment(bundles[i].Commitment))
-			cellIndices = append(cellIndices, uint64(j))
-			cells = append(cells, (*goethkzg.Cell)(&blobCells[j]))
-			proofs = append(proofs, goethkzg.KZGProof(bundles[i].KzgProofs[j]))
-		}
+		g.Go(func() error {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			bundle := &bundles[i]
+			blobCells, err := peerdasutils.ComputeCells(bundle.Blob)
+			if err != nil {
+				return err
+			}
+			bundle.Cells = blobCells
+			if len(bundle.KzgProofs) != len(blobCells) {
+				return fmt.Errorf("blob has %d kzg proofs for %d cells", len(bundle.KzgProofs), len(blobCells))
+			}
+			commitments := make([]goethkzg.KZGCommitment, len(blobCells))
+			cellIndices := make([]uint64, len(blobCells))
+			cells := make([]*goethkzg.Cell, len(blobCells))
+			proofs := make([]goethkzg.KZGProof, len(blobCells))
+			for j := range blobCells {
+				commitments[j] = goethkzg.KZGCommitment(bundle.Commitment)
+				cellIndices[j] = uint64(j)
+				cells[j] = (*goethkzg.Cell)(&blobCells[j])
+				proofs[j] = goethkzg.KZGProof(bundle.KzgProofs[j])
+			}
+			return kzg.Ctx().VerifyCellKZGProofBatch(commitments, cellIndices, cells, proofs)
+		})
 	}
-	return kzg.Ctx().VerifyCellKZGProofBatch(commitments, cellIndices, cells, proofs)
+	return g.Wait()
 }
 
 func (a *ApiHandler) forwardPublishedBlockToBuilder(builderURL string, block *cltypes.SignedBeaconBlock) {
@@ -2927,10 +2989,19 @@ func (a *ApiHandler) broadcastBlockWithIntegrationWaitAndPublication(
 		}
 	}
 
+	// The store job writes sidecar fields, so column gossip must not encode the sidecars concurrently.
+	columnsSidecarsSSZ := make([][]byte, len(columnsSidecars))
+	for i, column := range columnsSidecars {
+		if columnsSidecarsSSZ[i], err = column.EncodeSSZ(nil); err != nil {
+			return err
+		}
+	}
+	servable := make(chan struct{})
+	markServable := sync.OnceFunc(func() { close(servable) })
 	store := func(ctx context.Context) error {
 		finishBlockWork := a.payloadPreparationGate.beginBlockWork()
 		defer finishBlockWork()
-		return a.storeBlockAndBlobs(ctx, blk, blobsSidecars, columnsSidecars, validation)
+		return a.storeBlockAndBlobs(ctx, blk, blobsSidecars, columnsSidecars, validation, markServable)
 	}
 	lenBlobs := 0
 	if blk.Version() >= clparams.DenebVersion {
@@ -2977,21 +3048,30 @@ func (a *ApiHandler) broadcastBlockWithIntegrationWaitAndPublication(
 	if blk.Version() >= clparams.FuluVersion && len(columnsSidecars) > 0 {
 		// A Gloas column has no signed block header. Lighthouse requests an unknown block from the column's peer
 		// and penalizes that peer if it cannot serve the block.
+		var storeDone chan struct{}
 		if blk.Version() >= clparams.GloasVersion && job != nil {
 			storeCtx, cancel := context.WithTimeout(ctx, publishedBlockStoreWaitBeforeColumns)
-			_ = job.Wait(storeCtx) // a failed or slow store must not hold back the columns of an already gossiped block
-			cancel()
+			defer cancel()
+			storeDone = make(chan struct{})
+			go func() {
+				defer close(storeDone)
+				_ = job.Wait(storeCtx) // a failed or slow store must not hold back the columns of an already gossiped block
+			}()
+			select {
+			case <-servable:
+			case <-storeDone:
+			}
 		}
-		for _, column := range columnsSidecars {
-			columnSSZ, err := column.EncodeSSZ(nil)
-			if err != nil {
-				a.logger.Error("Failed to encode column sidecar", "err", err)
-				return err
-			}
+		for i, column := range columnsSidecars {
 			subnet := das.ComputeSubnetForDataColumnSidecar(column.Index)
-			if err := a.publishGossip(ctx, gossip.TopicNameDataColumnSidecar(subnet), columnSSZ); err != nil {
+			if err := a.publishGossip(ctx, gossip.TopicNameDataColumnSidecar(subnet), columnsSidecarsSSZ[i]); err != nil {
 				return err
 			}
+		}
+		// A stateful envelope POST checks the custody columns, so without the integration wait the
+		// response still waits for the store job until the deadline.
+		if storeDone != nil && !waitForIntegration {
+			<-storeDone
 		}
 	}
 
@@ -3031,10 +3111,12 @@ func (a *ApiHandler) publishGossip(ctx context.Context, topic string, data []byt
 
 func collectPublishedPayloadData(
 	commitments *solid.ListSSZ[*cltypes.KZGCommitment],
-	isGloas bool,
+	deferMissing bool,
 	lookup func(common.Bytes48) (BlobBundle, bool),
 ) ([]peerdasutils.CellsAndKZGProofs, bool, error) {
 	cellsAndProofs := make([]peerdasutils.CellsAndKZGProofs, 0, commitments.Len())
+	var withoutCells []int
+	var blobsWithoutCells [][]byte
 	for i := 0; i < commitments.Len(); i++ {
 		commitment := commitments.Get(i)
 		if commitment == nil {
@@ -3042,7 +3124,7 @@ func collectPublishedPayloadData(
 		}
 		bundle, ok := lookup(common.Bytes48(*commitment))
 		if !ok {
-			if isGloas {
+			if deferMissing {
 				return nil, true, nil
 			}
 			return nil, false, fmt.Errorf("missing blob bundle for commitment %x", commitment)
@@ -3050,18 +3132,22 @@ func collectPublishedPayloadData(
 		if bundle.Blob == nil {
 			return nil, false, fmt.Errorf("nil blob bundle for commitment %x", commitment)
 		}
-		cells := bundle.Cells
-		if cells == nil {
-			var err error
-			if cells, err = das.ComputeCells(bundle.Blob); err != nil {
-				return nil, false, err
-			}
+		if bundle.Cells == nil {
+			withoutCells = append(withoutCells, i)
+			blobsWithoutCells = append(blobsWithoutCells, bundle.Blob[:])
 		}
 		proofs := make([]cltypes.KZGProof, len(bundle.KzgProofs))
 		for i := range proofs {
 			proofs[i] = cltypes.KZGProof(bundle.KzgProofs[i])
 		}
-		cellsAndProofs = append(cellsAndProofs, peerdasutils.CellsAndKZGProofs{Blobs: cells, Proofs: proofs})
+		cellsAndProofs = append(cellsAndProofs, peerdasutils.CellsAndKZGProofs{Blobs: bundle.Cells, Proofs: proofs})
+	}
+	cells, err := peerdasutils.ComputeBlobsCells(blobsWithoutCells)
+	if err != nil {
+		return nil, false, err
+	}
+	for j, i := range withoutCells {
+		cellsAndProofs[i].Blobs = cells[j]
 	}
 	return cellsAndProofs, false, nil
 }
@@ -3089,6 +3175,7 @@ func (a *ApiHandler) storeBlockAndBlobs(
 	sidecars []*cltypes.BlobSidecar,
 	columnSidecars []*cltypes.DataColumnSidecar,
 	validation BlockPublishingValidation,
+	markServable func(),
 ) error {
 	blockRoot, err := block.Block.HashSSZ()
 	if err != nil {
@@ -3108,10 +3195,6 @@ func (a *ApiHandler) storeBlockAndBlobs(
 	} else if validation != BlockPublishingValidationGossip && block.Block.Slot <= a.forkchoiceStore.FinalizedSlot() {
 		return fmt.Errorf("%w: block is at or below the finalized validation horizon", forkchoice.ErrBlockInvalid)
 	}
-	if err := a.storeDataColumnSidecars(ctx, blockRoot, columnSidecars); err != nil {
-		return fmt.Errorf("%w: %w", errPublishedBlockDataStorage, err)
-	}
-
 	if block.Version() < clparams.FuluVersion {
 		if err := a.blobStoage.WriteBlobSidecars(ctx, blockRoot, sidecars); err != nil {
 			return fmt.Errorf("%w: %w", errPublishedBlockDataStorage, err)
@@ -3143,6 +3226,12 @@ func (a *ApiHandler) storeBlockAndBlobs(
 	}); err != nil {
 		return err
 	}
+	a.emitters.NotifyBlockIndicesChanged()
+	markServable()
+	// Columns are chosen after OnBlock, which can raise the custody group count.
+	if err := a.storeDataColumnSidecars(ctx, block.Block.Slot, blockRoot, columnSidecars); err != nil {
+		return &clservices.AcceptedBlockWriteError{Err: fmt.Errorf("%w: %w", errPublishedBlockDataStorage, err)}
+	}
 
 	headRoot, headSlot, headState, err := a.selectedHeadState(blockRoot)
 	if err != nil {
@@ -3154,10 +3243,10 @@ func (a *ApiHandler) storeBlockAndBlobs(
 	if _, err := a.engine.ForkChoiceUpdate(ctx, finalizedHash, safeHash, a.forkchoiceStore.GetEth1Hash(headRoot), nil, headVersion); err != nil {
 		// Storing the block does not depend on the execution layer acknowledging the head in time,
 		// and the next head sends another update.
-		if !errors.Is(err, execution_client.ErrForkChoiceUpdateTimeout) {
+		if !errors.Is(err, execution_client.ErrForkChoiceUpdateTimeout) && !errors.Is(err, execution_client.ErrForkChoiceUpdateBusy) {
 			return err
 		}
-		log.Debug("BlockProduction: forkchoice update timed out while storing block", "root", headRoot)
+		log.Debug("BlockProduction: forkchoice update deferred while storing block", "root", headRoot, "err", err)
 	}
 
 	if err := a.indiciesDB.View(ctx, func(tx kv.Tx) error {
@@ -3178,24 +3267,47 @@ func rootKeyedSignedBlockReplayMatches(stored, incoming *cltypes.SignedBeaconBlo
 		stored.Version() == incoming.Version() && stored.Signature == incoming.Signature
 }
 
-func (a *ApiHandler) storeDataColumnSidecars(ctx context.Context, blockRoot common.Hash, sidecars []*cltypes.DataColumnSidecar) error {
+func (a *ApiHandler) storeDataColumnSidecars(ctx context.Context, slot uint64, blockRoot common.Hash, sidecars []*cltypes.DataColumnSidecar) error {
 	if len(sidecars) == 0 {
 		return nil
 	}
 	if a.columnStorage == nil {
 		return errors.New("data column storage unavailable")
 	}
+	store := das.ColumnsToStore(a.peerDas)
+	toStore := make([]*cltypes.DataColumnSidecar, 0, len(sidecars))
 	for _, sidecar := range sidecars {
 		if sidecar == nil {
 			return errors.New("nil data column sidecar")
 		}
+		if !store(sidecar.Index) {
+			continue
+		}
 		if sidecar.Index > math.MaxInt64 {
 			return fmt.Errorf("data column index %d exceeds storage range", sidecar.Index)
 		}
+		toStore = append(toStore, sidecar)
+	}
+	return a.writeColumnSidecarsBatched(ctx, slot, blockRoot, toStore)
+}
+
+// writeColumnSidecarsBatched stores the columns in one batch. A failed batch may drop columns it had already
+// fsynced, so the columns are then written one at a time, which keeps every column before the first
+// failing one.
+func (a *ApiHandler) writeColumnSidecarsBatched(ctx context.Context, slot uint64, blockRoot common.Hash, sidecars []*cltypes.DataColumnSidecar) error {
+	if len(sidecars) == 0 {
+		return nil
+	}
+	batchErr := a.columnStorage.WriteColumnSidecarsBatch(ctx, blockRoot, sidecars)
+	if batchErr == nil {
+		return nil
+	}
+	for _, sidecar := range sidecars {
 		if err := a.columnStorage.WriteColumnSidecars(ctx, blockRoot, int64(sidecar.Index), sidecar); err != nil {
-			return err
+			return fmt.Errorf("%w (after a failed batch write: %w)", err, batchErr)
 		}
 	}
+	log.Warn("[Beacon REST] batched data column write failed, the columns were written one at a time", "slot", slot, "blockRoot", blockRoot, "columnCount", len(sidecars), "err", batchErr)
 	return nil
 }
 

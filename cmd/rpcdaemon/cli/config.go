@@ -902,14 +902,10 @@ func newGraphQLHandler(cfg *httpcfg.HttpCfg, graphQLSrv http.Handler, rpcConcurr
 
 func createHandler(cfg *httpcfg.HttpCfg, apiList []rpc.API, httpHandler http.Handler, wsHandler http.Handler, graphQLHandler http.Handler, jwtSecret []byte) (http.Handler, error) {
 	var handler http.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if cfg.GraphQLEnabled && graphql.ProcessGraphQLcheckIfNeeded(graphQLHandler, w, r) {
+		if cfg.GraphQLEnabled && graphQLHandler != nil && graphql.ProcessGraphQLcheckIfNeeded(graphQLHandler, w, r) {
 			return
 		}
 
-		// adding a healthcheck here
-		if health.ProcessHealthcheckIfNeeded(w, r, apiList) {
-			return
-		}
 		if cfg.WebsocketEnabled && wsHandler != nil && isWebsocket(r) {
 			wsHandler.ServeHTTP(w, r)
 			return
@@ -924,6 +920,9 @@ func createHandler(cfg *httpcfg.HttpCfg, apiList []rpc.API, httpHandler http.Han
 			return
 		}
 
+		if health.ProcessHealthcheckIfNeeded(w, r, apiList) {
+			return
+		}
 		httpHandler.ServeHTTP(w, r)
 	})
 
@@ -938,6 +937,7 @@ func createEngineListener(cfg *httpcfg.HttpCfg, engineApi []rpc.API, logger log.
 	engineHttpEndpoint := fmt.Sprintf("tcp://%s:%d", cfg.AuthRpcHTTPListenAddress, cfg.AuthRpcPort)
 
 	engineSrv := rpc.NewServer(cfg.RpcBatchConcurrency, cfg.TraceRequests, cfg.DebugSingleRequest, true, logger, cfg.RPCSlowLogThreshold)
+	engineSrv.SetBatchLimit(cfg.BatchLimit)
 	engineSrv.SetSubscriptionLimit(cfg.SubscriptionLimit)
 
 	if err := node.RegisterApisFromWhitelist(engineApi, nil, engineSrv, true, logger); err != nil {
@@ -957,9 +957,7 @@ func createEngineListener(cfg *httpcfg.HttpCfg, engineApi []rpc.API, logger log.
 	// latency-critical, and gzip costs far more time than the transfer it saves.
 	engineHttpHandler := node.NewHTTPHandlerStack(engineSrv, nil /* authCors */, cfg.AuthRpcVirtualHost, false /* compression */, 0, false)
 
-	graphQLHandler := graphql.CreateHandler(engineApi)
-
-	engineApiHandler, err := createHandler(cfg, engineApi, engineHttpHandler, wsHandler, graphQLHandler, jwtSecret)
+	engineApiHandler, err := createHandler(cfg, engineApi, engineHttpHandler, wsHandler, nil, jwtSecret)
 	if err != nil {
 		return nil, nil, "", err
 	}

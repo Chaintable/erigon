@@ -11,6 +11,7 @@ import (
 	"github.com/erigontech/erigon/cl/clparams"
 	"github.com/erigontech/erigon/cl/cltypes"
 	"github.com/erigontech/erigon/cl/cltypes/solid"
+	"github.com/erigontech/erigon/cl/persistence/beacon_indicies"
 	"github.com/erigontech/erigon/cl/phase1/core/state"
 	"github.com/erigontech/erigon/cl/phase1/execution_client"
 	"github.com/erigontech/erigon/cl/phase1/forkchoice"
@@ -20,6 +21,7 @@ import (
 	"github.com/erigontech/erigon/common"
 	"github.com/erigontech/erigon/common/hexutil"
 	"github.com/erigontech/erigon/common/log/v3"
+	"github.com/erigontech/erigon/db/kv"
 )
 
 const (
@@ -33,6 +35,7 @@ const (
 	chainTipRequestRetryInterval = 300 * time.Millisecond
 	chainTipNoPeersRetryInterval = 2 * time.Second
 	chainTipPollInterval         = time.Second
+	chainTipPresenceInterval     = 20 * time.Millisecond
 )
 
 func gloasVersionedHashes(blobCommitments *solid.ListSSZ[*cltypes.KZGCommitment]) ([]common.Hash, error) {
@@ -120,6 +123,11 @@ func waitForExecutionEngineToBeFinished(ctx context.Context, cfg *Cfg) (ready bo
 		}
 	}
 }
+
+const (
+	ancestorLookupWindow      = 64
+	maxAncestorLookupRequests = 4
+)
 
 // fetchBlocksFromReqResp retrieves blocks starting from a specified block number and continues for a given count.
 // It sends a request to fetch the blocks, verifies the associated blobs, and inserts them into the blob store.
@@ -218,20 +226,29 @@ func listenToIncomingBlocksUntilANewBlockIsReceived(ctx context.Context, logger 
 	logTicker := time.NewTicker(30 * time.Second)
 	defer logTicker.Stop()
 
-	// Timer to check block presence every 20 milliseconds
-	presenceTicker := time.NewTicker(20 * time.Millisecond)
+	presenceTicker := time.NewTicker(chainTipPresenceInterval)
 	defer presenceTicker.Stop()
 
 	// Map to keep track of seen block roots
 	seenBlockRoots := make(map[common.Hash]struct{})
 	// Why a block was not imported, so its children report the cause instead of a missing parent.
 	rejected := make(map[common.Hash]error)
+	// An index commit wakes the loop, which returns once the highest seen block is indexed.
+	indicesChanged := cfg.emitter.BlockIndicesChanged()
+	if highestSeenBlockIndexed(ctx, cfg, args.targetSlot) {
+		return nil
+	}
 MainLoop:
 	for {
 		select {
 		case <-presenceTicker.C:
 			// Check if the highest seen block is greater than or equal to the target slot
 			if cfg.forkChoice.HighestSeen() >= args.targetSlot {
+				break MainLoop
+			}
+		case <-indicesChanged:
+			indicesChanged = cfg.emitter.BlockIndicesChanged()
+			if highestSeenBlockIndexed(ctx, cfg, args.targetSlot) {
 				break MainLoop
 			}
 		case <-ctx.Done():
@@ -244,7 +261,7 @@ MainLoop:
 			if blocks == nil {
 				continue
 			}
-			if processChainTipBatch(ctx, cfg, args, blocks.Data, seenBlockRoots, rejected) {
+			if processChainTipBatch(ctx, cfg, args, withMissingAncestors(ctx, cfg, blocks, rejected), seenBlockRoots, rejected) {
 				break MainLoop
 			}
 		case <-logTicker.C:
@@ -255,16 +272,139 @@ MainLoop:
 	return nil
 }
 
+func highestSeenBlockIndexed(ctx context.Context, cfg *Cfg, targetSlot uint64) bool {
+	if cfg.forkChoice.HighestSeen() < targetSlot {
+		return false
+	}
+	root := cfg.forkChoice.HighestSeenRoot()
+	var slot *uint64
+	err := cfg.indiciesDB.View(ctx, func(tx kv.Tx) (err error) {
+		slot, err = beacon_indicies.ReadBlockSlotByBlockRoot(tx, root)
+		return err
+	})
+	return err == nil && slot != nil && *slot >= targetSlot
+}
+
+// withMissingAncestors puts the ancestors of a batch's first block with an unknown parent before the
+// batch. The peer that served the batch has them on its chain, so it is the one asked.
+func withMissingAncestors(ctx context.Context, cfg *Cfg, batch *peers.PeeredObject[[]*cltypes.SignedBeaconBlock], rejected map[common.Hash]error) []*cltypes.SignedBeaconBlock {
+	if cfg.rpc == nil || batch.Peer == "" {
+		return batch.Data
+	}
+	orphan := firstBlockWithMissingParent(cfg, batch.Data, rejected)
+	if orphan == nil || cfg.ethClock.GetCurrentSlot() == cfg.ancestorLookupFailedSlot {
+		return batch.Data
+	}
+	finalizedStart := cfg.forkChoice.FinalizedCheckpoint().Epoch * cfg.beaconCfg.SlotsPerEpoch
+	start := max(max(orphan.Block.Slot, ancestorLookupWindow)-ancestorLookupWindow, finalizedStart+1, cfg.forkChoice.AnchorSlot()+1)
+	if start >= orphan.Block.Slot {
+		return batch.Data
+	}
+	// Bound each lookup to half a slot so the loop can still react to the gossip block.
+	ctx, cancel := context.WithTimeout(ctx, time.Duration(cfg.beaconCfg.SecondsPerSlot)*time.Second/2)
+	defer cancel()
+	ancestors, err := fetchLinkedAncestors(ctx, cfg, batch.Peer, orphan, start)
+	if err != nil {
+		log.Debug("[chainTipSync] ancestor lookup failed", "peer", batch.Peer, "startSlot", start, "orphanSlot", orphan.Block.Slot, "err", err)
+		cfg.ancestorLookupFailedSlot = cfg.ethClock.GetCurrentSlot()
+		return batch.Data
+	}
+	return append(ancestors, batch.Data...)
+}
+
+// fetchLinkedAncestors asks the peer for the slots from start below the orphan until what it
+// returned links the orphan's parent to a known block.
+func fetchLinkedAncestors(ctx context.Context, cfg *Cfg, peer string, orphan *cltypes.SignedBeaconBlock, start uint64) ([]*cltypes.SignedBeaconBlock, error) {
+	var fetched []*cltypes.SignedBeaconBlock
+	next, end := start, orphan.Block.Slot
+	for requests := 0; next < end && requests < maxAncestorLookupRequests; requests++ {
+		blocks, err := cfg.rpc.SendBeaconBlocksByRangeReqToPeer(ctx, peer, next, end-next)
+		switch {
+		case err != nil:
+			return nil, err
+		case len(blocks) == 0:
+			return nil, fmt.Errorf("empty response, blocks fetched before: %d", len(fetched))
+		case !slotsIncreasingWithin(blocks, next, end):
+			return nil, errors.New("response slots out of range or not increasing")
+		}
+		fetched = append(fetched, blocks...)
+		if linked, ok := linkedAncestors(cfg, fetched, orphan.Block.ParentRoot); ok {
+			return linked, nil
+		}
+		next = blocks[len(blocks)-1].Block.Slot + 1
+	}
+	if next < end {
+		return nil, fmt.Errorf("request cap of %d reached", maxAncestorLookupRequests)
+	}
+	return nil, errors.New("window does not link the orphan to a known block")
+}
+
+func slotsIncreasingWithin(blocks []*cltypes.SignedBeaconBlock, from, to uint64) bool {
+	for i, block := range blocks {
+		if block.Block.Slot < from || block.Block.Slot >= to || i > 0 && block.Block.Slot <= blocks[i-1].Block.Slot {
+			return false
+		}
+	}
+	return true
+}
+
+// linkedAncestors returns the blocks that chain by parent root from missing down to a block fork
+// choice knows, oldest first.
+func linkedAncestors(cfg *Cfg, blocks []*cltypes.SignedBeaconBlock, missing common.Hash) ([]*cltypes.SignedBeaconBlock, bool) {
+	byRoot := make(map[common.Hash]*cltypes.SignedBeaconBlock, len(blocks))
+	for _, block := range blocks {
+		root, _ := block.Block.HashSSZ()
+		byRoot[root] = block
+	}
+	var linked []*cltypes.SignedBeaconBlock
+	for root := missing; ; {
+		if _, known := cfg.forkChoice.GetHeader(root); known {
+			slices.Reverse(linked)
+			return linked, true
+		}
+		block, ok := byRoot[root]
+		if !ok {
+			return nil, false
+		}
+		linked = append(linked, block)
+		root = block.Block.ParentRoot
+	}
+}
+
+// firstBlockWithMissingParent returns the first block whose parent is neither known, in the
+// batch, nor rejected for a cause of its own.
+func firstBlockWithMissingParent(cfg *Cfg, blocks []*cltypes.SignedBeaconBlock, rejected map[common.Hash]error) *cltypes.SignedBeaconBlock {
+	inBatch := make(map[common.Hash]struct{}, len(blocks))
+	for _, block := range blocks {
+		root, _ := block.Block.HashSSZ()
+		inBatch[root] = struct{}{}
+	}
+	for _, block := range blocks {
+		parentRoot := block.Block.ParentRoot
+		if _, ok := inBatch[parentRoot]; ok || rejected[parentRoot] != nil {
+			continue
+		}
+		if _, ok := cfg.forkChoice.GetHeader(parentRoot); !ok {
+			return block
+		}
+	}
+	return nil
+}
+
 func processChainTipBatch(ctx context.Context, cfg *Cfg, args Args, blocks []*cltypes.SignedBeaconBlock, seenBlockRoots map[common.Hash]struct{}, rejected map[common.Hash]error) bool {
 	// [GLOAS] Batch-determine and fetch parent envelopes before processing blocks.
 	envelopeRoots, batchBlockByRoot := determineParentEnvelopeRoots(cfg, blocks)
-	envelopes, storedEnvelopeRoots := fetchParentEnvelopes(ctx, cfg, envelopeRoots)
 	parentBlockByRoot := func(root common.Hash) *cltypes.SignedBeaconBlock {
 		if parentBlock, ok := cfg.forkChoice.GetBlock(root); ok {
 			return parentBlock
 		}
 		return batchBlockByRoot[root]
 	}
+	validateEnvelope := network.NewEnvelopeBlockValidator(cfg.beaconCfg, func(root common.Hash) (*cltypes.SignedBeaconBlock, bool) {
+		block := parentBlockByRoot(root)
+		return block, block != nil
+	})
+	envelopes, storedEnvelopeRoots := fetchParentEnvelopes(ctx, cfg, envelopeRoots, validateEnvelope)
 	storedReplayRoots := storedParentReplayRoots(
 		blocks,
 		args.targetSlot,
@@ -285,6 +425,8 @@ func processChainTipBatch(ctx context.Context, cfg *Cfg, args Args, blocks []*cl
 		remaining: len(storedReplayRoots),
 		results:   make(map[common.Hash]error),
 	}
+	var imported importedSlots
+	defer imported.requestCustodyBackfill(cfg)
 
 	for _, block := range blocks {
 		blockRoot, _ := block.Block.HashSSZ() // Ignoring error as block would not process if HashSSZ failed
@@ -322,6 +464,9 @@ func processChainTipBatch(ctx context.Context, cfg *Cfg, args Args, blocks []*cl
 					log.Debug("[chainTipSync] failed to apply parent envelope", "slot", block.Block.Slot, "err", envErr)
 				}
 				parentBlock := parentBlockByRoot(parentRoot)
+				if parentBlock != nil {
+					imported.add(parentBlock.Block.Slot)
+				}
 				if wasStored && parentEnvelopeRequired(block, parentBlock) {
 					if reason := payloadReplay.rejection(ctx, cfg, cfg.forkChoice, parentRoot, env, envErr); reason != nil {
 						rejectChainTipBlock(ctx, cfg, rejected, block, blockRoot, "parent payload not accepted", reason)
@@ -331,7 +476,7 @@ func processChainTipBatch(ctx context.Context, cfg *Cfg, args Args, blocks []*cl
 			}
 		}
 
-		// Process the block - DA can be downloaded later if we are behind (see blobHistoryDownloader)
+		// Process the block without its data; the deferred requestCustodyBackfill fetches it.
 		if err := processBlock(ctx, cfg, cfg.indiciesDB, block, true, true, false); err != nil {
 			if parentEnvelopeUnavailable(cfg, block, envelopes, parentBlockByRoot) {
 				rejectChainTipBlock(ctx, cfg, rejected, block, blockRoot, errParentEnvelopeUnavailable.Error(), errParentEnvelopeUnavailable)
@@ -344,6 +489,7 @@ func processChainTipBatch(ctx context.Context, cfg *Cfg, args Args, blocks []*cl
 			continue
 		}
 
+		imported.add(block.Block.Slot)
 		delete(rejected, blockRoot)
 		seenBlockRoots[blockRoot] = struct{}{}
 		if block.Block.Slot >= args.targetSlot {
@@ -353,9 +499,33 @@ func processChainTipBatch(ctx context.Context, cfg *Cfg, args Args, blocks []*cl
 	return false
 }
 
+// importedSlots is the slot range of the blocks a chain tip batch imported and of the parents whose
+// envelopes it applied or found applied.
+type importedSlots struct {
+	from, to uint64
+	any      bool
+}
+
+func (s *importedSlots) add(slot uint64) {
+	if !s.any {
+		s.from, s.to, s.any = slot, slot, true
+		return
+	}
+	s.from, s.to = min(s.from, slot), max(s.to, slot)
+}
+
+// requestCustodyBackfill asks for the custody columns of what the batch imported: it skips their
+// data availability check, and the blob history downloader that would fetch them later runs only
+// on nodes that backfill blobs.
+func (s *importedSlots) requestCustodyBackfill(cfg *Cfg) {
+	if s.any && cfg.peerDas != nil {
+		cfg.peerDas.BackfillCustodyColumns(s.from, s.to)
+	}
+}
+
 // fetchAndApplyEnvelopes fetches missing execution payload envelopes from peers and applies them.
 func fetchAndApplyEnvelopes(ctx context.Context, cfg *Cfg, roots [][32]byte) {
-	envelopes, err := network.RequestEnvelopesFrantically(ctx, cfg.rpc, roots)
+	envelopes, err := network.RequestEnvelopesFrantically(ctx, cfg.rpc, roots, network.NewEnvelopeBlockValidator(cfg.beaconCfg, cfg.forkChoice.GetBlock), nil)
 	if err != nil {
 		log.Debug("[chainTipSync] failed to request GLOAS envelopes", "err", err)
 		return
@@ -437,7 +607,7 @@ func parentEnvelopeNeedsRecovery(child, parent *cltypes.SignedBeaconBlock, store
 
 // fetchParentEnvelopes batch-fetches execution payload envelopes for the given roots.
 // It retries until all envelopes are obtained or the context is cancelled.
-func fetchParentEnvelopes(ctx context.Context, cfg *Cfg, roots [][32]byte) (map[common.Hash]*cltypes.SignedExecutionPayloadEnvelope, map[common.Hash]struct{}) {
+func fetchParentEnvelopes(ctx context.Context, cfg *Cfg, roots [][32]byte, validate network.EnvelopeValidator) (map[common.Hash]*cltypes.SignedExecutionPayloadEnvelope, map[common.Hash]struct{}) {
 	envelopes, storedRoots := storedParentEnvelopes(roots, cfg.forkChoice.HasEnvelope, cfg.forkChoice.ReadEnvelopeFromDisk)
 	if len(roots) == 0 {
 		return envelopes, storedRoots
@@ -458,15 +628,14 @@ func fetchParentEnvelopes(ctx context.Context, cfg *Cfg, roots [][32]byte) (map[
 		if ctx.Err() != nil {
 			return envelopes, storedRoots
 		}
-		result, err := network.RequestEnvelopesFrantically(ctx, cfg.rpc, remaining)
-		if err != nil {
-			log.Debug("[chainTipSync] envelope fetch attempt failed", "err", err, "attempt", attempt+1, "remaining", len(remaining))
-			continue
-		}
+		result, err := network.RequestEnvelopesFrantically(ctx, cfg.rpc, remaining, validate, nil)
 		for root, envelope := range result {
 			if _, stored := envelopes[root]; !stored {
 				envelopes[root] = envelope
 			}
+		}
+		if err != nil {
+			log.Debug("[chainTipSync] envelope fetch attempt failed", "err", err, "attempt", attempt+1, "remaining", len(remaining))
 		}
 		// Recalculate remaining
 		var stillMissing [][32]byte
@@ -1536,7 +1705,7 @@ func chainTipSync(ctx context.Context, logger log.Logger, cfg *Cfg, args Args) e
 			observeSelectedHeadEnvelopeRequest(cfg, headRoot)
 			if headRoot != (common.Hash{}) && blockSupportsExecutionPayloadEnvelope(headBlock) && !cfg.forkChoice.HasEnvelope(headRoot) {
 				waitForClaimedSelectedHeadEnvelope(ctx, cfg, cfg.forkChoice, func(requestCtx context.Context, roots [][32]byte) (map[common.Hash]*cltypes.SignedExecutionPayloadEnvelope, error) {
-					return network.RequestEnvelopesFrantically(requestCtx, cfg.rpc, roots)
+					return network.RequestEnvelopesFrantically(requestCtx, cfg.rpc, roots, network.NewEnvelopeBlockValidator(cfg.beaconCfg, cfg.forkChoice.GetBlock), nil)
 				}, headRoot, 2*time.Second, canValidateGloasPayloads(cfg))
 			}
 			if canValidateGloasPayloads(cfg) {
